@@ -7954,7 +7954,7 @@ fn a_tick_without_an_alert_writes_no_focus_record() {
 /// past the cap is truncated with a log line and the notification still goes
 /// out.
 #[test]
-fn notify_stop_records_the_session_from_its_piped_payload() {
+fn a_stop_hook_records_the_session_from_its_piped_payload() {
     let dir = scratch_dir("focus-hook-stdin");
     let home = dir.join("home");
     let tmp = dir.join("tmp");
@@ -10098,4 +10098,40 @@ fn the_click_wait_reports_the_click_retries_without_the_flag_and_bounds_the_wait
         started.elapsed() < std::time::Duration::from_secs(5),
         "the wait must end at the deadline, not when the child does"
     );
+}
+
+/// The in-process render tests that cross a threshold make `fire_alerts`
+/// re-execute the current executable as `notify <event> <value> [<key>]`,
+/// and inside this harness the current executable is the test binary:
+/// libtest reads those arguments as name filters and runs every test whose
+/// name contains one of them, concurrently with the outer run. A test that
+/// stages a fixed scratch directory and matches such a filter then races its
+/// own nested copy, which is how `notify_stop_records_…` flaked in the
+/// container. Test names therefore avoid the alert argv, except the
+/// read-only fixture check that predates the rule.
+#[test]
+fn no_writing_test_name_matches_the_alert_argv_the_render_path_spawns() {
+    let body = read_repo_file("tests/equivalence.rs");
+    let allowed = ["notify_invocations_match_the_captured_fixtures"];
+    let mut failures = Failures::default();
+    let mut previous_was_test_attr = false;
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if previous_was_test_attr {
+            if let Some(name) = trimmed.strip_prefix("fn ") {
+                let name = name.split('(').next().unwrap_or(name);
+                for filter in ["notify", "context_high", "rate_limit"] {
+                    if name.contains(filter) && !allowed.contains(&name) {
+                        failures.check(name, false, || {
+                            format!(
+                                "contains `{filter}`, which the render path's nested `notify`                                  invocation would run as a filter"
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        previous_was_test_attr = trimmed == "#[test]";
+    }
+    failures.assert_empty("test names against the alert argv");
 }

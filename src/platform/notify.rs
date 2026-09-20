@@ -230,9 +230,18 @@ fn run_for_click(
             Err(_) => break None,
         }
     };
-    let stdout = rx
-        .recv_timeout(std::time::Duration::from_millis(250))
-        .unwrap_or_default();
+    // A child that exited has closed its end of the pipe, so the drain
+    // finishes as soon as the thread is scheduled — but on a loaded machine
+    // that can be later than a few hundred milliseconds, and a click read
+    // as a dismissal is the one outcome that must not depend on load. A
+    // killed child gets the short budget: something it spawned may still
+    // hold the pipe, and there is nothing left to read from it anyway.
+    let drain = if timed_out {
+        std::time::Duration::from_millis(250)
+    } else {
+        std::time::Duration::from_secs(2)
+    };
+    let stdout = rx.recv_timeout(drain).unwrap_or_default();
     Some(ClickRun {
         status,
         stdout,
