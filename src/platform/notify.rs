@@ -64,6 +64,7 @@ pub fn probe_env() -> Env {
         bundle_id: std::env::var("__CFBundleIdentifier")
             .ok()
             .filter(|v| !v.is_empty()),
+        term_program: std::env::var("TERM_PROGRAM").ok().filter(|v| !v.is_empty()),
         handler_registered,
     }
 }

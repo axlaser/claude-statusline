@@ -92,6 +92,9 @@ pub struct Env {
     /// The launching application's bundle identifier on macOS, when the
     /// inherited environment names one.
     pub bundle_id: Option<String>,
+    /// `TERM_PROGRAM`, the fallback for the bundle identifier when the
+    /// application did not export one (KTD2).
+    pub term_program: Option<String>,
     /// Windows: the `claude-statusline:` handler is registered and names the
     /// helper beside this binary, which is what makes a protocol toast safe
     /// to raise (KTD4).
@@ -111,6 +114,46 @@ impl Env {
         let icon = join(platform, &self.home, &[".claude", "claude-icon.png"]);
         self.file_exists(&icon).then_some(icon)
     }
+
+    /// The application terminal-notifier activates on click: the inherited
+    /// identifier first, then the known terminals by `TERM_PROGRAM`.
+    pub fn activation_bundle(&self) -> Option<String> {
+        if let Some(id) = &self.bundle_id {
+            return Some(id.clone());
+        }
+        let program = self.term_program.as_deref()?;
+        bundle_for_term_program(program).map(str::to_string)
+    }
+}
+
+/// The bundle identifiers of the terminals that export `TERM_PROGRAM`.
+/// Warp's is the one shipped by Warp itself; nothing here is guessed.
+pub fn bundle_for_term_program(program: &str) -> Option<&'static str> {
+    Some(match program {
+        "Apple_Terminal" => "com.apple.Terminal",
+        "iTerm.app" => "com.googlecode.iterm2",
+        "ghostty" => "com.mitchellh.ghostty",
+        "vscode" => "com.microsoft.VSCode",
+        "WezTerm" => "com.github.wez.wezterm",
+        "kitty" => "net.kovidgoyal.kitty",
+        "Alacritty" => "org.alacritty",
+        "WarpTerminal" => "dev.warp.Warp-Stable",
+        _ => return None,
+    })
+}
+
+/// The `-execute` value: the binary's absolute path in single quotes, the
+/// word `focus`, and the key (KTD10). terminal-notifier hands it to `/bin/sh
+/// -c`, and `/bin/sh` expands `$`, backticks and backslashes inside double
+/// quotes but nothing inside single ones, so a path that contains a single
+/// quote, a control byte, or is not absolute yields no command at all rather
+/// than a differently quoted one.
+pub fn execute_command(binary: &Path, key: &Key) -> Option<String> {
+    let path = binary.to_str()?;
+    if !crate::focus::is_abs_path(path) || path.contains('\'') {
+        return None;
+    }
+    Some(format!("'{path}' focus {}", key.as_string()))
 }
 
 /// Joins path components with the separator the **target** platform uses, not
@@ -370,7 +413,7 @@ pub fn plan(
                 actions.extend(unix_sound(platform, event, env));
             }
             if flags.visual && !msg.is_empty() {
-                actions.extend(unix_visual(platform, &msg, env));
+                actions.extend(unix_visual(platform, &msg, env, key));
             }
         }
     }
@@ -420,7 +463,7 @@ fn unix_sound(platform: Platform, event: &str, env: &Env) -> Option<Action> {
     }
 }
 
-fn unix_visual(platform: Platform, msg: &str, env: &Env) -> Option<Action> {
+fn unix_visual(platform: Platform, msg: &str, env: &Env, key: Option<&Key>) -> Option<Action> {
     let icon = env.icon(platform);
     match platform {
         Platform::Macos => {
@@ -439,6 +482,20 @@ fn unix_visual(platform: Platform, msg: &str, env: &Env) -> Option<Action> {
                 args.push(icon.clone());
                 args.push("-contentImage".to_string());
                 args.push(icon);
+            }
+            // The click actions (KTD2), stored with the notification by
+            // terminal-notifier and run on click in this order: activate the
+            // application, then execute the focus command. Only with a key,
+            // so the captured fixtures keep today's argv.
+            if let Some(key) = key {
+                if let Some(bundle) = env.activation_bundle() {
+                    args.push("-activate".to_string());
+                    args.push(bundle);
+                }
+                if let Some(command) = execute_command(&env.binary, key) {
+                    args.push("-execute".to_string());
+                    args.push(command);
+                }
             }
             Some(Action::Spawn {
                 program: "terminal-notifier".to_string(),

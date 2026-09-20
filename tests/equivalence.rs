@@ -2080,6 +2080,7 @@ fn full_env() -> Env {
         files,
         binary: PathBuf::from("/home/fixture/.claude/bin/claude-statusline"),
         bundle_id: Some("com.apple.Terminal".to_string()),
+        term_program: Some("Apple_Terminal".to_string()),
         handler_registered: true,
     }
 }
@@ -9781,4 +9782,157 @@ fn the_installers_place_register_and_remove_the_click_helper_in_order() {
         "uninstall.sh does not sweep the focus family".to_string()
     });
     failures.assert_empty("click helper installer contract");
+}
+
+// ---------------------------------------------------------------------------
+// Click-to-focus: the macOS click actions
+// ---------------------------------------------------------------------------
+
+/// With a key the macOS toast carries `-activate` and `-execute`; without one
+/// it is today's argv exactly.
+#[test]
+fn the_macos_toast_carries_the_click_actions_only_with_a_key() {
+    let key = Key::parse(&format!("s1.{}", "k".repeat(32))).unwrap();
+    let plan_records = |env: &Env, key: Option<&Key>| {
+        as_records(&notify::plan(
+            Platform::Macos,
+            "permission",
+            "",
+            PERMISSION_PAYLOAD,
+            &NotifyConfig::default(),
+            env,
+            key,
+        ))
+    };
+    let env = full_env();
+    assert_eq!(
+        plan_records(&env, Some(&key)),
+        vec![
+            "afplay\t/System/Library/Sounds/Tink.aiff".to_string(),
+            format!(
+                "terminal-notifier\t-title\tClaude Code\t-message\tBash: git status --porcelain\t-activate\tcom.apple.Terminal\t-execute\t'/home/fixture/.claude/bin/claude-statusline' focus s1.{}",
+                "k".repeat(32)
+            ),
+        ]
+    );
+    assert_eq!(
+        plan_records(&env, None),
+        vec![
+            "afplay\t/System/Library/Sounds/Tink.aiff".to_string(),
+            "terminal-notifier\t-title\tClaude Code\t-message\tBash: git status --porcelain"
+                .to_string(),
+        ]
+    );
+
+    // No bundle id and no known TERM_PROGRAM: `-execute` alone.
+    let mut bare = full_env();
+    bare.bundle_id = None;
+    bare.term_program = None;
+    let got = plan_records(&bare, Some(&key));
+    assert!(
+        got[1].contains("\t-execute\t") && !got[1].contains("-activate"),
+        "{got:?}"
+    );
+
+    // TERM_PROGRAM is the fallback map, never a guess.
+    let mut term = full_env();
+    term.bundle_id = None;
+    term.term_program = Some("iTerm.app".to_string());
+    assert!(plan_records(&term, Some(&key))[1].contains("-activate\tcom.googlecode.iterm2"));
+    term.term_program = Some("SomethingElse".to_string());
+    assert!(!plan_records(&term, Some(&key))[1].contains("-activate"));
+    assert_eq!(
+        notify::bundle_for_term_program("WarpTerminal"),
+        Some("dev.warp.Warp-Stable")
+    );
+    assert_eq!(
+        notify::bundle_for_term_program("Apple_Terminal"),
+        Some("com.apple.Terminal")
+    );
+}
+
+/// The `-execute` value is exactly the single-quoted absolute path, `focus`
+/// and the key, whatever the path contains; a single quote in the path drops
+/// `-execute` and keeps `-activate`.
+#[test]
+fn the_execute_command_is_single_quoted_or_absent() {
+    let key = Key::parse(&format!("Az09_-.{}", "AZaz09-_AZaz09-_AZaz09-_AZaz09-_")).unwrap();
+    let mut failures = Failures::default();
+    for path in [
+        "/Users/a b/.claude/bin/claude-statusline",
+        "/Users/$HOME/.claude/bin/claude-statusline",
+        "/Users/`id`/.claude/bin/claude-statusline",
+        "/Users/q\"uote/.claude/bin/claude-statusline",
+        "/Users/back\\slash/.claude/bin/claude-statusline",
+    ] {
+        let got = notify::execute_command(Path::new(path), &key);
+        let want = format!("'{path}' focus {}", key.as_string());
+        failures.check(path, got.as_deref() == Some(want.as_str()), || {
+            format!("got {got:?}")
+        });
+    }
+    failures.check(
+        "single-quote",
+        notify::execute_command(
+            Path::new("/Users/o'brien/.claude/bin/claude-statusline"),
+            &key,
+        )
+        .is_none(),
+        || "a single quote in the path must drop the command".to_string(),
+    );
+    failures.check(
+        "relative",
+        notify::execute_command(Path::new("bin/claude-statusline"), &key).is_none(),
+        || "a relative path must drop the command".to_string(),
+    );
+    failures.check(
+        "control-byte",
+        notify::execute_command(Path::new("/Users/a\nb/claude-statusline"), &key).is_none(),
+        || "a control byte in the path must drop the command".to_string(),
+    );
+
+    // With the single-quoted path unusable, the plan keeps `-activate`.
+    let mut env = full_env();
+    env.binary = PathBuf::from("/Users/o'brien/.claude/bin/claude-statusline");
+    let plan = notify::plan(
+        Platform::Macos,
+        "stop",
+        "",
+        "",
+        &NotifyConfig::default(),
+        &env,
+        Some(&key),
+    );
+    let records = as_records(&plan);
+    let toast = records
+        .iter()
+        .find(|r| r.starts_with("terminal-notifier"))
+        .unwrap();
+    failures.check(
+        "activate-kept",
+        toast.contains("-activate\tcom.apple.Terminal") && !toast.contains("-execute"),
+        || toast.to_string(),
+    );
+    // And the command never carries anything but the path, the verb and the
+    // key: no record field, no message.
+    let toast_with = as_records(&notify::plan(
+        Platform::Macos,
+        "permission",
+        "",
+        PERMISSION_PAYLOAD,
+        &NotifyConfig::default(),
+        &full_env(),
+        Some(&key),
+    ));
+    let execute = toast_with[1].rsplit('\t').next().unwrap().to_string();
+    failures.check(
+        "execute-shape",
+        execute
+            == format!(
+                "'/home/fixture/.claude/bin/claude-statusline' focus {}",
+                key.as_string()
+            ),
+        || execute.clone(),
+    );
+    failures.assert_empty("macOS execute command");
 }
