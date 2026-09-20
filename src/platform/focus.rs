@@ -114,6 +114,19 @@ mod imp {
         walk(u64::from(std::process::id()), stat)
     }
 
+    /// The chain above an arbitrary pid, for the click-time window search.
+    pub fn ancestors_of(pid: u64) -> Vec<ProcessInfo> {
+        walk(pid, stat)
+    }
+
+    pub fn window_verifies(_window: &crate::focus::WindowIdentity) -> bool {
+        false
+    }
+
+    pub fn raise_window(_handle: u64) -> bool {
+        false
+    }
+
     pub fn process_start(pid: u64) -> Option<u64> {
         stat(pid).map(|p| p.start)
     }
@@ -177,6 +190,18 @@ mod imp {
 
     pub fn ancestor_chain() -> Vec<ProcessInfo> {
         walk(u64::from(std::process::id()), describe)
+    }
+
+    pub fn ancestors_of(pid: u64) -> Vec<ProcessInfo> {
+        walk(pid, describe)
+    }
+
+    pub fn window_verifies(_window: &crate::focus::WindowIdentity) -> bool {
+        false
+    }
+
+    pub fn raise_window(_handle: u64) -> bool {
+        false
     }
 
     pub fn process_start(pid: u64) -> Option<u64> {
@@ -316,6 +341,25 @@ mod imp {
     pub fn controlling_tty() -> Option<String> {
         None
     }
+
+    /// Nothing on Windows searches windows by ancestor; the record carries
+    /// the handle itself.
+    pub fn ancestors_of(pid: u64) -> Vec<ProcessInfo> {
+        vec![ProcessInfo {
+            pid,
+            ppid: 0,
+            name: String::new(),
+            start: 0,
+        }]
+    }
+
+    pub fn window_verifies(_window: &crate::focus::WindowIdentity) -> bool {
+        false
+    }
+
+    pub fn raise_window(_handle: u64) -> bool {
+        false
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -340,5 +384,553 @@ mod imp {
 
     pub fn controlling_tty() -> Option<String> {
         None
+    }
+
+    pub fn ancestors_of(_pid: u64) -> Vec<ProcessInfo> {
+        Vec::new()
+    }
+
+    pub fn window_verifies(_window: &crate::focus::WindowIdentity) -> bool {
+        false
+    }
+
+    pub fn raise_window(_handle: u64) -> bool {
+        false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Click path: probes and executors
+// ---------------------------------------------------------------------------
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
+
+use crate::cmd::focus::{DbusStyle, Probes, Step, TabFamily, TmuxClient, Tool, X11Tool};
+use crate::cmd::notify::Platform;
+use crate::focus::Record;
+
+/// How long a terminal or desktop tool may take. These are local IPC calls
+/// that answer in milliseconds; a stuck one degrades to a missed step.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// osascript may have to wake the target application and, the first time,
+/// wait for the Automation consent prompt to be answered.
+const SCRIPT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// How often a running tool is checked against its deadline.
+const POLL_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Selects the Terminal.app tab whose tty is argv's first item and fronts its
+/// window. Reads its input through `on run argv`, never by interpolation
+/// (KTD10). Returns without touching anything when Terminal is not running,
+/// so a stale record cannot launch it.
+pub const TERMINAL_SELECT_TAB: &str = r#"on run argv
+set target to item 1 of argv
+if application "Terminal" is not running then return
+tell application "Terminal"
+repeat with w in windows
+repeat with t in tabs of w
+if tty of t is target then
+set selected tab of w to t
+set frontmost of w to true
+return
+end if
+end repeat
+end repeat
+end tell
+end run"#;
+
+/// The iTerm2 equivalent: sessions carry the tty, and `select` on the
+/// session, its tab and its window walks the selection up.
+pub const ITERM2_SELECT_TAB: &str = r#"on run argv
+set target to item 1 of argv
+if application "iTerm2" is not running then return
+tell application "iTerm2"
+repeat with w in windows
+repeat with t in tabs of w
+repeat with s in sessions of t
+if tty of s is target then
+tell w to select
+tell t to select
+tell s to select
+return
+end if
+end repeat
+end repeat
+end repeat
+end tell
+end run"#;
+
+/// Ghostty: argv is the tty and the working directory, either possibly empty.
+/// The tty is exact and wins; the working directory proves neither ownership
+/// nor continuity, so it selects only when exactly one terminal matches
+/// (KTD9). `focus` is Ghostty's own command and fronts the window.
+pub const GHOSTTY_SELECT: &str = r#"on run argv
+set targetTty to item 1 of argv
+set targetCwd to item 2 of argv
+if application "Ghostty" is not running then return
+tell application "Ghostty"
+if targetTty is not "" then
+repeat with t in terminals
+if tty of t is targetTty then
+focus t
+return
+end if
+end repeat
+end if
+if targetCwd is not "" then
+set matched to {}
+repeat with t in terminals
+if working directory of t is targetCwd then set end of matched to t
+end repeat
+if (count of matched) is 1 then focus (item 1 of matched)
+end if
+end tell
+end run"#;
+
+/// Where tools are looked for before `PATH`, in order (KTD10).
+///
+/// The click runs with the login session's environment on macOS, whose PATH
+/// has none of Homebrew, MacPorts, cargo or the app bundles; a tool that only
+/// resolves through PATH would be found from a shell and missed from a click.
+pub fn candidate_dirs(platform: Platform) -> Vec<PathBuf> {
+    let home = crate::home_dir().unwrap_or_default();
+    let dirs: Vec<PathBuf> = match platform {
+        Platform::Macos => vec![
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/opt/local/bin"),
+            home.join(".cargo").join("bin"),
+            home.join(".local").join("bin"),
+            PathBuf::from("/Applications/kitty.app/Contents/MacOS"),
+            PathBuf::from("/Applications/WezTerm.app/Contents/MacOS"),
+            PathBuf::from("/Applications/Ghostty.app/Contents/MacOS"),
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/bin"),
+        ],
+        Platform::Linux => vec![
+            PathBuf::from("/usr/bin"),
+            PathBuf::from("/usr/local/bin"),
+            PathBuf::from("/bin"),
+            home.join(".local").join("bin"),
+            home.join(".cargo").join("bin"),
+            PathBuf::from("/snap/bin"),
+        ],
+        // No Unix tool is ever planned on Windows; the helper spawns nothing.
+        Platform::Windows => Vec::new(),
+    };
+    dirs
+}
+
+/// Resolves a tool to the absolute path it will be spawned by: the candidate
+/// list first, `PATH` last.
+pub fn resolve_tool(platform: Platform, tool: Tool) -> Option<PathBuf> {
+    let name = tool.name();
+    for dir in candidate_dirs(platform) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    crate::platform::notify::which(name).filter(|p| p.is_absolute())
+}
+
+/// Runs a tool by absolute path with constant verbs and record fields as
+/// separate arguments, bounded end to end, and returns its stdout on success.
+///
+/// The shape mirrors `git::run_bounded`: a drain thread so a chatty child
+/// cannot deadlock on a full pipe, a poll against the deadline, a kill when
+/// it lapses. Every failure is `None`; the caller logs the step name only.
+fn run_tool(program: &Path, args: &[String], timeout: Duration) -> Option<Vec<u8>> {
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    #[cfg(windows)]
+    {
+        // The helper is a GUI-subsystem process with no console; a spawned
+        // console program would otherwise get a fresh window. Nothing is
+        // planned on Windows today, and this keeps that true for the tool
+        // runner itself.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let name = program
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            crate::debug::log(move || format!("focus: cannot run {name}: {e}"));
+            return None;
+        }
+    };
+
+    let mut pipe = child.stdout.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(p) = pipe.as_mut() {
+            use std::io::Read;
+            let _ = p.read_to_end(&mut buf);
+        }
+        let _ = tx.send(buf);
+    });
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break Some(s),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    crate::debug::log(|| "focus: tool killed at its deadline".to_string());
+                    break None;
+                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(_) => break None,
+        }
+    };
+    let budget = deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .max(Duration::from_millis(250));
+    let stdout = rx.recv_timeout(budget).ok()?;
+    if !status?.success() {
+        return None;
+    }
+    Some(stdout)
+}
+
+fn lines(bytes: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn args(parts: &[&str]) -> Vec<String> {
+    parts.iter().map(|s| s.to_string()).collect()
+}
+
+/// The clients attached to the recorded tmux server, by tty and pid. Lines
+/// that do not parse as a tty and a pid are dropped rather than trusted.
+fn tmux_clients(tmux: &Path, socket: &str) -> Vec<TmuxClient> {
+    let out = run_tool(
+        tmux,
+        &args(&[
+            "-S",
+            socket,
+            "list-clients",
+            "-F",
+            "#{client_tty} #{client_pid}",
+        ]),
+        TOOL_TIMEOUT,
+    );
+    let Some(out) = out else {
+        return Vec::new();
+    };
+    lines(&out)
+        .iter()
+        .filter_map(|line| {
+            let (tty, pid) = line.split_once(' ')?;
+            if !crate::focus::is_tty(tty) || !pid.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            Some(TmuxClient {
+                tty: tty.to_string(),
+                pid: pid.parse().ok()?,
+            })
+        })
+        .collect()
+}
+
+/// Visible top-level X11 windows of `pid`, through xdotool's search. xdotool
+/// exits non-zero when nothing matches, which reads as no windows.
+fn xdotool_windows(tool: &Path, pid: u64) -> Vec<u64> {
+    run_tool(
+        tool,
+        &args(&["search", "--onlyvisible", "--pid", &pid.to_string()]),
+        TOOL_TIMEOUT,
+    )
+    .map(|out| lines(&out).iter().filter_map(|l| l.parse().ok()).collect())
+    .unwrap_or_default()
+}
+
+/// wmctrl lists every window with its pid once; the caller filters.
+fn wmctrl_windows(tool: &Path) -> Vec<(u64, u64)> {
+    run_tool(tool, &args(&["-lp"]), TOOL_TIMEOUT)
+        .map(|out| {
+            lines(&out)
+                .iter()
+                .filter_map(|l| {
+                    let mut parts = l.split_whitespace();
+                    let id = parts.next()?;
+                    let _desktop = parts.next()?;
+                    let pid: u64 = parts.next()?.parse().ok()?;
+                    let id = u64::from_str_radix(id.trim_start_matches("0x"), 16).ok()?;
+                    Some((pid, id))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// kdotool ids are opaque strings; only a conservative alphabet is kept.
+fn kdotool_windows(tool: &Path, pid: u64) -> Vec<String> {
+    run_tool(
+        tool,
+        &args(&["search", "--pid", &pid.to_string()]),
+        TOOL_TIMEOUT,
+    )
+    .map(|out| {
+        lines(&out)
+            .into_iter()
+            .filter(|l| {
+                l.len() <= 64
+                    && l.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'{' | b'}' | b'-'))
+            })
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+/// The windows of `pid` or, when it owns none, of its nearest ancestor that
+/// does: a tmux client's shell owns no window, its terminal does.
+fn windows_up_the_chain<T>(pid: u64, search: impl Fn(u64) -> Vec<T>) -> Vec<T> {
+    for candidate in imp::ancestors_of(pid) {
+        let found = search(candidate.pid);
+        if !found.is_empty() {
+            return found;
+        }
+    }
+    Vec::new()
+}
+
+fn anchor_alive(anchor: &crate::focus::Anchor) -> bool {
+    if anchor.pid == 0 {
+        return false;
+    }
+    if imp::process_start(anchor.pid) != Some(anchor.start) {
+        return false;
+    }
+    match &anchor.boot_id {
+        Some(recorded) => imp::boot_id().as_deref() == Some(recorded.as_str()),
+        None => true,
+    }
+}
+
+/// Everything the planner needs to know about this machine now.
+pub fn probe(platform: Platform, record: &Record) -> Probes {
+    let id = &record.identity;
+    let mut probes = Probes::default();
+    for tool in Tool::ALL {
+        if let Some(path) = resolve_tool(platform, tool) {
+            probes.tools.insert(tool, path);
+        }
+    }
+    probes.anchor_alive = anchor_alive(&record.anchor);
+    probes.terminal_alive = match (id.terminal_pid, id.terminal_start) {
+        (Some(pid), Some(start)) => imp::process_start(pid) == Some(start),
+        _ => false,
+    };
+    probes.window_verifies = id.window.as_ref().is_some_and(imp::window_verifies);
+    probes.kitty_socket_present = id
+        .kitty_socket
+        .as_deref()
+        .and_then(|s| s.strip_prefix("unix:"))
+        .is_some_and(|p| Path::new(p).exists());
+    probes.kde = std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|d| d.to_ascii_uppercase().contains("KDE"))
+        .unwrap_or(false);
+
+    if let (Some(t), Some(tmux)) = (&id.tmux, probes.tools.get(&Tool::Tmux)) {
+        probes.tmux_clients = tmux_clients(tmux, &t.socket);
+    }
+
+    if platform == Platform::Linux {
+        let mut pids: Vec<u64> = Vec::new();
+        if id.tmux.is_some() {
+            pids.extend(probes.tmux_clients.iter().map(|c| c.pid));
+        } else {
+            pids.extend(id.vscode_pid);
+            if probes.terminal_alive {
+                pids.extend(id.terminal_pid);
+            }
+        }
+        if id.session_type.as_deref() == Some("wayland") {
+            if let Some(kd) = probes.tools.get(&Tool::Kdotool).cloned() {
+                for pid in pids {
+                    let found = windows_up_the_chain(pid, |p| kdotool_windows(&kd, p));
+                    probes.kde_windows.insert(pid, found);
+                }
+            }
+        } else if let Some(xd) = probes.tools.get(&Tool::Xdotool).cloned() {
+            for pid in pids {
+                let found = windows_up_the_chain(pid, |p| xdotool_windows(&xd, p));
+                probes.x11_windows.insert(pid, found);
+            }
+        } else if let Some(wm) = probes.tools.get(&Tool::Wmctrl).cloned() {
+            let all = wmctrl_windows(&wm);
+            for pid in pids {
+                let found = windows_up_the_chain(pid, |p| {
+                    all.iter()
+                        .filter(|(owner, _)| *owner == p)
+                        .map(|(_, id)| *id)
+                        .collect()
+                });
+                probes.x11_windows.insert(pid, found);
+            }
+        }
+    }
+    probes
+}
+
+/// Carries out one step. `false` means it did not complete; the caller logs
+/// the step name and nothing else.
+pub fn execute(step: &Step) -> bool {
+    match step {
+        Step::RaiseWindow { handle } => imp::raise_window(*handle),
+        Step::ActivateX11 {
+            tool,
+            via,
+            window_id,
+        } => {
+            let id = window_id.to_string();
+            let argv = match via {
+                X11Tool::Xdotool => args(&["windowactivate", "--sync", &id]),
+                X11Tool::Wmctrl => args(&["-i", "-a", &id]),
+            };
+            run_tool(tool, &argv, TOOL_TIMEOUT).is_some()
+        }
+        Step::ActivateKde { tool, window_id } => {
+            run_tool(tool, &args(&["windowactivate", window_id]), TOOL_TIMEOUT).is_some()
+        }
+        Step::SelectTab { tool, family, tty } => {
+            let script = match family {
+                TabFamily::Terminal => TERMINAL_SELECT_TAB,
+                TabFamily::ITerm2 => ITERM2_SELECT_TAB,
+                TabFamily::Ghostty => GHOSTTY_SELECT,
+            };
+            let argv = match family {
+                TabFamily::Ghostty => args(&["-e", script, tty, ""]),
+                _ => args(&["-e", script, tty]),
+            };
+            run_tool(tool, &argv, SCRIPT_TIMEOUT).is_some()
+        }
+        Step::SelectGhostty { tool, tty, cwd } => run_tool(
+            tool,
+            &args(&["-e", GHOSTTY_SELECT, tty, cwd]),
+            SCRIPT_TIMEOUT,
+        )
+        .is_some(),
+        Step::KittenFocus {
+            tool,
+            socket,
+            window_id,
+        } => run_tool(
+            tool,
+            &args(&[
+                "@",
+                "--to",
+                socket,
+                "focus-window",
+                "--match",
+                &format!("id:{window_id}"),
+            ]),
+            TOOL_TIMEOUT,
+        )
+        .is_some(),
+        Step::WeztermActivate { tool, pane } => run_tool(
+            tool,
+            &args(&["cli", "activate-pane", "--pane-id", &pane.to_string()]),
+            TOOL_TIMEOUT,
+        )
+        .is_some(),
+        Step::KonsoleSetSession {
+            tool,
+            style,
+            service,
+            window,
+            session,
+        } => {
+            let session = session.to_string();
+            let argv = match style {
+                DbusStyle::Qdbus => args(&[
+                    service,
+                    window,
+                    "org.kde.konsole.Window.setCurrentSession",
+                    &session,
+                ]),
+                DbusStyle::Busctl => args(&[
+                    "--user",
+                    "call",
+                    service,
+                    window,
+                    "org.kde.konsole.Window",
+                    "setCurrentSession",
+                    "i",
+                    &session,
+                ]),
+            };
+            run_tool(tool, &argv, TOOL_TIMEOUT).is_some()
+        }
+        Step::TmuxSwitchClient {
+            tool,
+            socket,
+            client_tty,
+            pane,
+        } => run_tool(
+            tool,
+            &args(&["-S", socket, "switch-client", "-c", client_tty, "-t", pane]),
+            TOOL_TIMEOUT,
+        )
+        .is_some(),
+        Step::TmuxSelectWindow { tool, socket, pane } => run_tool(
+            tool,
+            &args(&["-S", socket, "select-window", "-t", pane]),
+            TOOL_TIMEOUT,
+        )
+        .is_some(),
+        Step::TmuxSelectPane { tool, socket, pane } => run_tool(
+            tool,
+            &args(&["-S", socket, "select-pane", "-t", pane]),
+            TOOL_TIMEOUT,
+        )
+        .is_some(),
+        Step::ScreenSelect {
+            tool,
+            session,
+            window,
+        } => run_tool(
+            tool,
+            &args(&["-S", session, "-X", "select", &window.to_string()]),
+            TOOL_TIMEOUT,
+        )
+        .is_some(),
+        Step::ZellijFocus {
+            tool,
+            session,
+            pane,
+        } => {
+            let pane = pane.to_string();
+            let argv = match session {
+                Some(name) => args(&["--session", name, "action", "focus-pane-id", &pane]),
+                None => args(&["action", "focus-pane-id", &pane]),
+            };
+            run_tool(tool, &argv, TOOL_TIMEOUT).is_some()
+        }
     }
 }

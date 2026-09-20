@@ -10,13 +10,32 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
-/// True when `STATUSLINE_DEBUG` is set to anything other than empty or `0`.
+/// Set by [`enable`]: logging switched on by a caller rather than the
+/// environment.
+static FORCED: AtomicBool = AtomicBool::new(false);
+
+/// True when `STATUSLINE_DEBUG` is set to anything other than empty or `0`,
+/// or when [`enable`] was called.
 pub fn is_enabled() -> bool {
+    if FORCED.load(Ordering::Relaxed) {
+        return true;
+    }
     match std::env::var("STATUSLINE_DEBUG") {
         Ok(v) => !v.is_empty() && v != "0",
         Err(_) => false,
     }
+}
+
+/// Switches logging on for the rest of this process.
+///
+/// The click handlers run without the session's environment — the OS launched
+/// them — so the debug flag travels in the focus record and is applied here
+/// before the first line the click path logs (KTD12). Nothing switches it off
+/// again: a process that reached this point exits within a second.
+pub fn enable() {
+    FORCED.store(true, Ordering::Relaxed);
 }
 
 /// Default log path: `~/.claude/statusline-debug.log`, matching what the

@@ -62,9 +62,22 @@ fn main() {
     // is even read.
     entry::silence();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Read as OS strings: `env::args` panics on an argument that is not
+    // valid Unicode, and the click helper is launched by the shell with
+    // whatever a URI carried (R12). Every subcommand but `focus` reads the
+    // lossy form; `focus` sees the raw bytes and rejects what it cannot use.
+    let os_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let args: Vec<String> = os_args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
     let sub = args.first().map(String::as_str).unwrap_or("statusline");
     let rest: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    let os_rest: &[std::ffi::OsString] = if os_args.is_empty() {
+        &[]
+    } else {
+        &os_args[1..]
+    };
 
     // `self-check` is deliberately outside the catch below. It is
     // the installer's only signal that a binary launches but renders wrongly,
@@ -86,7 +99,7 @@ fn main() {
 
     // Layers 3 and 4: an unwinding panic anywhere below becomes a silent
     // no-op, and stdout is flushed with the result checked.
-    entry::guarded(sub, || dispatch(sub, &rest));
+    entry::guarded(sub, || dispatch(sub, &rest, os_rest));
 
     // Layer 5.
     std::process::exit(0);
@@ -211,8 +224,12 @@ fn fail(message: &str) -> i32 {
     1
 }
 
-fn dispatch(sub: &str, rest: &[&str]) {
+fn dispatch(sub: &str, rest: &[&str], os_rest: &[std::ffi::OsString]) {
     match sub {
+        // The click handler on macOS (terminal-notifier's `-execute`) and the
+        // manual form everywhere; the Windows helper and the Linux click path
+        // reach the same `run`.
+        "focus" => cmd::focus::run(os_rest),
         "statusline" => {
             let payload = read_stdin();
             let roots = cmd::statusline::Roots::from_env();

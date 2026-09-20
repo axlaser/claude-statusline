@@ -87,7 +87,7 @@ fn sound_assets(platform: Platform, system_root: &Path) -> Vec<PathBuf> {
 }
 
 /// Resolves a program on `PATH`, honouring `PATHEXT` on Windows.
-fn which(program: &str) -> Option<PathBuf> {
+pub(crate) fn which(program: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(program);

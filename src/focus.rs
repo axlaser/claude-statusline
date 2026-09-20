@@ -148,6 +148,12 @@ fn is_display(s: &str) -> bool {
     })
 }
 
+fn is_zellij_session(s: &str) -> bool {
+    within(s, 1, 64, |b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-')
+    })
+}
+
 fn is_session_type(s: &str) -> bool {
     s == "x11" || s == "wayland"
 }
@@ -436,6 +442,9 @@ pub struct Identity {
     pub tmux: Option<Tmux>,
     pub screen: Option<Screen>,
     pub zellij_pane: Option<u64>,
+    /// zellij needs its session named to address a pane from outside; the
+    /// name is user text, so it is held to a narrow alphabet.
+    pub zellij_session: Option<String>,
     pub vscode_pid: Option<u64>,
     pub window: Option<WindowIdentity>,
 }
@@ -545,6 +554,14 @@ pub fn identity_from_env(
         }
     }
     id.zellij_pane = take_u64(&mut omitted, "zellij_pane", var("ZELLIJ_PANE_ID"));
+    if id.zellij_pane.is_some() {
+        id.zellij_session = take_str(
+            &mut omitted,
+            "zellij_session",
+            var("ZELLIJ_SESSION_NAME"),
+            is_zellij_session,
+        );
+    }
 
     id.bundle_id = take_str(
         &mut omitted,
@@ -750,6 +767,11 @@ impl Record {
             identity.insert("screen".into(), Value::Object(m));
         }
         put(&mut identity, "zellij_pane", id.zellij_pane.map(num));
+        put(
+            &mut identity,
+            "zellij_session",
+            id.zellij_session.as_deref().map(text),
+        );
         put(&mut identity, "vscode_pid", id.vscode_pid.map(num));
         if let Some(w) = &id.window {
             let mut m = Map::new();
@@ -872,6 +894,7 @@ fn load_identity(map: &Map<String, Value>) -> Option<Identity> {
         tmux: None,
         screen: None,
         zellij_pane: opt_u64(map, "zellij_pane")?,
+        zellij_session: opt_str(map, "zellij_session", is_zellij_session)?,
         vscode_pid: opt_u64(map, "vscode_pid")?,
         window: None,
     };

@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use claude_statusline::clock::{Clock, TestClock};
+use claude_statusline::cmd::focus::{
+    self as cmd_focus, DbusStyle, Probes, Step, TabFamily, TmuxClient, Tool, X11Tool,
+};
 use claude_statusline::cmd::statusline as cmd_statusline;
 use claude_statusline::debug;
 use claude_statusline::focus::{self, Anchor, CaptureOutcome, Identity, Key, Observation, Record};
@@ -181,6 +184,18 @@ fn entry_contract_always_exits_zero_and_silent() {
             bin: BIN,
             name: "subagent-empty",
             args: &["subagent"],
+            stdin: "",
+        },
+        EntryCase {
+            bin: BIN,
+            name: "focus-no-key",
+            args: &["focus"],
+            stdin: "",
+        },
+        EntryCase {
+            bin: BIN,
+            name: "focus-hostile-key",
+            args: &["focus", "claude-statusline:a.b\" \"c"],
             stdin: "",
         },
         // an unwinding panic must not escape as stderr or a non-zero code.
@@ -8038,4 +8053,813 @@ fn the_anchor_is_the_first_non_shell_ancestor_unless_claude_pid_names_it() {
         (None, None)
     );
     assert!(focus::is_shell("-bash") && focus::is_shell("PWSH.EXE") && !focus::is_shell("node"));
+}
+
+// ---------------------------------------------------------------------------
+// Click-to-focus: the step planner and the `focus` subcommand
+// ---------------------------------------------------------------------------
+//
+// `cmd::focus::plan` is a lookup from record identity to steps, with the
+// liveness rule applied in front. The tables below are the High-Level
+// Technical Design's identity table, one row per terminal, plus the
+// degradations: a dead anchor, a missing tool, a non-unique match.
+
+fn tool_path(tool: Tool) -> PathBuf {
+    PathBuf::from(format!("/usr/bin/{}", tool.name()))
+}
+
+/// Probes with the anchor alive and every listed tool resolved.
+fn probes_with(tools: &[Tool]) -> Probes {
+    Probes {
+        tools: tools.iter().map(|t| (*t, tool_path(*t))).collect(),
+        anchor_alive: true,
+        terminal_alive: true,
+        window_verifies: true,
+        kitty_socket_present: true,
+        kde: false,
+        tmux_clients: Vec::new(),
+        x11_windows: Default::default(),
+        kde_windows: Default::default(),
+    }
+}
+
+fn record_with(identity: Identity) -> Record {
+    let mut record = sample_record("plan-1");
+    record.identity = identity;
+    record
+}
+
+fn step_names(plan: &cmd_focus::Plan) -> Vec<&'static str> {
+    plan.steps.iter().map(Step::name).collect()
+}
+
+/// Each identity row of the design table produces exactly its listed steps
+/// when the anchor is alive.
+#[test]
+fn each_identity_row_plans_exactly_its_steps() {
+    let osa = tool_path(Tool::Osascript);
+    let all: Vec<Tool> = Tool::ALL.to_vec();
+
+    struct Row {
+        name: &'static str,
+        platform: Platform,
+        identity: Identity,
+        probes: Probes,
+        want: Vec<Step>,
+    }
+
+    let rows = vec![
+        Row {
+            name: "terminal-app-tty",
+            platform: Platform::Macos,
+            identity: Identity {
+                bundle_id: Some("com.apple.Terminal".into()),
+                tty: Some("/dev/ttys003".into()),
+                ..Identity::default()
+            },
+            probes: probes_with(&all),
+            want: vec![Step::SelectTab {
+                tool: osa.clone(),
+                family: TabFamily::Terminal,
+                tty: "/dev/ttys003".into(),
+            }],
+        },
+        Row {
+            name: "iterm2-tty",
+            platform: Platform::Macos,
+            identity: Identity {
+                bundle_id: Some("com.googlecode.iterm2".into()),
+                tty: Some("/dev/ttys004".into()),
+                iterm_session: Some("w0t1p0:ABC".into()),
+                ..Identity::default()
+            },
+            probes: probes_with(&all),
+            want: vec![Step::SelectTab {
+                tool: osa.clone(),
+                family: TabFamily::ITerm2,
+                tty: "/dev/ttys004".into(),
+            }],
+        },
+        Row {
+            name: "ghostty-tty-and-cwd",
+            platform: Platform::Macos,
+            identity: Identity {
+                bundle_id: Some("com.mitchellh.ghostty".into()),
+                term_program: Some("ghostty".into()),
+                tty: Some("/dev/ttys005".into()),
+                ghostty_cwd: Some("/repo/work".into()),
+                ..Identity::default()
+            },
+            probes: probes_with(&all),
+            want: vec![Step::SelectGhostty {
+                tool: osa.clone(),
+                tty: "/dev/ttys005".into(),
+                cwd: "/repo/work".into(),
+            }],
+        },
+        Row {
+            name: "ghostty-cwd-only",
+            platform: Platform::Macos,
+            identity: Identity {
+                bundle_id: Some("com.mitchellh.ghostty".into()),
+                ghostty_cwd: Some("/repo/work".into()),
+                ..Identity::default()
+            },
+            probes: probes_with(&all),
+            want: vec![Step::SelectGhostty {
+                tool: osa.clone(),
+                tty: String::new(),
+                cwd: "/repo/work".into(),
+            }],
+        },
+        Row {
+            name: "kitty-linux",
+            platform: Platform::Linux,
+            identity: Identity {
+                kitty_window_id: Some(7),
+                kitty_socket: Some("unix:/tmp/kitty-1".into()),
+                window_id: Some(0x3200001),
+                session_type: Some("x11".into()),
+                ..Identity::default()
+            },
+            probes: probes_with(&all),
+            want: vec![
+                Step::ActivateX11 {
+                    tool: tool_path(Tool::Xdotool),
+                    via: X11Tool::Xdotool,
+                    window_id: 0x3200001,
+                },
+                Step::KittenFocus {
+                    tool: tool_path(Tool::Kitten),
+                    socket: "unix:/tmp/kitty-1".into(),
+                    window_id: 7,
+                },
+            ],
+        },
+        Row {
+            name: "wezterm-macos",
+            platform: Platform::Macos,
+            identity: Identity {
+                bundle_id: Some("com.github.wez.wezterm".into()),
+                wezterm_pane: Some(3),
+                ..Identity::default()
+            },
+            probes: probes_with(&all),
+            want: vec![Step::WeztermActivate {
+                tool: tool_path(Tool::Wezterm),
+                pane: 3,
+            }],
+        },
+        Row {
+            name: "konsole-qdbus6",
+            platform: Platform::Linux,
+            identity: Identity {
+                konsole: Some(focus::Konsole {
+                    service: "org.kde.konsole-4242".into(),
+                    window: "/Windows/1".into(),
+                    session: 9,
+                }),
+                window_id: Some(77),
+                session_type: Some("x11".into()),
+                ..Identity::default()
+            },
+            probes: probes_with(&[Tool::Wmctrl, Tool::Qdbus6, Tool::Busctl]),
+            want: vec![
+                Step::ActivateX11 {
+                    tool: tool_path(Tool::Wmctrl),
+                    via: X11Tool::Wmctrl,
+                    window_id: 77,
+                },
+                Step::KonsoleSetSession {
+                    tool: tool_path(Tool::Qdbus6),
+                    style: DbusStyle::Qdbus,
+                    service: "org.kde.konsole-4242".into(),
+                    window: "/Windows/1".into(),
+                    session: 9,
+                },
+            ],
+        },
+        Row {
+            name: "konsole-busctl-only",
+            platform: Platform::Linux,
+            identity: Identity {
+                konsole: Some(focus::Konsole {
+                    service: "org.kde.konsole-4242".into(),
+                    window: "/Windows/1".into(),
+                    session: 9,
+                }),
+                session_type: Some("wayland".into()),
+                ..Identity::default()
+            },
+            probes: probes_with(&[Tool::Busctl]),
+            want: vec![Step::KonsoleSetSession {
+                tool: tool_path(Tool::Busctl),
+                style: DbusStyle::Busctl,
+                service: "org.kde.konsole-4242".into(),
+                window: "/Windows/1".into(),
+                session: 9,
+            }],
+        },
+        Row {
+            name: "screen",
+            platform: Platform::Macos,
+            identity: Identity {
+                screen: Some(focus::Screen {
+                    session: "1234.pts-0.host".into(),
+                    window: 2,
+                }),
+                ..Identity::default()
+            },
+            probes: probes_with(&all),
+            want: vec![Step::ScreenSelect {
+                tool: tool_path(Tool::Screen),
+                session: "1234.pts-0.host".into(),
+                window: 2,
+            }],
+        },
+        Row {
+            name: "zellij",
+            platform: Platform::Linux,
+            identity: Identity {
+                zellij_pane: Some(5),
+                zellij_session: Some("main".into()),
+                ..Identity::default()
+            },
+            probes: probes_with(&all),
+            want: vec![Step::ZellijFocus {
+                tool: tool_path(Tool::Zellij),
+                session: Some("main".into()),
+                pane: 5,
+            }],
+        },
+        Row {
+            name: "vscode-windows",
+            platform: Platform::Windows,
+            identity: Identity {
+                term_program: Some("vscode".into()),
+                window: Some(focus::WindowIdentity {
+                    handle: 0x2071e,
+                    owner_pid: 18112,
+                    owner_start: 133_000,
+                    class: "Chrome_WidgetWin_1".into(),
+                    host: "vscode".into(),
+                }),
+                ..Identity::default()
+            },
+            probes: probes_with(&[]),
+            want: vec![Step::RaiseWindow { handle: 0x2071e }],
+        },
+        Row {
+            name: "vscode-macos-activation-only",
+            platform: Platform::Macos,
+            identity: Identity {
+                bundle_id: Some("com.microsoft.VSCode".into()),
+                term_program: Some("vscode".into()),
+                tty: Some("/dev/ttys009".into()),
+                ..Identity::default()
+            },
+            probes: probes_with(&all),
+            want: vec![],
+        },
+        Row {
+            name: "vscode-linux-pid-search",
+            platform: Platform::Linux,
+            identity: Identity {
+                vscode_pid: Some(500),
+                session_type: Some("x11".into()),
+                ..Identity::default()
+            },
+            probes: {
+                let mut p = probes_with(&[Tool::Xdotool]);
+                p.x11_windows.insert(500, vec![0x4400003]);
+                p
+            },
+            want: vec![Step::ActivateX11 {
+                tool: tool_path(Tool::Xdotool),
+                via: X11Tool::Xdotool,
+                window_id: 0x4400003,
+            }],
+        },
+        Row {
+            name: "windows-terminal",
+            platform: Platform::Windows,
+            identity: Identity {
+                window: Some(focus::WindowIdentity {
+                    handle: 0x30914,
+                    owner_pid: 9416,
+                    owner_start: 133_000,
+                    class: "CASCADIA_HOSTING_WINDOW_CLASS".into(),
+                    host: "windows-terminal".into(),
+                }),
+                ..Identity::default()
+            },
+            probes: probes_with(&[]),
+            want: vec![Step::RaiseWindow { handle: 0x30914 }],
+        },
+        Row {
+            name: "unknown-terminal-macos",
+            platform: Platform::Macos,
+            identity: Identity {
+                bundle_id: Some("dev.warp.Warp-Stable".into()),
+                tty: Some("/dev/ttys010".into()),
+                ..Identity::default()
+            },
+            probes: probes_with(&all),
+            want: vec![],
+        },
+        Row {
+            name: "gnome-terminal-pid-search",
+            platform: Platform::Linux,
+            identity: Identity {
+                terminal_pid: Some(41),
+                terminal_start: Some(6),
+                session_type: Some("x11".into()),
+                display: Some(":1".into()),
+                ..Identity::default()
+            },
+            probes: {
+                let mut p = probes_with(&[Tool::Xdotool]);
+                p.x11_windows.insert(41, vec![0x1a00001]);
+                p
+            },
+            want: vec![Step::ActivateX11 {
+                tool: tool_path(Tool::Xdotool),
+                via: X11Tool::Xdotool,
+                window_id: 0x1a00001,
+            }],
+        },
+        Row {
+            name: "kde-wayland-kdotool",
+            platform: Platform::Linux,
+            identity: Identity {
+                terminal_pid: Some(41),
+                terminal_start: Some(6),
+                session_type: Some("wayland".into()),
+                ..Identity::default()
+            },
+            probes: {
+                let mut p = probes_with(&[Tool::Kdotool, Tool::Xdotool]);
+                p.kde = true;
+                p.kde_windows.insert(41, vec!["{abc-1}".into()]);
+                p
+            },
+            want: vec![Step::ActivateKde {
+                tool: tool_path(Tool::Kdotool),
+                window_id: "{abc-1}".into(),
+            }],
+        },
+    ];
+
+    let mut failures = Failures::default();
+    for row in rows {
+        let record = record_with(row.identity);
+        let plan = cmd_focus::plan(row.platform, &record, &row.probes);
+        failures.check(row.name, plan.steps == row.want, || {
+            format!(
+                "planned {:?}\n  wanted {:?}\n  notes {:?}",
+                plan.steps, row.want, plan.notes
+            )
+        });
+    }
+    failures.assert_empty("identity rows");
+}
+
+/// The liveness rule: a dead anchor with a verifiable window raises it and
+/// selects nothing; a dead anchor with no verifiable window plans nothing.
+#[test]
+fn a_dead_anchor_raises_the_window_only_while_it_verifies() {
+    let window = focus::WindowIdentity {
+        handle: 0x30914,
+        owner_pid: 9416,
+        owner_start: 133_000,
+        class: "CASCADIA_HOSTING_WINDOW_CLASS".into(),
+        host: "windows-terminal".into(),
+    };
+    let record = record_with(Identity {
+        window: Some(window),
+        ..Identity::default()
+    });
+
+    let mut alive = probes_with(&[]);
+    alive.anchor_alive = false;
+    let plan = cmd_focus::plan(Platform::Windows, &record, &alive);
+    assert_eq!(plan.steps, vec![Step::RaiseWindow { handle: 0x30914 }]);
+
+    alive.window_verifies = false;
+    let plan = cmd_focus::plan(Platform::Windows, &record, &alive);
+    assert!(
+        plan.steps.is_empty(),
+        "an unverifiable window was raised: {:?}",
+        plan.steps
+    );
+
+    // A live anchor whose window stopped verifying: nothing raised either,
+    // and a note says why.
+    let mut live = probes_with(&[]);
+    live.window_verifies = false;
+    let plan = cmd_focus::plan(Platform::Windows, &record, &live);
+    assert!(plan.steps.is_empty());
+    assert!(plan.notes.iter().any(|n| n.contains("no longer verifies")));
+
+    // macOS: the app activation is the transport's; a dead anchor selects no
+    // tab and plans nothing here.
+    let mac = record_with(Identity {
+        bundle_id: Some("com.apple.Terminal".into()),
+        tty: Some("/dev/ttys003".into()),
+        ..Identity::default()
+    });
+    let mut dead = probes_with(&Tool::ALL);
+    dead.anchor_alive = false;
+    assert!(cmd_focus::plan(Platform::Macos, &mac, &dead)
+        .steps
+        .is_empty());
+}
+
+/// kitty remote control that is off at click time costs the kitten step and
+/// nothing else.
+#[test]
+fn kitty_without_remote_control_keeps_the_raise_and_drops_the_kitten_step() {
+    let record = record_with(Identity {
+        kitty_window_id: Some(7),
+        kitty_socket: Some("unix:/tmp/kitty-1".into()),
+        window_id: Some(11),
+        session_type: Some("x11".into()),
+        ..Identity::default()
+    });
+    let mut probes = probes_with(&[Tool::Kitten, Tool::Xdotool]);
+    probes.kitty_socket_present = false;
+    let plan = cmd_focus::plan(Platform::Linux, &record, &probes);
+    assert_eq!(step_names(&plan), vec!["activate-x11"]);
+    assert!(plan.notes.iter().any(|n| n.contains("kitty")));
+
+    // A record with a kitty window id and no socket never plans a kitten
+    // step: the socket is what makes the id addressable.
+    let no_socket = record_with(Identity {
+        kitty_window_id: Some(7),
+        ..Identity::default()
+    });
+    let plan = cmd_focus::plan(Platform::Macos, &no_socket, &probes_with(&Tool::ALL));
+    assert!(plan.steps.is_empty());
+}
+
+/// Inside tmux: one switch-client per attached client, then the window and
+/// pane, a tab match per client tty, and nothing from any recorded tty.
+#[test]
+fn a_tmux_record_plans_per_client_and_ignores_the_recorded_tty() {
+    let tmux = tool_path(Tool::Tmux);
+    let osa = tool_path(Tool::Osascript);
+    let record = record_with(Identity {
+        bundle_id: Some("com.apple.Terminal".into()),
+        // Never written by capture inside tmux, planted here to prove it is
+        // ignored even if a record carried one.
+        tty: Some("/dev/ttys099".into()),
+        tmux: Some(focus::Tmux {
+            socket: "/tmp/tmux-501/default".into(),
+            pane: "%3".into(),
+        }),
+        ..Identity::default()
+    });
+    let mut probes = probes_with(&[Tool::Tmux, Tool::Osascript]);
+    probes.tmux_clients = vec![
+        TmuxClient {
+            tty: "/dev/ttys001".into(),
+            pid: 301,
+        },
+        TmuxClient {
+            tty: "/dev/ttys002".into(),
+            pid: 302,
+        },
+    ];
+    let plan = cmd_focus::plan(Platform::Macos, &record, &probes);
+    let sock = "/tmp/tmux-501/default".to_string();
+    assert_eq!(
+        plan.steps,
+        vec![
+            Step::TmuxSwitchClient {
+                tool: tmux.clone(),
+                socket: sock.clone(),
+                client_tty: "/dev/ttys001".into(),
+                pane: "%3".into(),
+            },
+            Step::TmuxSwitchClient {
+                tool: tmux.clone(),
+                socket: sock.clone(),
+                client_tty: "/dev/ttys002".into(),
+                pane: "%3".into(),
+            },
+            Step::TmuxSelectWindow {
+                tool: tmux.clone(),
+                socket: sock.clone(),
+                pane: "%3".into(),
+            },
+            Step::TmuxSelectPane {
+                tool: tmux,
+                socket: sock,
+                pane: "%3".into(),
+            },
+            Step::SelectTab {
+                tool: osa.clone(),
+                family: TabFamily::Terminal,
+                tty: "/dev/ttys001".into(),
+            },
+            Step::SelectTab {
+                tool: osa,
+                family: TabFamily::Terminal,
+                tty: "/dev/ttys002".into(),
+            },
+        ]
+    );
+
+    // On X11 the raise goes through each client pid's window search.
+    let linux = record_with(Identity {
+        tmux: Some(focus::Tmux {
+            socket: "/tmp/tmux-1000/default".into(),
+            pane: "%3".into(),
+        }),
+        session_type: Some("x11".into()),
+        ..Identity::default()
+    });
+    let mut probes = probes_with(&[Tool::Tmux, Tool::Xdotool]);
+    probes.tmux_clients = vec![TmuxClient {
+        tty: "/dev/pts/4".into(),
+        pid: 301,
+    }];
+    probes.x11_windows.insert(301, vec![0x2a00001]);
+    let plan = cmd_focus::plan(Platform::Linux, &linux, &probes);
+    assert_eq!(
+        step_names(&plan),
+        vec![
+            "activate-x11",
+            "tmux-switch-client",
+            "tmux-select-window",
+            "tmux-select-pane"
+        ]
+    );
+}
+
+/// A pid search only raises when exactly one window matched, and a terminal
+/// whose start time changed is never searched.
+#[test]
+fn non_unique_and_stale_pid_searches_raise_nothing() {
+    let record = record_with(Identity {
+        terminal_pid: Some(41),
+        terminal_start: Some(6),
+        session_type: Some("x11".into()),
+        ..Identity::default()
+    });
+
+    let mut two = probes_with(&[Tool::Xdotool]);
+    two.x11_windows.insert(41, vec![1, 2]);
+    let plan = cmd_focus::plan(Platform::Linux, &record, &two);
+    assert!(plan.steps.is_empty(), "{:?}", plan.steps);
+    assert!(plan.notes.iter().any(|n| n.contains("2 visible windows")));
+
+    let mut stale = probes_with(&[Tool::Xdotool]);
+    stale.terminal_alive = false;
+    stale.x11_windows.insert(41, vec![1]);
+    let plan = cmd_focus::plan(Platform::Linux, &record, &stale);
+    assert!(plan.steps.is_empty());
+    assert!(plan.notes.iter().any(|n| n.contains("start time changed")));
+
+    // Wayland outside KDE: no raise at all, but a tmux record still gets its
+    // multiplexer steps.
+    let wayland = record_with(Identity {
+        session_type: Some("wayland".into()),
+        tmux: Some(focus::Tmux {
+            socket: "/tmp/tmux-1000/default".into(),
+            pane: "%1".into(),
+        }),
+        ..Identity::default()
+    });
+    let plan = cmd_focus::plan(
+        Platform::Linux,
+        &wayland,
+        &probes_with(&[Tool::Tmux, Tool::Xdotool]),
+    );
+    assert_eq!(
+        step_names(&plan),
+        vec!["tmux-select-window", "tmux-select-pane"]
+    );
+    assert!(plan.notes.iter().any(|n| n.contains("wayland")));
+}
+
+/// A step whose tool did not resolve is not planned, and says so.
+#[test]
+fn a_step_without_its_tool_is_not_planned() {
+    let record = record_with(Identity {
+        bundle_id: Some("com.apple.Terminal".into()),
+        tty: Some("/dev/ttys003".into()),
+        wezterm_pane: Some(1),
+        screen: Some(focus::Screen {
+            session: "1.host".into(),
+            window: 0,
+        }),
+        ..Identity::default()
+    });
+    let plan = cmd_focus::plan(Platform::Macos, &record, &probes_with(&[]));
+    assert!(plan.steps.is_empty(), "{:?}", plan.steps);
+    for tool in ["osascript", "wezterm", "screen"] {
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.contains(tool) || n.contains("tool not found")),
+            "no note about {tool}: {:?}",
+            plan.notes
+        );
+    }
+}
+
+/// The AppleScript bodies are constants that read their inputs through
+/// `on run argv`; the Ghostty body enforces the exactly-one rule itself.
+#[test]
+fn the_applescript_bodies_take_their_inputs_as_arguments() {
+    for (name, body) in [
+        ("terminal", platform::focus::TERMINAL_SELECT_TAB),
+        ("iterm2", platform::focus::ITERM2_SELECT_TAB),
+        ("ghostty", platform::focus::GHOSTTY_SELECT),
+    ] {
+        assert!(body.starts_with("on run argv"), "{name} does not read argv");
+        assert!(
+            body.contains("item 1 of argv"),
+            "{name} ignores its argument"
+        );
+        assert!(
+            !body.contains("{tty")
+                && !body.contains("{cwd")
+                && !body.contains("{}\"")
+                && !body.contains("format!"),
+            "{name} carries an interpolation marker"
+        );
+        assert!(
+            body.contains("is not running then return"),
+            "{name} could launch an application that has quit"
+        );
+    }
+    assert!(
+        platform::focus::GHOSTTY_SELECT.contains("(count of matched) is 1"),
+        "the working-directory fallback must select only a unique match"
+    );
+    assert_eq!(
+        TabFamily::from_bundle_id("com.apple.Terminal"),
+        Some(TabFamily::Terminal)
+    );
+    assert_eq!(TabFamily::from_bundle_id("com.microsoft.VSCode"), None);
+}
+
+/// The compile-time candidate list covers the locations the login session's
+/// PATH lacks (KTD10).
+#[test]
+fn the_tool_candidate_list_covers_the_locations_path_lacks() {
+    let mac: Vec<String> = platform::focus::candidate_dirs(Platform::Macos)
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+    for dir in [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/opt/local/bin",
+        "/Applications/kitty.app/Contents/MacOS",
+        "/Applications/WezTerm.app/Contents/MacOS",
+        "/Applications/Ghostty.app/Contents/MacOS",
+    ] {
+        assert!(
+            mac.iter().any(|d| d == dir),
+            "macOS candidates lack {dir}: {mac:?}"
+        );
+    }
+    assert!(mac.iter().any(|d| d.ends_with("/.cargo/bin")));
+    assert!(mac.iter().any(|d| d.ends_with("/.local/bin")));
+    let linux: Vec<String> = platform::focus::candidate_dirs(Platform::Linux)
+        .iter()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+    assert!(linux.iter().any(|d| d == "/usr/bin"));
+    assert!(
+        platform::focus::candidate_dirs(Platform::Windows).is_empty(),
+        "nothing is spawned on Windows"
+    );
+}
+
+/// `focus` with no arguments, two arguments, a malformed key, and a
+/// well-formed key with no record: exit 0, nothing on stdout or stderr, no
+/// file created, and a log line that names the session but never the token.
+#[test]
+fn the_focus_subcommand_exits_quietly_on_every_rejected_input() {
+    let dir = scratch_dir("focus-subcommand");
+    let home = dir.join("home");
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(&tmp).unwrap();
+    let home_s = home.to_str().unwrap();
+    let tmp_s = tmp.to_str().unwrap();
+    let env = [
+        ("HOME", home_s),
+        ("USERPROFILE", home_s),
+        ("TMPDIR", tmp_s),
+        ("TEMP", tmp_s),
+        ("STATUSLINE_DEBUG", "1"),
+    ];
+    let token = "t".repeat(32);
+    let well_formed = format!("no-such-session.{token}");
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("no-args", vec!["focus"]),
+        ("two-args", vec!["focus", &well_formed, "extra"]),
+        ("malformed", vec!["focus", "not a key"]),
+        ("scheme-uppercase", vec!["focus", "CLAUDE-STATUSLINE:a.b"]),
+        ("well-formed-no-record", vec!["focus", &well_formed]),
+    ];
+    let mut failures = Failures::default();
+    for (name, args) in cases {
+        let run = run_bin(&args, "", &env);
+        failures.check(name, run.code == Some(0), || format!("exit {:?}", run.code));
+        failures.check(name, run.stdout.is_empty() && run.stderr.is_empty(), || {
+            format!("stdout {:?} stderr {:?}", run.stdout, run.stderr)
+        });
+    }
+    let stray: Vec<String> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    failures.check("no-file", stray.is_empty(), || {
+        format!("a rejected click created state: {stray:?}")
+    });
+    let log = std::fs::read_to_string(home.join(".claude").join("statusline-debug.log"))
+        .unwrap_or_default();
+    failures.check(
+        "logs-the-miss",
+        log.contains("no record for no-such-session"),
+        || format!("the miss was not logged: {log}"),
+    );
+    failures.check("no-token-in-log", !log.contains(&token), || {
+        "the token reached the log".to_string()
+    });
+    failures.check(
+        "no-argument-bytes-in-log",
+        !log.contains("not a key"),
+        || "a rejected argument's bytes reached the log".to_string(),
+    );
+    failures.assert_empty("focus subcommand");
+}
+
+/// A resolved record whose anchor is gone and whose window is unverifiable
+/// still exits quietly and logs the decision, through the real `run`.
+#[test]
+fn a_resolved_record_with_nothing_to_do_logs_and_exits() {
+    let dir = scratch_dir("focus-resolved");
+    let home = dir.join("home");
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(&tmp).unwrap();
+    let root = claude_statusline::session::state_dir_in(&tmp);
+    let mut record = sample_record("resolved-1");
+    // A pid that never exists on any platform, with the debug flag carried
+    // in the record rather than the environment (KTD12).
+    record.anchor = Anchor {
+        pid: u64::from(u32::MAX) - 1,
+        start: 1,
+        boot_id: None,
+    };
+    record.debug = true;
+    record.identity.window = Some(focus::WindowIdentity {
+        handle: 1,
+        owner_pid: u64::from(u32::MAX) - 1,
+        owner_start: 1,
+        class: "ConsoleWindowClass".into(),
+        host: "console".into(),
+    });
+    let path = focus::record_path(&root, "resolved-1");
+    assert_eq!(
+        state::write_guarded_under(&root, &path, record.to_json().as_bytes()),
+        WriteOutcome::Written
+    );
+    let key = record.key().unwrap().as_string();
+    let home_s = home.to_str().unwrap();
+    let tmp_s = tmp.to_str().unwrap();
+    let run = run_bin(
+        &["focus", &key],
+        "",
+        &[
+            ("HOME", home_s),
+            ("USERPROFILE", home_s),
+            ("TMPDIR", tmp_s),
+            ("TEMP", tmp_s),
+        ],
+    );
+    assert_eq!(run.code, Some(0));
+    assert!(run.stdout.is_empty() && run.stderr.is_empty());
+    let log = std::fs::read_to_string(home.join(".claude").join("statusline-debug.log"))
+        .unwrap_or_default();
+    assert!(
+        log.contains("resolved-1: anchor_alive=false steps=[]"),
+        "the record's debug flag must enable the click path's log: {log}"
+    );
+    assert!(
+        !log.contains(record.token.as_str()),
+        "the token reached the log"
+    );
+    assert!(
+        path.is_file(),
+        "the click path must never unlink the record"
+    );
 }
