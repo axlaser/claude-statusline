@@ -533,6 +533,16 @@ The stable commands above stay on `master`.
 > installer first and run `.\install.ps1 --pre` — see
 > [Without piping to a shell](#without-piping-to-a-shell).
 
+**Uninstall** with the uninstaller from the same branch, which knows about
+everything that installer placed — the stable one may not yet:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.sh | bash
+```
+```powershell
+irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.ps1 | iex
+```
+
 `--pre` installs whatever tagged release is furthest ahead, prereleases included.
 Once a stable release overtakes them you get that stable release instead of an
 older preview, so `--pre` is safe to leave in an update command. Everything else
@@ -574,6 +584,17 @@ ever resolves to a dev build. Only the three newest builds are kept, and a
 commit whose message carries `[skip release]` publishes none.
 
 To leave the channel, re-run the install command without `--dev`.
+
+**Uninstall** with the uninstaller from `dev`, for the same reason as a
+prerelease: it matches the installer that placed the files. From a clone, that is
+`bash install/uninstall.sh` or `.\install\uninstall.ps1`.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.sh | bash
+```
+```powershell
+irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.ps1 | iex
+```
 
 ---
 
