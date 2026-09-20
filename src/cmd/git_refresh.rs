@@ -20,9 +20,10 @@ pub const INVALIDATING_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "Bash",
 
 /// The two caches a file-modifying tool invalidates.
 ///
-/// The tasks feed and the notification latch are deliberately absent: they are
-/// data stores rather than performance caches, and deleting them here
-/// would drop subagent rows and re-fire alerts on every edit.
+/// The tasks feed, the notification latch and the focus record are deliberately
+/// absent: they are data stores rather than performance caches, and deleting
+/// them here would drop subagent rows, re-fire alerts, and orphan the toasts a
+/// session already raised, on every edit.
 pub fn cache_paths(temp: &Path, safe_id: &str) -> Vec<PathBuf> {
     vec![
         temp.join(format!("statusline-git-{safe_id}.txt")),

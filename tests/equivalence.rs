@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use claude_statusline::clock::{Clock, TestClock};
 use claude_statusline::cmd::statusline as cmd_statusline;
 use claude_statusline::debug;
+use claude_statusline::focus::{self, Anchor, CaptureOutcome, Identity, Key, Observation, Record};
 use claude_statusline::git::{self, GitStatus, Porcelain};
 use claude_statusline::notify_state::{self, decide, Latch, LatchState};
 use claude_statusline::payload::{sanitize_display, Payload};
@@ -1397,6 +1398,7 @@ fn only_the_git_and_output_caches_are_invalidated() {
         format!("statusline-oc-{session}.txt"),
         format!("statusline-tasks-{session}.json"),
         format!("statusline-notify-{session}.json"),
+        format!("statusline-focus-{session}.json"),
         format!("statusline-sa-{session}-task-0001.txt"),
         "unrelated.txt".to_string(),
     ];
@@ -2268,6 +2270,7 @@ fn every_event_invokes_what_the_scripts_invoked() {
             c.stdin,
             &cfg,
             &full_env(),
+            None,
         ));
         let want: Vec<String> = c.want.iter().map(|s| s.to_string()).collect();
         failures.check(c.name, got == want, || {
@@ -2305,6 +2308,7 @@ fn muting_is_honoured_on_every_platform() {
             PERMISSION_PAYLOAD,
             &cfg,
             &env,
+            None,
         ));
         let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
         failures.check(name, got == want, || {
@@ -2321,6 +2325,7 @@ fn muting_is_honoured_on_every_platform() {
         PERMISSION_PAYLOAD,
         &cfg,
         &env,
+        None,
     );
     failures.check(
         "windows",
@@ -2341,7 +2346,15 @@ fn a_missing_helper_degrades_rather_than_dropping_the_notification() {
     env.programs.remove("paplay");
 
     let cfg = NotifyConfig::default();
-    let got = as_records(&notify::plan(Platform::Linux, "stop", "", "", &cfg, &env));
+    let got = as_records(&notify::plan(
+        Platform::Linux,
+        "stop",
+        "",
+        "",
+        &cfg,
+        &env,
+        None,
+    ));
     assert_eq!(
         got,
         vec!["ffplay\t-nodisp\t-autoexit\t-loglevel\tquiet\t/usr/share/sounds/freedesktop/stereo/complete.oga"],
@@ -2352,7 +2365,15 @@ fn a_missing_helper_degrades_rather_than_dropping_the_notification() {
     env.programs.remove("ffplay");
     env.programs.remove("ogg123");
     env.programs.insert("notify-send".to_string());
-    let got = as_records(&notify::plan(Platform::Linux, "stop", "", "", &cfg, &env));
+    let got = as_records(&notify::plan(
+        Platform::Linux,
+        "stop",
+        "",
+        "",
+        &cfg,
+        &env,
+        None,
+    ));
     assert_eq!(
         got,
         vec!["notify-send\tClaude Code\tFinished working\t--urgency=normal"]
@@ -2361,7 +2382,15 @@ fn a_missing_helper_degrades_rather_than_dropping_the_notification() {
     // The sound asset missing is the other half: Linux checks, macOS does not.
     let mut env = full_env();
     env.files.clear();
-    let got = as_records(&notify::plan(Platform::Linux, "stop", "", "", &cfg, &env));
+    let got = as_records(&notify::plan(
+        Platform::Linux,
+        "stop",
+        "",
+        "",
+        &cfg,
+        &env,
+        None,
+    ));
     assert_eq!(
         got,
         vec!["notify-send\tClaude Code\tFinished working\t--urgency=normal"],
@@ -2378,7 +2407,15 @@ fn the_icon_is_attached_only_when_it_exists() {
     env.files
         .insert(PathBuf::from("/home/fixture/.claude/claude-icon.png"));
 
-    let macos = as_records(&notify::plan(Platform::Macos, "stop", "", "", &cfg, &env));
+    let macos = as_records(&notify::plan(
+        Platform::Macos,
+        "stop",
+        "",
+        "",
+        &cfg,
+        &env,
+        None,
+    ));
     assert_eq!(
         macos,
         vec![
@@ -2387,7 +2424,15 @@ fn the_icon_is_attached_only_when_it_exists() {
         ]
     );
 
-    let linux = as_records(&notify::plan(Platform::Linux, "stop", "", "", &cfg, &env));
+    let linux = as_records(&notify::plan(
+        Platform::Linux,
+        "stop",
+        "",
+        "",
+        &cfg,
+        &env,
+        None,
+    ));
     assert!(
         linux
             .iter()
@@ -2419,6 +2464,7 @@ fn the_windows_toast_never_carries_the_message_in_its_argv() {
         &stdin,
         &NotifyConfig::default(),
         &full_env(),
+        None,
     );
 
     let Some(Action::Spawn {
@@ -2597,7 +2643,9 @@ fn notify_invocations_match_the_captured_fixtures() {
                 .filter(|l| !l.is_empty())
                 .map(str::to_string)
                 .collect();
-            let got = as_records(&notify::plan(platform, event, value, &payload, &cfg, &env));
+            let got = as_records(&notify::plan(
+                platform, event, value, &payload, &cfg, &env, None,
+            ));
 
             failures.check(&label, got == expected, || {
                 format!("script invoked {expected:?}, port planned {got:?}")
@@ -2640,12 +2688,16 @@ fn code_lines(body: &str, comment: char) -> impl Iterator<Item = (usize, &str)> 
 /// These four areas are where a platform difference is irreducible; a branch
 /// anywhere else is a behaviour that should be resolved to one recorded answer
 /// instead of forked.
-const PLATFORM_CONDITIONAL: [(&str, &str); 8] = [
+const PLATFORM_CONDITIONAL: [(&str, &str); 9] = [
     (
         "src/platform/mod.rs",
         "file-ownership checks and process-entry stream handling",
     ),
     ("src/platform/notify.rs", "notification delivery"),
+    (
+        "src/platform/focus.rs",
+        "notification delivery: click capture, transport and URI registration",
+    ),
     ("src/cmd/notify.rs", "notification delivery"),
     (
         "src/notify_state.rs",
@@ -7141,4 +7193,849 @@ fn an_unchanged_transcript_is_not_rescanned() {
     let grown_clock = TestClock::at(1_767_225_600).with_mtime(&transcript, grown_mtime);
     let fourth = cmd_statusline::run(&grown_clock, &roots, &payload);
     assert_ne!(fourth, first, "a transcript that grew must be rescanned");
+}
+
+// ---------------------------------------------------------------------------
+// Click-to-focus: record, key and capture
+// ---------------------------------------------------------------------------
+//
+// The focus record is the contract between the process that raises a toast
+// and the process that handles the click, possibly hours later and with none
+// of the session's environment. The cases below pin its grammar in both
+// directions: what capture writes, and what the loader refuses.
+
+/// A guarded state root under a fresh scratch directory, as the tick resolves
+/// it on a clean machine.
+fn guarded_root(case: &str) -> (PathBuf, claude_statusline::session::StateRoot) {
+    let dir = scratch_dir(case);
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).expect("tmp");
+    let root = claude_statusline::session::state_dir_in(&tmp);
+    assert!(root.is_guarded(), "a clean temp root must resolve guarded");
+    (dir, root)
+}
+
+fn env_vars(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+    let map: std::collections::BTreeMap<String, String> = pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    move |k: &str| map.get(k).cloned()
+}
+
+fn observation(random: Option<[u8; 24]>) -> Observation {
+    Observation {
+        anchor: Some(Anchor {
+            pid: 42,
+            start: 7,
+            boot_id: Some("9d1c-boot".to_string()),
+        }),
+        terminal: Some((41, 6)),
+        tty: Some("/dev/ttys003".to_string()),
+        cwd: "/repo/work".to_string(),
+        window: None,
+        random,
+    }
+}
+
+fn sample_record(session: &str) -> Record {
+    Record {
+        session: session.to_string(),
+        token: "A".repeat(32),
+        captured_at: 1,
+        anchor: Anchor {
+            pid: 42,
+            start: 7,
+            boot_id: Some("9d1c-boot".to_string()),
+        },
+        cwd: "/repo/work".to_string(),
+        debug: false,
+        identity: Identity::default(),
+    }
+}
+
+/// The names of every `statusline-focus-*` file under `dir`.
+fn focus_files(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("statusline-focus-"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The state directory a fresh-process run created under `tmp`, if any.
+fn state_dir_under(tmp: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(tmp)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("claude-statusline-"))
+        })
+}
+
+/// Only a toast gets a click key: a visual alert writes the record inside the
+/// guarded state directory, a sound-only alert writes nothing.
+#[test]
+fn a_visual_alert_writes_the_focus_record_and_a_sound_only_alert_does_not() {
+    let mut failures = Failures::default();
+    for (name, config, want_record) in [
+        ("visual", "{}", true),
+        (
+            "sound-only",
+            r#"{"context_high":{"visual":false},"rate_limit":{"visual":false}}"#,
+            false,
+        ),
+    ] {
+        let dir = scratch_dir(&format!("focus-alert-{name}"));
+        let home = dir.join("home");
+        let tmp = dir.join("tmp");
+        std::fs::create_dir_all(home.join(".claude")).expect("home");
+        std::fs::create_dir_all(&tmp).expect("tmp");
+        std::fs::write(home.join(".claude").join("notify-config.json"), config).expect("config");
+        let resolved = claude_statusline::session::state_dir_in(&tmp);
+        let session = format!("focus-alert-{name}");
+        let payload = format!(
+            r#"{{"session_id":"{session}","cwd":"{cwd}","workspace":{{"current_dir":"{cwd}"}},"model":{{"display_name":"Opus 5","id":"claude-opus-5"}},"context_window":{{"context_window_size":200000,"used_percentage":91.5}},"rate_limits":{{"five_hour":{{"used_percentage":95}}}}}}"#,
+            cwd = slashed(&dir),
+        );
+        let roots = cmd_statusline::Roots {
+            home: Some(home.clone()),
+            temp: resolved.clone(),
+        };
+        let rendered = cmd_statusline::run(&TestClock::at(1_000), &roots, &payload);
+        failures.check(name, rendered.contains('\u{250f}'), || {
+            "the render produced no box".to_string()
+        });
+        let files = focus_files(resolved.path());
+        failures.check(name, files.is_empty() != want_record, || {
+            format!("focus records after the alert: {files:?}")
+        });
+        if want_record {
+            let bytes = std::fs::read(
+                resolved
+                    .path()
+                    .join(format!("statusline-focus-{session}.json")),
+            )
+            .unwrap_or_default();
+            let record = Record::load(&bytes, &session, None);
+            failures.check(name, record.is_some(), || {
+                format!(
+                    "the written record does not load: {}",
+                    String::from_utf8_lossy(&bytes)
+                )
+            });
+            if let Some(r) = record {
+                failures.check(name, r.anchor.pid != 0 || r.anchor.start == 0, || {
+                    "an anchor with a start time but no pid".to_string()
+                });
+            }
+        }
+        // A sanitised session id is the whole filename: nothing may land flat.
+        failures.check(name, focus_files(&tmp).is_empty(), || {
+            "a focus record landed flat in the temp root".to_string()
+        });
+    }
+    failures.assert_empty("focus capture on alerts");
+}
+
+/// Every toast a session raises keeps working: the token is minted once and
+/// reused while the stored record is trusted and well-formed, and replaced
+/// the moment it is not.
+#[test]
+fn a_second_capture_keeps_the_token_and_a_bad_stored_token_is_replaced() {
+    let (_dir, root) = guarded_root("focus-token-reuse");
+    let var = env_vars(&[("TERM_PROGRAM", "Apple_Terminal")]);
+    let first = focus::capture_with(
+        &root,
+        "reuse-1",
+        false,
+        Platform::Macos,
+        &var,
+        &observation(Some([1u8; 24])),
+        10,
+    );
+    assert_eq!(first.outcome, CaptureOutcome::Written);
+    let first_key = first.key.expect("first capture yields a key");
+
+    let second = focus::capture_with(
+        &root,
+        "reuse-1",
+        true,
+        Platform::Macos,
+        &env_vars(&[("TERM_PROGRAM", "iTerm.app")]),
+        &observation(Some([2u8; 24])),
+        20,
+    );
+    assert_eq!(second.outcome, CaptureOutcome::Reused);
+    assert_eq!(
+        second.key.as_ref().map(Key::as_string),
+        Some(first_key.as_string()),
+        "the second capture must keep the first token"
+    );
+    let path = focus::record_path(&root, "reuse-1");
+    let stored = Record::load(&std::fs::read(&path).unwrap(), "reuse-1", None).unwrap();
+    assert_eq!(
+        stored.identity.term_program.as_deref(),
+        Some("iTerm.app"),
+        "the identity fields are refreshed on every capture"
+    );
+    assert!(stored.debug, "the debug flag is refreshed too");
+    assert_eq!(stored.captured_at, 20);
+
+    // A trusted record whose token is the wrong length is regenerated.
+    let mut broken = sample_record("reuse-1");
+    broken.token = "A".repeat(31);
+    std::fs::write(&path, broken.to_json()).unwrap();
+    let third = focus::capture_with(
+        &root,
+        "reuse-1",
+        false,
+        Platform::Macos,
+        &var,
+        &observation(Some([3u8; 24])),
+        30,
+    );
+    assert_eq!(third.outcome, CaptureOutcome::Written);
+    let third_key = third.key.expect("a fresh token");
+    assert_ne!(third_key.token(), first_key.token());
+    assert_eq!(third_key.token(), focus::encode_token(&[3u8; 24]));
+}
+
+/// The loader is a closed gate: size before parsing, then version, session
+/// and token, and it tolerates only what the grammar leaves open.
+#[test]
+fn the_loader_refuses_what_it_must_and_tolerates_unknown_identity_keys() {
+    let record = sample_record("load-1");
+    let base: serde_json::Value = serde_json::from_str(&record.to_json()).unwrap();
+    let with = |edit: &dyn Fn(&mut serde_json::Value)| {
+        let mut v = base.clone();
+        edit(&mut v);
+        v.to_string().into_bytes()
+    };
+    let mut failures = Failures::default();
+
+    let good = Record::load(
+        &base.to_string().into_bytes(),
+        "load-1",
+        Some(&"A".repeat(32)),
+    );
+    failures.check("round-trip", good.as_ref() == Some(&record), || {
+        format!("the record did not round-trip: {good:?}")
+    });
+
+    let cases: Vec<(&str, Vec<u8>, &str, Option<String>)> = vec![
+        (
+            "version-2",
+            with(&|v| v["version"] = serde_json::json!(2)),
+            "load-1",
+            None,
+        ),
+        (
+            "oversize",
+            with(&|v| v["pad"] = serde_json::json!("x".repeat(65 * 1024))),
+            "load-1",
+            None,
+        ),
+        (
+            "token-off-by-one",
+            base.to_string().into_bytes(),
+            "load-1",
+            Some(format!("{}B", "A".repeat(31))),
+        ),
+        (
+            "session-differs",
+            base.to_string().into_bytes(),
+            "load-2",
+            None,
+        ),
+        (
+            "token-wrong-length",
+            with(&|v| v["token"] = serde_json::json!("A".repeat(31))),
+            "load-1",
+            None,
+        ),
+        (
+            "debug-not-bool",
+            with(&|v| v["debug"] = serde_json::json!("yes")),
+            "load-1",
+            None,
+        ),
+        ("not-an-object", b"[1,2,3]".to_vec(), "load-1", None),
+    ];
+    for (name, bytes, session, token) in cases {
+        let got = Record::load(&bytes, session, token.as_deref());
+        failures.check(name, got.is_none(), || {
+            format!("loaded a record it must refuse: {got:?}")
+        });
+    }
+
+    let tolerated = with(&|v| v["identity"]["future_terminal"] = serde_json::json!({"a": 1}));
+    failures.check(
+        "unknown-identity-key",
+        Record::load(&tolerated, "load-1", None).is_some(),
+        || "an unknown optional identity key must be ignored, not refused".to_string(),
+    );
+    failures.assert_empty("focus loader");
+}
+
+/// One identity field failing its grammar costs that field, named in the
+/// outcome, and never the record.
+#[test]
+fn a_kitty_tcp_socket_is_omitted_by_name_and_the_record_still_lands() {
+    let (_dir, root) = guarded_root("focus-omit");
+    let var = env_vars(&[
+        ("KITTY_LISTEN_ON", "tcp:localhost:1"),
+        ("KITTY_WINDOW_ID", "3"),
+        ("WEZTERM_PANE", "not-a-number"),
+    ]);
+    let capture = focus::capture_with(
+        &root,
+        "omit-1",
+        false,
+        Platform::Linux,
+        &var,
+        &observation(Some([5u8; 24])),
+        1,
+    );
+    assert_eq!(capture.outcome, CaptureOutcome::Written);
+    assert!(capture.key.is_some());
+    assert!(
+        capture.omitted.contains(&"kitty_socket") && capture.omitted.contains(&"wezterm_pane"),
+        "omitted fields must be named: {:?}",
+        capture.omitted
+    );
+    let bytes = std::fs::read(focus::record_path(&root, "omit-1")).unwrap();
+    let record = Record::load(&bytes, "omit-1", None).expect("the record loads");
+    assert_eq!(record.identity.kitty_socket, None);
+    assert_eq!(record.identity.kitty_window_id, Some(3));
+    assert_eq!(record.identity.wezterm_pane, None);
+    assert_eq!(record.identity.terminal_pid, Some(41));
+}
+
+/// Inside a multiplexer the tty and window id the process sees belong to the
+/// multiplexer; storing them would select the wrong tab.
+#[test]
+fn a_capture_inside_tmux_stores_only_the_multiplexer_identity() {
+    let var = env_vars(&[
+        ("TMUX", "/tmp/tmux-1000/default,123,0"),
+        ("TMUX_PANE", "%3"),
+        ("WINDOWID", "99"),
+        ("KITTY_LISTEN_ON", "unix:/tmp/kitty"),
+        ("KITTY_WINDOW_ID", "1"),
+        ("__CFBundleIdentifier", "com.apple.Terminal"),
+    ]);
+    let mut failures = Failures::default();
+    for platform in [Platform::Macos, Platform::Linux] {
+        let (id, omitted) = focus::identity_from_env(platform, &var, &observation(None));
+        let name = format!("{platform:?}");
+        failures.check(&name, omitted.is_empty(), || format!("omitted {omitted:?}"));
+        failures.check(
+            &name,
+            id.tmux
+                .as_ref()
+                .map(|t| (t.socket.as_str(), t.pane.as_str()))
+                == Some(("/tmp/tmux-1000/default", "%3")),
+            || format!("tmux identity: {:?}", id.tmux),
+        );
+        failures.check(&name, id.tty.is_none() && id.window_id.is_none(), || {
+            format!(
+                "tty {:?} window_id {:?} stored inside tmux",
+                id.tty, id.window_id
+            )
+        });
+        failures.check(
+            &name,
+            id.kitty_socket.is_none() && id.terminal_pid.is_none(),
+            || "terminal-level identity stored inside tmux".to_string(),
+        );
+        failures.check(
+            &name,
+            id.bundle_id.as_deref() == Some("com.apple.Terminal"),
+            || "the bundle id still travels, for app activation".to_string(),
+        );
+    }
+    failures.assert_empty("tmux capture");
+}
+
+/// One bad value per R18 field makes the whole record unusable.
+#[test]
+fn one_bad_value_per_field_makes_the_record_unusable() {
+    let mut record = sample_record("bad-1");
+    record.identity = Identity {
+        bundle_id: Some("com.apple.Terminal".into()),
+        tty: Some("/dev/ttys003".into()),
+        kitty_socket: Some("unix:/tmp/kitty".into()),
+        kitty_window_id: Some(1),
+        tmux: Some(focus::Tmux {
+            socket: "/tmp/tmux-1000/default".into(),
+            pane: "%3".into(),
+        }),
+        screen: Some(focus::Screen {
+            session: "1234.pts-0.host".into(),
+            window: 2,
+        }),
+        konsole: Some(focus::Konsole {
+            service: "org.kde.konsole-4242".into(),
+            window: "/Windows/1".into(),
+            session: 7,
+        }),
+        window: Some(focus::WindowIdentity {
+            handle: 0x30914,
+            owner_pid: 9416,
+            owner_start: 133_000_000,
+            class: "CASCADIA_HOSTING_WINDOW_CLASS".into(),
+            host: "windows-terminal".into(),
+        }),
+        ..Identity::default()
+    };
+    let base: serde_json::Value = serde_json::from_str(&record.to_json()).unwrap();
+    assert!(
+        Record::load(&base.to_string().into_bytes(), "bad-1", None).is_some(),
+        "the full record must load before its fields are broken one at a time"
+    );
+
+    type Edit = Box<dyn Fn(&mut serde_json::Value)>;
+    let edits: Vec<(&str, Edit)> = vec![
+        (
+            "tmux-name-target",
+            Box::new(|v| v["identity"]["tmux"]["pane"] = serde_json::json!("main")),
+        ),
+        (
+            "tmux-relative-socket",
+            Box::new(|v| v["identity"]["tmux"]["socket"] = serde_json::json!("tmp/sock")),
+        ),
+        (
+            "kitty-tcp-socket",
+            Box::new(|v| v["identity"]["kitty_socket"] = serde_json::json!("tcp:localhost:1")),
+        ),
+        (
+            "tty-outside-pattern",
+            Box::new(|v| v["identity"]["tty"] = serde_json::json!("/dev/ttyp1")),
+        ),
+        (
+            "cwd-newline",
+            Box::new(|v| v["cwd"] = serde_json::json!("/repo\nwork")),
+        ),
+        (
+            "cwd-relative",
+            Box::new(|v| v["cwd"] = serde_json::json!("repo/work")),
+        ),
+        (
+            "handle-not-numeric",
+            Box::new(|v| v["identity"]["window"]["handle"] = serde_json::json!("12")),
+        ),
+        (
+            "handle-float",
+            Box::new(|v| v["identity"]["window"]["handle"] = serde_json::json!(1.5)),
+        ),
+        (
+            "window-class-unknown",
+            Box::new(|v| v["identity"]["window"]["class"] = serde_json::json!("Notepad")),
+        ),
+        (
+            "window-class-pseudo-console",
+            Box::new(|v| {
+                v["identity"]["window"]["class"] = serde_json::json!("PseudoConsoleWindow")
+            }),
+        ),
+        (
+            "host-unknown",
+            Box::new(|v| v["identity"]["window"]["host"] = serde_json::json!("emacs")),
+        ),
+        (
+            "konsole-service",
+            Box::new(|v| {
+                v["identity"]["konsole"]["service"] = serde_json::json!("org.kde.konsole")
+            }),
+        ),
+        (
+            "konsole-window",
+            Box::new(|v| v["identity"]["konsole"]["window"] = serde_json::json!("/MainWindow_1")),
+        ),
+        (
+            "screen-session",
+            Box::new(|v| v["identity"]["screen"]["session"] = serde_json::json!("pts-0.host")),
+        ),
+        (
+            "bundle-id",
+            Box::new(|v| v["identity"]["bundle_id"] = serde_json::json!("com.apple Terminal")),
+        ),
+        (
+            "anchor-pid-negative",
+            Box::new(|v| v["anchor"]["pid"] = serde_json::json!(-1)),
+        ),
+        (
+            "boot-id-space",
+            Box::new(|v| v["anchor"]["boot_id"] = serde_json::json!("a b")),
+        ),
+        (
+            "session-type",
+            Box::new(|v| v["identity"]["session_type"] = serde_json::json!("mir")),
+        ),
+    ];
+    let mut failures = Failures::default();
+    for (name, edit) in edits {
+        let mut v = base.clone();
+        edit(&mut v);
+        let got = Record::load(&v.to_string().into_bytes(), "bad-1", None);
+        failures.check(name, got.is_none(), || {
+            "loaded despite the bad field".to_string()
+        });
+    }
+    failures.assert_empty("R18 grammar");
+}
+
+/// R12: length first, then byte-exact. Nothing is trimmed, decoded or folded.
+#[test]
+fn key_grammar_rejects_every_variation() {
+    let token = "abcdefghijklmnopqrstuvwxyzABCDEF";
+    let good = format!("sess-1.{token}");
+    let parsed = Key::parse(&good).expect("a valid key parses");
+    assert_eq!(parsed.session(), "sess-1");
+    assert_eq!(parsed.token(), token);
+    assert_eq!(parsed.as_string(), good);
+    assert_eq!(parsed.uri(), format!("claude-statusline:{good}"));
+    assert_eq!(
+        Key::parse_argument(&format!("claude-statusline:{good}")).map(|k| k.as_string()),
+        Some(good.clone()),
+        "the exact lowercase scheme prefix is accepted"
+    );
+    assert_eq!(
+        parsed.record_path(Path::new("/state")),
+        PathBuf::from("/state").join("statusline-focus-sess-1.json")
+    );
+
+    let mut failures = Failures::default();
+    let bad = [
+        ("dots-in-session", format!("a..b.{token}")),
+        ("slash", format!("a/b.{token}")),
+        ("backslash", format!("a\\b.{token}")),
+        ("uppercase-scheme", format!("CLAUDE-STATUSLINE:{good}")),
+        ("scheme-slashes", format!("claude-statusline://{good}")),
+        ("token-short", format!("sess-1.{}", &token[..31])),
+        ("token-long", format!("sess-1.{token}A")),
+        ("percent-encoded", format!("sess%2D1.{token}")),
+        ("embedded-space", format!("sess 1.{token}")),
+        ("leading-space", format!(" {good}")),
+        ("trailing-newline", format!("{good}\n")),
+        ("empty-session", format!(".{token}")),
+        ("no-separator", format!("sess-1{token}")),
+        ("session-too-long", format!("{}.{token}", "s".repeat(129))),
+        ("empty", String::new()),
+    ];
+    for (name, arg) in bad {
+        failures.check(name, Key::parse_argument(&arg).is_none(), || {
+            format!("accepted {arg:?}")
+        });
+    }
+    failures.assert_empty("key grammar");
+}
+
+/// A record reached through a symlink reads as no record, exactly like the
+/// latch and the token record. A foreign owner needs a second uid to stage
+/// and is covered by `owner_check_fail_direction_matches_the_shipped_fix`.
+#[cfg(unix)]
+#[test]
+fn a_symlinked_focus_record_reads_as_none() {
+    let (dir, root) = guarded_root("focus-symlink");
+    let capture = focus::capture_with(
+        &root,
+        "link-1",
+        false,
+        Platform::Linux,
+        &env_vars(&[]),
+        &observation(Some([9u8; 24])),
+        1,
+    );
+    assert_eq!(capture.outcome, CaptureOutcome::Written);
+    let path = focus::record_path(&root, "link-1");
+    let elsewhere = dir.join("elsewhere.json");
+    std::fs::copy(&path, &elsewhere).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    assert!(make_symlink(&elsewhere, &path));
+    assert!(
+        state::read_trusted(&path).is_none(),
+        "a symlinked record must not be read"
+    );
+    // And capture regenerates through it: the link is removed, not followed.
+    let again = focus::capture_with(
+        &root,
+        "link-1",
+        false,
+        Platform::Linux,
+        &env_vars(&[]),
+        &observation(Some([8u8; 24])),
+        2,
+    );
+    assert_eq!(again.outcome, CaptureOutcome::Written);
+    assert!(!std::fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+/// R19: on the flat temp-root fallback nothing is written, the outcome says
+/// so, and the toast is planned exactly as it is today.
+#[test]
+fn capture_on_an_unguarded_root_writes_nothing_and_leaves_the_toast_unchanged() {
+    let dir = scratch_dir("focus-unguarded");
+    let root = inherited(&dir);
+    let capture = focus::capture_with(
+        &root,
+        "flat-1",
+        false,
+        Platform::Macos,
+        &env_vars(&[]),
+        &observation(Some([4u8; 24])),
+        1,
+    );
+    assert_eq!(capture.outcome, CaptureOutcome::Unguarded);
+    assert!(capture.key.is_none());
+    assert!(
+        focus_files(&dir).is_empty(),
+        "a record landed on the flat root"
+    );
+
+    let today = as_records(&notify::plan(
+        Platform::Macos,
+        "permission",
+        "",
+        PERMISSION_PAYLOAD,
+        &NotifyConfig::default(),
+        &full_env(),
+        capture.key.as_ref(),
+    ));
+    assert_eq!(
+        today,
+        vec![
+            "afplay\t/System/Library/Sounds/Tink.aiff".to_string(),
+            "terminal-notifier\t-title\tClaude Code\t-message\tBash: git status --porcelain"
+                .to_string(),
+        ]
+    );
+}
+
+/// KTD13: no randomness, no token, no record; and the tokens the OS does
+/// produce are 32 characters of the URL-safe alphabet and differ.
+#[test]
+fn a_randomness_failure_writes_no_record_and_tokens_are_well_formed() {
+    let (_dir, root) = guarded_root("focus-random");
+    let capture = focus::capture_with(
+        &root,
+        "rand-1",
+        false,
+        Platform::Linux,
+        &env_vars(&[]),
+        &observation(None),
+        1,
+    );
+    assert_eq!(capture.outcome, CaptureOutcome::NoRandomness);
+    assert!(capture.key.is_none());
+    assert!(focus_files(root.path()).is_empty());
+
+    let a = platform::focus::random_bytes().expect("the OS supplies randomness");
+    let b = platform::focus::random_bytes().expect("the OS supplies randomness");
+    assert_ne!(a, b, "two draws must differ");
+    for bytes in [a, b] {
+        let token = focus::encode_token(&bytes);
+        assert_eq!(token.len(), 32);
+        assert!(token
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'));
+    }
+    assert_eq!(focus::encode_token(&[0u8; 24]), "A".repeat(32));
+    assert_eq!(focus::encode_token(&[0xff; 24]), "_".repeat(32));
+}
+
+/// A tick that crosses nothing touches nothing new.
+#[test]
+fn a_tick_without_an_alert_writes_no_focus_record() {
+    let dir = scratch_dir("focus-quiet-tick");
+    let home = dir.join("home");
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(home.join(".claude")).expect("home");
+    std::fs::create_dir_all(&tmp).expect("tmp");
+    let resolved = claude_statusline::session::state_dir_in(&tmp);
+    let payload = format!(
+        r#"{{"session_id":"quiet-1","cwd":"{cwd}","workspace":{{"current_dir":"{cwd}"}},"model":{{"display_name":"Opus 5","id":"claude-opus-5"}},"context_window":{{"context_window_size":200000,"used_percentage":12}},"rate_limits":{{"five_hour":{{"used_percentage":5}}}}}}"#,
+        cwd = slashed(&dir),
+    );
+    let roots = cmd_statusline::Roots {
+        home: Some(home),
+        temp: resolved.clone(),
+    };
+    let rendered = cmd_statusline::run(&TestClock::at(1_000), &roots, &payload);
+    assert!(rendered.contains('\u{250f}'));
+    assert!(
+        focus_files(resolved.path()).is_empty() && focus_files(&tmp).is_empty(),
+        "a quiet tick wrote a focus record"
+    );
+}
+
+/// KTD11: every hook event reads its payload when stdin is a pipe, so a stop
+/// toast can name its session; a null stdin proceeds with no record; a payload
+/// past the cap is truncated with a log line and the notification still goes
+/// out.
+#[test]
+fn notify_stop_records_the_session_from_its_piped_payload() {
+    let dir = scratch_dir("focus-hook-stdin");
+    let home = dir.join("home");
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(home.join(".claude")).expect("home");
+    std::fs::create_dir_all(&tmp).expect("tmp");
+    let home_s = home.to_str().unwrap();
+    let tmp_s = tmp.to_str().unwrap();
+    // No toast may reach this machine's desktop: the Windows interpreter is
+    // resolved under an empty SystemRoot and the Unix helpers under an empty
+    // PATH, so the planned spawn fails silently, exactly as a missing helper
+    // does in the field.
+    let env = [
+        ("HOME", home_s),
+        ("USERPROFILE", home_s),
+        ("TMPDIR", tmp_s),
+        ("TEMP", tmp_s),
+        ("SystemRoot", tmp_s),
+        ("PATH", ""),
+        ("STATUSLINE_DEBUG", "1"),
+    ];
+
+    let piped = run_bin(&["notify", "stop"], r#"{"session_id":"hook-stop-1"}"#, &env);
+    assert_eq!(piped.code, Some(0));
+    assert_eq!(piped.stderr, "");
+    let state = state_dir_under(&tmp).expect("the hook created the state directory");
+    assert!(
+        state.join("statusline-focus-hook-stop-1.json").is_file(),
+        "the stop hook did not record its session: {:?}",
+        focus_files(&state)
+    );
+
+    let silent = run_bin(&["notify", "compaction_done"], "", &env);
+    assert_eq!(silent.code, Some(0));
+    assert_eq!(
+        focus_files(&state).len(),
+        1,
+        "a hook with no payload must not write a record"
+    );
+
+    // 32 MiB and one byte more: the take truncates, the JSON no longer parses,
+    // and the log says why. The notification itself still renders (exit 0).
+    let mut huge = String::from(r#"{"session_id":"hook-cap-1","pad":""#);
+    huge.push_str(&"x".repeat(32 * 1024 * 1024));
+    huge.push_str("\"}");
+    let capped = run_bin(&["notify", "stop"], &huge, &env);
+    assert_eq!(capped.code, Some(0));
+    assert_eq!(capped.stderr, "");
+    assert!(
+        !state.join("statusline-focus-hook-cap-1.json").exists(),
+        "a truncated payload must not yield a session"
+    );
+    let log = std::fs::read_to_string(home.join(".claude").join("statusline-debug.log"))
+        .unwrap_or_default();
+    assert!(
+        log.contains("stdin capped at"),
+        "the cap must be logged: {log}"
+    );
+    assert!(
+        !log.contains("hook-stop-1.") || !log.contains("token"),
+        "no log line may carry a token"
+    );
+}
+
+/// The detached child carries the key as a fourth argv value, and the
+/// three-value form the hooks have always used still works.
+#[test]
+fn the_detached_child_carries_the_key_as_a_fourth_argument() {
+    let alert = notify_state::Alert {
+        event: "context_high",
+        value: 82,
+    };
+    assert_eq!(
+        notify_state::spawn_args(&alert, None),
+        vec!["notify", "context_high", "82"]
+    );
+    let key = Key::parse(&format!("s1.{}", "k".repeat(32))).unwrap();
+    assert_eq!(
+        notify_state::spawn_args(&alert, Some(&key)),
+        vec![
+            "notify",
+            "context_high",
+            "82",
+            &format!("s1.{}", "k".repeat(32))
+        ]
+    );
+
+    // The fourth value is parsed, not trusted: a malformed one yields no key
+    // and the notification still goes out, as a fresh process shows.
+    let dir = scratch_dir("focus-fourth-arg");
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let tmp_s = tmp.to_str().unwrap();
+    let run = run_bin(
+        &["notify", "context_high", "82", "not a key"],
+        "",
+        &[
+            ("TMPDIR", tmp_s),
+            ("TEMP", tmp_s),
+            ("SystemRoot", tmp_s),
+            ("PATH", ""),
+        ],
+    );
+    assert_eq!(run.code, Some(0));
+    assert_eq!(run.stderr, "");
+}
+
+/// The anchor is Claude Code: named by `CLAUDE_PID` when it is in the chain,
+/// otherwise the first non-shell ancestor; the terminal is the first non-shell
+/// above it.
+#[test]
+fn the_anchor_is_the_first_non_shell_ancestor_unless_claude_pid_names_it() {
+    let p = |pid: u64, ppid: u64, name: &str| focus::ProcessInfo {
+        pid,
+        ppid,
+        name: name.to_string(),
+        start: pid * 10,
+    };
+    let chain = vec![
+        p(50, 40, "claude-statusline"),
+        p(40, 30, "bash.exe"),
+        p(30, 20, "claude.exe"),
+        p(20, 10, "pwsh.exe"),
+        p(10, 1, "WindowsTerminal.exe"),
+    ];
+    let (anchor, terminal) = focus::select_anchor(&chain, None);
+    assert_eq!(anchor.as_ref().map(|a| a.pid), Some(30));
+    assert_eq!(
+        terminal.as_ref().map(|t| t.name.as_str()),
+        Some("WindowsTerminal.exe")
+    );
+
+    // CLAUDE_PID overrides the shell heuristic when it is genuinely an ancestor.
+    let (anchor, _) = focus::select_anchor(&chain, Some(20));
+    assert_eq!(anchor.as_ref().map(|a| a.pid), Some(20));
+    // ...and is ignored when it is not in the chain.
+    let (anchor, _) = focus::select_anchor(&chain, Some(999));
+    assert_eq!(anchor.as_ref().map(|a| a.pid), Some(30));
+
+    let unix = vec![
+        p(5, 4, "claude-statusline"),
+        p(4, 3, "sh"),
+        p(3, 2, "node"),
+        p(2, 1, "-zsh"),
+        p(1, 0, "gnome-terminal-server"),
+    ];
+    let (anchor, terminal) = focus::select_anchor(&unix, None);
+    assert_eq!(anchor.as_ref().map(|a| a.pid), Some(3));
+    assert_eq!(terminal.as_ref().map(|t| t.pid), Some(1));
+
+    assert_eq!(
+        focus::select_anchor(&[p(1, 0, "claude-statusline")], None),
+        (None, None)
+    );
+    assert!(focus::is_shell("-bash") && focus::is_shell("PWSH.EXE") && !focus::is_shell("node"));
 }

@@ -12,6 +12,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::focus::Key;
 use crate::session::sanitize_session_id;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -166,25 +167,43 @@ pub fn decide(
     }
 }
 
-/// Re-executes this binary as `claude-statusline notify <event> <value>`,
-/// detached and never waited on.
+/// The child's argv: `notify <event> <value>`, plus the click key as a fourth
+/// value when the tick captured one.
+///
+/// The child cannot capture for itself — it has no console, and its parent
+/// has exited by the time it runs — so the key travels in argv. The token is
+/// visible there to same-user processes, which are inside the boundary
+/// already (KTD1).
+pub fn spawn_args(alert: &Alert, key: Option<&Key>) -> Vec<String> {
+    let mut args = vec![
+        "notify".to_string(),
+        alert.event.to_string(),
+        alert.value.to_string(),
+    ];
+    if let Some(key) = key {
+        args.push(key.as_string());
+    }
+    args
+}
+
+/// Re-executes this binary as `claude-statusline notify <event> <value>
+/// [<key>]`, detached and never waited on.
 ///
 /// The render path must not deliver inline: a notification that blocks is a
 /// status line that stops refreshing. This mirrors the scripts' `&` and
 /// `Start-Process -WindowStyle Hidden`.
-pub fn spawn(alert: &Alert) {
+pub fn spawn(alert: &Alert, key: Option<&Key>) {
     let Ok(exe) = std::env::current_exe() else {
         crate::debug::log(|| "notify spawn: cannot resolve current_exe".to_string());
         return;
     };
     let mut command = std::process::Command::new(exe);
     command
-        .arg("notify")
-        .arg(alert.event)
-        .arg(alert.value.to_string())
-        // The child must not inherit this tick's pipes. `notify` only reads
-        // stdin for the permission event, but an inherited stdout would keep
-        // the parent's pipe open past exit and stall whoever is reading it.
+        .args(spawn_args(alert, key))
+        // The child must not inherit this tick's pipes. A null stdin returns
+        // end-of-file at once to the hook-payload read every event now makes,
+        // and an inherited stdout would keep the parent's pipe open past exit
+        // and stall whoever is reading it.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

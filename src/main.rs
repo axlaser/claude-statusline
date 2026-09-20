@@ -9,7 +9,7 @@
 use std::io::Write;
 
 use claude_statusline::{
-    clock, cmd, config, debug, entry, platform, self_check, session, settings,
+    clock, cmd, config, debug, entry, focus, platform, self_check, session, settings,
 };
 
 /// Reads all of stdin, treating an unreadable or non-UTF-8 stream as empty.
@@ -21,6 +21,38 @@ fn read_stdin() -> String {
     let mut buf = Vec::new();
     if std::io::stdin().read_to_end(&mut buf).is_err() {
         return String::new();
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The most a hook payload may occupy. A large `Write` permission still
+/// arrives whole; a runaway stream cannot exhaust memory.
+const HOOK_STDIN_CAP: u64 = 32 * 1024 * 1024;
+
+/// The hook payload for `notify`: read when stdin is not a terminal, capped.
+///
+/// One rule for every event (KTD11). The session id in the payload is what
+/// lets a stop or compaction toast be clicked into, so every hook reads its
+/// input now, not only `permission`. An interactive shell is skipped so
+/// `claude-statusline notify stop` typed at a prompt stays usable, and the
+/// tick-spawned child's null stdin returns end-of-file at once.
+fn read_hook_stdin() -> String {
+    use std::io::{IsTerminal, Read};
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return String::new();
+    }
+    let mut buf = Vec::new();
+    if stdin
+        .lock()
+        .take(HOOK_STDIN_CAP)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        return String::new();
+    }
+    if buf.len() as u64 == HOOK_STDIN_CAP {
+        debug::log(|| format!("notify: stdin capped at {HOOK_STDIN_CAP} bytes"));
     }
     String::from_utf8_lossy(&buf).into_owned()
 }
@@ -189,17 +221,22 @@ fn dispatch(sub: &str, rest: &[&str]) {
         "notify" => {
             let event = rest.first().copied().unwrap_or("");
             let value = rest.get(1).copied().unwrap_or("");
-            // Only the permission event carries a payload, and only it reads
-            // stdin — the status line invokes the others with no input at all,
-            // and a blocking read there would hang the tick that spawned it.
-            let payload = if event == "permission" {
-                read_stdin()
-            } else {
-                String::new()
-            };
+            let payload = read_hook_stdin();
             let cfg = config::NotifyConfig::default_path()
                 .map(|p| config::NotifyConfig::load(&p))
                 .unwrap_or_default();
+            // The tick-spawned child carries the key the tick captured as a
+            // fourth value; a hook captures its own, naming the session from
+            // the payload. Either way only a toast gets one (R5).
+            let key = match rest.get(2) {
+                Some(arg) => focus::Key::parse(arg),
+                None if cfg.event(event).visual => {
+                    focus::session_from_payload(&payload).and_then(|session| {
+                        focus::capture(&session::state_dir(), &session, debug::is_enabled())
+                    })
+                }
+                None => None,
+            };
             let env = platform::notify::probe_env();
             for action in cmd::notify::plan(
                 cmd::notify::Platform::current(),
@@ -208,6 +245,7 @@ fn dispatch(sub: &str, rest: &[&str]) {
                 &payload,
                 &cfg,
                 &env,
+                key.as_ref(),
             ) {
                 platform::notify::execute(&action);
             }

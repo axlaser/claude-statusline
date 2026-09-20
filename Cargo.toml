@@ -42,6 +42,11 @@ windows-sys = { version = "0.59", features = [
     # through System.Media.SoundPlayer. Spawning a player instead would be a
     # visible behaviour change and a second process on every notification.
     "Win32_Media_Audio",
+    # Click-to-focus: the token's random bytes come from `ProcessPrng`, the
+    # source the standard library itself uses (KTD13), and the anchor process
+    # is found by walking the Toolhelp parent chain.
+    "Win32_Security_Cryptography",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 # KTD7: the top-level catch_unwind is a no-op under `panic = "abort"`, so the

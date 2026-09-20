@@ -15,7 +15,11 @@
 //!   cache on Windows and re-fired the context alert every two seconds.
 //! - **File exists but cannot be parsed** → the caller's conservative value.
 //!   For the notification latch that means "already notified", so a corrupt
-//!   latch suppresses rather than spams.
+//!   latch suppresses rather than spams. For the focus record it means "no
+//!   record": the same symlink and foreign-owner refusals and the same
+//!   undeterminable-owner pass as its siblings, and a missing, unparsable,
+//!   over-size or unknown-version record makes the click do nothing while the
+//!   next visual alert regenerates it.
 //! - **Parent state directory unverifiable** → the two sites answer for
 //!   different reasons, and both are recorded because a guard whose direction is
 //!   not in this table is the shape of the defect above. At

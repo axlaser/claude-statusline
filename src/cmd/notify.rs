@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::config::NotifyConfig;
+use crate::focus::Key;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
@@ -303,6 +304,11 @@ fn strip_cwd(platform: Platform, detail: &str, cwd: &Path) -> String {
 /// background the sound and then raise the visual, while the Windows handler
 /// raises the toast first and plays its sound synchronously afterwards so the
 /// toast is not delayed behind the audio.
+///
+/// `key` is the click key the alert captured, passed as its own parameter
+/// rather than probed into `Env` (KTD16): it is the product of a write that
+/// just happened, not a fact about the machine. With no key the plan is
+/// exactly today's, which is what keeps the captured fixtures untouched.
 pub fn plan(
     platform: Platform,
     event: &str,
@@ -310,10 +316,13 @@ pub fn plan(
     stdin: &str,
     cfg: &NotifyConfig,
     env: &Env,
+    key: Option<&Key>,
 ) -> Vec<Action> {
     if event.is_empty() {
         return Vec::new();
     }
+    // The per-platform click transports arrive with their delivery units.
+    let _ = key;
     let flags = cfg.event(event);
     let msg = message(platform, event, value, stdin, &env.cwd);
 

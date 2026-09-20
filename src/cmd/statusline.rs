@@ -335,7 +335,16 @@ fn fire_alerts(roots: &Roots, payload: &Payload, session_id: &str, rendered: &st
         // user already lived through.
         let event = config.event(alert.event);
         if event.sound || event.visual {
-            notify_state::spawn(alert);
+            // Click handling exists only for a toast (KD4, R5): a sound-only
+            // alert captures nothing, so the alert path stays as cheap as it
+            // was. Capture happens here, in the tick, because the detached
+            // child cannot see the terminal this session runs in.
+            let key = if event.visual {
+                crate::focus::capture(&roots.temp, session_id, crate::debug::is_enabled())
+            } else {
+                None
+            };
+            notify_state::spawn(alert, key.as_ref());
         }
     }
     if decision.changed && !latch_unusable {

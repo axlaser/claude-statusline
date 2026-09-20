@@ -1,12 +1,14 @@
 //! Two of the areas platform-conditional code is confined to: file-ownership
 //! checks and process-entry stream handling. Notification delivery is the third
-//! and lives in the `notify` submodule.
+//! and lives in the `notify` submodule, with its click side — capture,
+//! transport and URI registration — in `focus`.
 //!
 //! Keep new `#[cfg]` code here rather than scattering it —
 //! `platform_conditional_code_stays_in_its_areas` asserts the file list.
 
 use std::path::Path;
 
+pub mod focus;
 pub mod notify;
 
 /// What a candidate state directory is.
