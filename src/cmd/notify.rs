@@ -522,8 +522,15 @@ fn windows_toast(msg: &str, env: &Env, key: Option<&Key>) -> Action {
 pub const FOCUS_HELPER: &str = "claude-statusline-focus.exe";
 
 pub fn helper_beside(binary: &Path) -> PathBuf {
-    let dir = binary.parent().unwrap_or(binary);
-    join(Platform::Windows, dir, &[FOCUS_HELPER])
+    // The directory is cut at the last separator of either kind rather than
+    // through `Path::parent`, which on a Unix host would treat the whole
+    // Windows path as one file name; the case table asserts this from Linux.
+    let text = binary.to_string_lossy();
+    let dir = match text.rfind(['\\', '/']) {
+        Some(i) => &text[..i],
+        None => "",
+    };
+    join(Platform::Windows, Path::new(dir), &[FOCUS_HELPER])
 }
 
 /// The open command the registration writes: the helper quoted, then `"%1"`.

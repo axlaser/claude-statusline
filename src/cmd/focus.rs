@@ -231,6 +231,40 @@ impl Step {
     }
 }
 
+/// One move of the Windows foreground recipe (KTD7), as data so the order
+/// and the fallback can be asserted without a window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundStep {
+    /// `ShowWindow(SW_RESTORE)` when the window is minimised.
+    Restore,
+    /// `SetForegroundWindow`, then verify with `GetForegroundWindow`.
+    SetForeground,
+    /// Register the `VK_F22` hotkey on a hidden popup window.
+    RegisterHotkey,
+    /// `SendInput` the key, then wait for `WM_HOTKEY` with a two-second
+    /// bound and call `SetForegroundWindow` inside the handler.
+    SendKeyAndAwait,
+    /// `FlashWindowEx`: the attention signal Windows always allows (R7).
+    Flash,
+}
+
+/// The recipe after the first `SetForegroundWindow` was refused.
+///
+/// The key is sent only after the registration succeeded: a lingering helper
+/// or macro software owning F22 fails the registration, and then the flash is
+/// all there is. Nothing here retries.
+pub fn foreground_recipe_after_refusal(hotkey_registered: bool) -> Vec<ForegroundStep> {
+    if hotkey_registered {
+        vec![
+            ForegroundStep::RegisterHotkey,
+            ForegroundStep::SendKeyAndAwait,
+            ForegroundStep::Flash,
+        ]
+    } else {
+        vec![ForegroundStep::RegisterHotkey, ForegroundStep::Flash]
+    }
+}
+
 /// An attached tmux client: the terminal it sits in and the process behind it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TmuxClient {
@@ -307,7 +341,13 @@ pub fn plan(platform: Platform, record: &Record, probes: &Probes) -> Plan {
     }
 
     match platform {
-        Platform::Windows => raise_windows_window(id, probes, &mut plan),
+        Platform::Windows => {
+            // The helper spawns nothing at all (R12): a Windows record plans
+            // the window raise and never a tool, whatever multiplexer
+            // variables a Git Bash or MSYS environment carried into it.
+            raise_windows_window(id, probes, &mut plan);
+            return plan;
+        }
         Platform::Linux => raise_linux(id, probes, &mut plan),
         // Activation is the transport's job on macOS (KTD2).
         Platform::Macos => {}

@@ -31,6 +31,9 @@ use claude_statusline::transcript::{self, Scan, TokenRecord};
 
 const BIN: &str = env!("CARGO_BIN_EXE_claude-statusline");
 
+/// The Windows click helper, built on every host (KTD14).
+const FOCUS_BIN: &str = env!("CARGO_BIN_EXE_claude-statusline-focus");
+
 struct Run {
     code: Option<i32>,
     stdout: String,
@@ -196,6 +199,18 @@ fn entry_contract_always_exits_zero_and_silent() {
             bin: BIN,
             name: "focus-hostile-key",
             args: &["focus", "claude-statusline:a.b\" \"c"],
+            stdin: "",
+        },
+        EntryCase {
+            bin: FOCUS_BIN,
+            name: "helper-no-args",
+            args: &[],
+            stdin: "",
+        },
+        EntryCase {
+            bin: FOCUS_BIN,
+            name: "helper-hostile-uri",
+            args: &["claude-statusline://a.b"],
             stdin: "",
         },
         // an unwinding panic must not escape as stderr or a non-zero code.
@@ -9114,4 +9129,235 @@ fn the_handler_probe_accepts_only_the_helper_beside_the_binary() {
             "[{name}] accepted {other:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Click-to-focus: the Windows helper and the foreground recipe
+// ---------------------------------------------------------------------------
+
+/// The helper with every hostile argument shape exits 0 with empty stdout,
+/// creates nothing under the scratch roots, and with logging on leaves a
+/// log that carries none of the argument beyond the scheme prefix.
+#[test]
+fn the_helper_rejects_every_hostile_argument_quietly() {
+    let dir = scratch_dir("focus-helper");
+    let home = dir.join("home");
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::create_dir_all(&tmp).unwrap();
+    let home_s = home.to_str().unwrap();
+    let tmp_s = tmp.to_str().unwrap();
+    let env = [
+        ("HOME", home_s),
+        ("USERPROFILE", home_s),
+        ("TMPDIR", tmp_s),
+        ("TEMP", tmp_s),
+        ("STATUSLINE_DEBUG", "1"),
+    ];
+    let token = "z".repeat(32);
+    let valid = format!("claude-statusline:nobody-home.{token}");
+    // Just under Windows' 32 767-character command-line limit: a larger
+    // argument cannot be passed to any process there, so the shell itself
+    // would refuse the launch before the helper ran.
+    let huge = "a".repeat(30 * 1024);
+    let cases: Vec<(&str, Vec<&str>)> = vec![
+        ("no-args", vec![]),
+        ("two-args", vec![&valid, "second"]),
+        ("quote-split", vec!["claude-statusline:a.b\" \"c"]),
+        ("doubled-quotes", vec!["claude-statusline:a.b\"\"c"]),
+        ("trailing-backslash", vec!["claude-statusline:a.b\\"]),
+        ("embedded-space", vec!["claude-statusline:a b.c"]),
+        ("thirty-kilobytes", vec![&huge]),
+        (
+            "percent-encoded",
+            vec!["claude-statusline:nobody%2Dhome.zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"],
+        ),
+        (
+            "scheme-slashes",
+            vec!["claude-statusline://nobody-home.zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"],
+        ),
+        (
+            "uppercase-scheme",
+            vec!["CLAUDE-STATUSLINE:nobody-home.zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"],
+        ),
+        ("valid-no-record", vec![&valid]),
+    ];
+    let mut failures = Failures::default();
+    for (name, args) in cases {
+        let run = run_exe(FOCUS_BIN, &args, "", &env);
+        failures.check(name, run.code == Some(0), || format!("exit {:?}", run.code));
+        failures.check(name, run.stdout.is_empty() && run.stderr.is_empty(), || {
+            format!("stdout {:?} stderr {:?}", run.stdout, run.stderr)
+        });
+    }
+    // An argument that is not valid Unicode, built per platform.
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(b"claude-statusline:\xff\xfe.b".to_vec())
+    };
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0x63, 0x3a, 0xD800, 0x2e, 0x62])
+    };
+    let mut cmd = Command::new(FOCUS_BIN);
+    cmd.arg(&invalid)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().expect("spawn the helper");
+    failures.check("invalid-unicode", out.status.code() == Some(0), || {
+        format!("exit {:?}", out.status.code())
+    });
+    failures.check(
+        "invalid-unicode",
+        out.stdout.is_empty() && out.stderr.is_empty(),
+        || "the helper wrote to a stream".to_string(),
+    );
+
+    let stray: Vec<String> = std::fs::read_dir(&tmp)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    failures.check("no-file", stray.is_empty(), || {
+        format!("the helper created state: {stray:?}")
+    });
+    let log = std::fs::read_to_string(home.join(".claude").join("statusline-debug.log"))
+        .unwrap_or_default();
+    failures.check("log-exists", log.contains("focus:"), || {
+        "with logging on, every rejection leaves a line".to_string()
+    });
+    // The session part of a well-formed key is what the log names (R20);
+    // everything else about an argument, and the token, stays out of it.
+    for fragment in ["a.b", "a b", "%2D", "aaaa", &token, "second"] {
+        failures.check("no-argument-bytes-in-log", !log.contains(fragment), || {
+            format!("the log carries argument bytes: {fragment:?}\n{log}")
+        });
+    }
+    failures.assert_empty("helper rejections");
+}
+
+/// A window verifies only when every recorded particular still holds and
+/// the capture-time marker is present.
+#[test]
+fn a_window_verifies_only_when_every_particular_still_matches() {
+    let recorded = focus::WindowIdentity {
+        handle: 0x30914,
+        owner_pid: 9416,
+        owner_start: 133_000,
+        class: "CASCADIA_HOSTING_WINDOW_CLASS".into(),
+        host: "windows-terminal".into(),
+    };
+    let good = focus::WindowFacts {
+        class: "CASCADIA_HOSTING_WINDOW_CLASS".into(),
+        owner_pid: 9416,
+        owner_start: Some(133_000),
+        marker_present: true,
+    };
+    assert!(focus::window_still_verifies(&recorded, Some(&good)));
+    assert!(
+        !focus::window_still_verifies(&recorded, None),
+        "a handle that is no longer a window"
+    );
+    let mut failures = Failures::default();
+    let cases: Vec<(&str, focus::WindowFacts)> = vec![
+        (
+            "creation-time-differs",
+            focus::WindowFacts {
+                owner_start: Some(133_001),
+                ..good.clone()
+            },
+        ),
+        (
+            "owner-gone",
+            focus::WindowFacts {
+                owner_start: None,
+                ..good.clone()
+            },
+        ),
+        (
+            "owner-pid-differs",
+            focus::WindowFacts {
+                owner_pid: 9417,
+                ..good.clone()
+            },
+        ),
+        (
+            "pseudo-console-class",
+            focus::WindowFacts {
+                class: "PseudoConsoleWindow".into(),
+                ..good.clone()
+            },
+        ),
+        (
+            "class-changed",
+            focus::WindowFacts {
+                class: "ConsoleWindowClass".into(),
+                ..good.clone()
+            },
+        ),
+        (
+            "recycled-handle-without-marker",
+            focus::WindowFacts {
+                marker_present: false,
+                ..good.clone()
+            },
+        ),
+    ];
+    for (name, facts) in cases {
+        failures.check(
+            name,
+            !focus::window_still_verifies(&recorded, Some(&facts)),
+            || "verified despite the mismatch".to_string(),
+        );
+    }
+    failures.assert_empty("window verification");
+}
+
+/// After a refused `SetForegroundWindow`, the key is sent only when the
+/// hotkey registered; a failed registration goes straight to the flash.
+#[test]
+fn the_foreground_recipe_sends_the_key_only_after_registration() {
+    use cmd_focus::ForegroundStep;
+    assert_eq!(
+        cmd_focus::foreground_recipe_after_refusal(true),
+        vec![
+            ForegroundStep::RegisterHotkey,
+            ForegroundStep::SendKeyAndAwait,
+            ForegroundStep::Flash
+        ]
+    );
+    assert_eq!(
+        cmd_focus::foreground_recipe_after_refusal(false),
+        vec![ForegroundStep::RegisterHotkey, ForegroundStep::Flash]
+    );
+}
+
+/// The helper's crate root carries nothing but the entry layers and the
+/// call into `run`: no platform branch, no console, nothing spawned.
+#[test]
+fn the_helper_source_is_a_thin_caller() {
+    let body = read_repo_file("src/bin/focus.rs");
+    assert!(body.contains("#![windows_subsystem = \"windows\"]"));
+    assert!(body.contains("entry::silence()"));
+    assert!(body.contains("entry::guarded(\"focus\""));
+    assert!(body.contains("cmd::focus::run(&args)"));
+    for forbidden in [
+        "cfg!(",
+        "#[cfg(",
+        "Command::",
+        "AllocConsole",
+        "AttachConsole",
+    ] {
+        assert!(!body.contains(forbidden), "the helper carries {forbidden}");
+    }
+    let cargo = read_repo_file("Cargo.toml");
+    assert!(cargo.contains("default-run = \"claude-statusline\""));
+    assert!(cargo.contains("name = \"claude-statusline-focus\""));
+    assert!(cargo.contains("test = false"));
 }

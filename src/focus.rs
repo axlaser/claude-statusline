@@ -442,6 +442,32 @@ pub fn host_kind(class: &str, owner_image: &str) -> &'static str {
     }
 }
 
+/// What the click handler can see of a window right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowFacts {
+    pub class: String,
+    pub owner_pid: u64,
+    /// The owner's creation time, or `None` when the process cannot be asked.
+    pub owner_start: Option<u64>,
+    pub marker_present: bool,
+}
+
+/// KTD9 for a window: every recorded particular must still hold, and the
+/// capture-time marker must still be on it. A handle recycled inside a
+/// surviving terminal process keeps pid, creation time and class, so the
+/// marker is what proves it is the captured window. `None` facts mean the
+/// handle is no longer a window at all.
+pub fn window_still_verifies(recorded: &WindowIdentity, facts: Option<&WindowFacts>) -> bool {
+    let Some(facts) = facts else {
+        return false;
+    };
+    facts.class != PSEUDO_CONSOLE_CLASS
+        && facts.class == recorded.class
+        && facts.owner_pid == recorded.owner_pid
+        && facts.owner_start == Some(recorded.owner_start)
+        && facts.marker_present
+}
+
 /// The name of the window property capture sets and the click verifies:
 /// session-specific, so a handle recycled inside a surviving terminal process
 /// cannot carry another session's mark.

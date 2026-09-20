@@ -5,6 +5,8 @@ edition = "2021"
 description = "Cross-platform custom status line for Claude Code"
 license = "MIT"
 repository = "https://github.com/axlaser/claude-statusline"
+# Two binaries: `cargo run` needs to be told which one (KTD14).
+default-run = "claude-statusline"
 
 [lib]
 name = "claude_statusline"
@@ -13,6 +15,15 @@ path = "src/lib.rs"
 [[bin]]
 name = "claude-statusline"
 path = "src/main.rs"
+
+# The Windows click helper (KTD14). Built everywhere so the entry contract
+# covers it on every host; shipped only for the Windows targets. `test = false`
+# because it has no unit tests of its own — the single integration test file
+# drives it as a process through `CARGO_BIN_EXE_claude-statusline-focus`.
+[[bin]]
+name = "claude-statusline-focus"
+path = "src/bin/focus.rs"
+test = false
 
 [dependencies]
 # `preserve_order` keeps settings.json's existing keys in the user's order
@@ -54,6 +65,13 @@ windows-sys = { version = "0.59", features = [
     # Click-to-focus: the per-user URI handler under HKCU\Software\Classes
     # is read on every visual alert and written by `settings protocol`.
     "Win32_System_Registry",
+    # Click-to-focus: the foreground recipe (KTD7) registers a hotkey and
+    # sends it, and skips its own verification under a debugger.
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Diagnostics_Debug",
+    # `WNDCLASSW` carries a brush handle, so its bindings sit behind Gdi.
+    "Win32_Graphics_Gdi",
 ] }
 
 # KTD7: the top-level catch_unwind is a no-op under `panic = "abort"`, so the

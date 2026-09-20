@@ -281,20 +281,30 @@ mod imp {
     use crate::focus::{WindowCandidate, WindowIdentity, PSEUDO_CONSOLE_CLASS, WINDOW_CLASSES};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, BOOL, ERROR_SUCCESS, FILETIME, HANDLE, HWND, LPARAM,
+        CloseHandle, BOOL, ERROR_SUCCESS, FILETIME, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
     };
     use windows_sys::Win32::Security::Cryptography::ProcessPrng;
+    use windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+        KEYEVENTF_KEYUP, MOD_NOREPEAT, VK_F22,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetAncestor, GetClassNameW, GetPropW, GetWindowTextW,
-        GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetPropW, GA_ROOTOWNER,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, EnumWindows,
+        FlashWindowEx, GetAncestor, GetClassNameW, GetForegroundWindow, GetMessageW, GetPropW,
+        GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, KillTimer,
+        PostQuitMessage, RegisterClassW, SetForegroundWindow, SetPropW, SetTimer, ShowWindow,
+        TranslateMessage, FLASHWINFO, FLASHW_ALL, FLASHW_TIMERNOFG, GA_ROOTOWNER, MSG, SW_RESTORE,
+        WM_HOTKEY, WM_TIMER, WNDCLASSW, WS_POPUP,
     };
 
     /// The source Rust's own standard library draws from. A zero return is a
@@ -569,23 +579,187 @@ mod imp {
     pub fn window_verifies(window: &WindowIdentity, session: &str) -> bool {
         let hwnd = window.handle as usize as HWND;
         if unsafe { IsWindow(hwnd) } == 0 {
-            return false;
+            return crate::focus::window_still_verifies(window, None);
         }
-        let class = class_of(hwnd);
-        if class == PSEUDO_CONSOLE_CLASS || class != window.class {
-            return false;
-        }
-        if pid_of(hwnd) != window.owner_pid {
-            return false;
-        }
-        if process_start(window.owner_pid) != Some(window.owner_start) {
-            return false;
-        }
+        let owner_pid = pid_of(hwnd);
         let marker = wide(&crate::focus::window_marker(session));
-        !unsafe { GetPropW(hwnd, marker.as_ptr()) }.is_null()
+        let facts = crate::focus::WindowFacts {
+            class: class_of(hwnd),
+            owner_pid,
+            owner_start: process_start(owner_pid),
+            marker_present: !unsafe { GetPropW(hwnd, marker.as_ptr()) }.is_null(),
+        };
+        crate::focus::window_still_verifies(window, Some(&facts))
     }
 
-    pub fn raise_window(_handle: u64) -> bool {
+    /// The window the hotkey handler raises. One helper, one click, one
+    /// target; the handler runs on this thread, so a static is the simplest
+    /// honest channel.
+    static TARGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Chromium's ForegroundHelper hotkey id, kept so a coexisting helper and
+    /// this one contend for the same registration rather than both winning.
+    const HOTKEY_ID: i32 = 0xbaba;
+
+    /// The bound on waiting for the hotkey to arrive.
+    const HOTKEY_TIMER_ID: usize = 1;
+    const HOTKEY_TIMEOUT_MS: u32 = 2_000;
+
+    /// `SetForegroundWindow` always reports success under a debugger, so
+    /// verification means nothing there and the first attempt is taken as the
+    /// answer (KTD7).
+    fn is_foreground(hwnd: HWND) -> bool {
+        unsafe { IsDebuggerPresent() != 0 || GetForegroundWindow() == hwnd }
+    }
+
+    unsafe extern "system" fn hotkey_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            // Only our id: any other hotkey delivered here is not ours to act
+            // on, and the loop keeps waiting for the one that is.
+            WM_HOTKEY if wparam as i32 == HOTKEY_ID => {
+                let target = TARGET.load(std::sync::atomic::Ordering::Relaxed) as HWND;
+                if !target.is_null() {
+                    // Inside the handler the process holds the foreground
+                    // right the keystroke earned it.
+                    SetForegroundWindow(target);
+                }
+                PostQuitMessage(0);
+                0
+            }
+            WM_TIMER if wparam == HOTKEY_TIMER_ID => {
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// The hotkey recipe, on a hidden popup window that exists only for the
+    /// duration of one wait. Every exit path unregisters, kills the timer and
+    /// destroys the window; the timer is what bounds the wait.
+    fn hotkey_foreground(target: HWND) -> bool {
+        let class_name = wide("ClaudeStatuslineForeground");
+        unsafe {
+            let instance = GetModuleHandleW(std::ptr::null());
+            let class = WNDCLASSW {
+                style: 0,
+                lpfnWndProc: Some(hotkey_wndproc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: instance,
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class_name.as_ptr(),
+            };
+            // A second registration of the same class in one process fails
+            // harmlessly; one raise per process is all that happens.
+            RegisterClassW(&class);
+            let hwnd = CreateWindowExW(
+                0,
+                class_name.as_ptr(),
+                std::ptr::null(),
+                WS_POPUP,
+                0,
+                0,
+                0,
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                instance,
+                std::ptr::null(),
+            );
+            if hwnd.is_null() {
+                return false;
+            }
+            TARGET.store(target as usize, std::sync::atomic::Ordering::Relaxed);
+
+            let registered = RegisterHotKey(hwnd, HOTKEY_ID, MOD_NOREPEAT, u32::from(VK_F22)) != 0;
+            let plan = crate::cmd::focus::foreground_recipe_after_refusal(registered);
+            if plan.contains(&crate::cmd::focus::ForegroundStep::SendKeyAndAwait) {
+                let mut inputs = [
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VK_F22,
+                                wScan: 0,
+                                dwFlags: 0,
+                                time: 0,
+                                dwExtraInfo: 0,
+                            },
+                        },
+                    },
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VK_F22,
+                                wScan: 0,
+                                dwFlags: KEYEVENTF_KEYUP,
+                                time: 0,
+                                dwExtraInfo: 0,
+                            },
+                        },
+                    },
+                ];
+                let sent = SendInput(
+                    inputs.len() as u32,
+                    inputs.as_mut_ptr(),
+                    std::mem::size_of::<INPUT>() as i32,
+                );
+                if sent == inputs.len() as u32 {
+                    SetTimer(hwnd, HOTKEY_TIMER_ID, HOTKEY_TIMEOUT_MS, None);
+                    let mut msg: MSG = std::mem::zeroed();
+                    while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                    KillTimer(hwnd, HOTKEY_TIMER_ID);
+                }
+            }
+            if registered {
+                UnregisterHotKey(hwnd, HOTKEY_ID);
+            }
+            DestroyWindow(hwnd);
+            TARGET.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        is_foreground(target)
+    }
+
+    /// KTD7 in full: restore, raise, verify; the hotkey recipe on refusal;
+    /// the taskbar flash when Windows still says no. `SwitchToThisWindow` is
+    /// never used, and an elevated terminal refusing under UIPI ends at the
+    /// flash like any other refusal.
+    pub fn raise_window(handle: u64) -> bool {
+        let hwnd = handle as usize as HWND;
+        unsafe {
+            if IsIconic(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+            }
+            SetForegroundWindow(hwnd);
+        }
+        if is_foreground(hwnd) {
+            return true;
+        }
+        if hotkey_foreground(hwnd) {
+            return true;
+        }
+        let flash = FLASHWINFO {
+            cbSize: std::mem::size_of::<FLASHWINFO>() as u32,
+            hwnd,
+            dwFlags: FLASHW_ALL | FLASHW_TIMERNOFG,
+            uCount: 0,
+            dwTimeout: 0,
+        };
+        unsafe { FlashWindowEx(&flash) };
+        crate::debug::log(|| "focus: foreground refused, flashed the taskbar button".to_string());
         false
     }
 
@@ -1019,9 +1193,13 @@ fn anchor_alive(anchor: &crate::focus::Anchor) -> bool {
 pub fn probe(platform: Platform, record: &Record) -> Probes {
     let id = &record.identity;
     let mut probes = Probes::default();
-    for tool in Tool::ALL {
-        if let Some(path) = resolve_tool(platform, tool) {
-            probes.tools.insert(tool, path);
+    // The Windows helper spawns nothing (R12): no tool is resolved, no tmux
+    // server is asked, and the planner never asks for either.
+    if platform != Platform::Windows {
+        for tool in Tool::ALL {
+            if let Some(path) = resolve_tool(platform, tool) {
+                probes.tools.insert(tool, path);
+            }
         }
     }
     probes.anchor_alive = anchor_alive(&record.anchor);
@@ -1043,7 +1221,9 @@ pub fn probe(platform: Platform, record: &Record) -> Probes {
         .unwrap_or(false);
 
     if let (Some(t), Some(tmux)) = (&id.tmux, probes.tools.get(&Tool::Tmux)) {
-        probes.tmux_clients = tmux_clients(tmux, &t.socket);
+        if platform != Platform::Windows {
+            probes.tmux_clients = tmux_clients(tmux, &t.socket);
+        }
     }
 
     if platform == Platform::Linux {
