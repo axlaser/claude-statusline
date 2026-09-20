@@ -1,7 +1,8 @@
 name: release
 
-# Tagged pushes produce six native artifacts, one `checksums.txt`, and one
-# Sigstore bundle per artifact.
+# Tagged pushes produce eight native artifacts -- the binary for six targets
+# and the Windows click helper for the two Windows targets -- one
+# `checksums.txt`, and one Sigstore bundle per artifact.
 #
 # Artifact packaging was left open. Decision: publish raw binaries, not archives.
 # The installers are POSIX sh and PowerShell with no unpacking dependency, and a
@@ -190,6 +191,17 @@ jobs:
           "$bin" self-check
           printf '' | "$bin" > /dev/null
 
+      # The click helper ships for Windows only (KTD14). Run with no arguments
+      # it must exit 0 and stay silent, which is its whole contract from the
+      # shell's point of view; bash waits for a GUI-subsystem process where
+      # PowerShell's `&` would not.
+      - name: Smoke the click helper
+        if: matrix.family == 'windows'
+        run: |
+          helper="target/${{ matrix.target }}/release/claude-statusline-focus${{ matrix.ext }}"
+          out=$("$helper" 2>&1)
+          test -z "$out" || { echo "::error::the helper wrote output: $out"; exit 1; }
+
       # A dynamically linked artifact would still pass every step above on
       # the build host and fail only on the user's older distribution.
       - name: Verify static linking
@@ -232,10 +244,16 @@ jobs:
           cp "target/${{ matrix.target }}/release/claude-statusline${{ matrix.ext }}" \
              "dist/claude-statusline-${{ matrix.target }}${{ matrix.ext }}"
 
+      - name: Stage the click helper
+        if: matrix.family == 'windows'
+        run: |
+          cp "target/${{ matrix.target }}/release/claude-statusline-focus${{ matrix.ext }}" \
+             "dist/claude-statusline-focus-${{ matrix.target }}${{ matrix.ext }}"
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: binary-${{ matrix.target }}
-          path: dist/claude-statusline-${{ matrix.target }}${{ matrix.ext }}
+          path: dist/claude-statusline-*
           if-no-files-found: error
           retention-days: 7
 
@@ -255,9 +273,10 @@ jobs:
       - name: Emit checksums.txt
         run: |
           cd dist
+          # Six binaries and the two Windows click helpers.
           count=$(find . -maxdepth 1 -type f -name 'claude-statusline-*' | wc -l)
-          if [ "$count" -ne 6 ]; then
-            echo "::error::expected 6 artifacts, found $count."
+          if [ "$count" -ne 8 ]; then
+            echo "::error::expected 8 artifacts, found $count."
             ls -la
             exit 1
           fi
@@ -373,6 +392,20 @@ jobs:
         with:
           subject-path: dist/claude-statusline-aarch64-pc-windows-msvc.exe
 
+      # One attest step per asset, the click helpers included: the installer
+      # verifies each file it places against its own bundle.
+      - name: Attest focus x86_64-pc-windows-msvc
+        id: attest-focus-x86_64-pc-windows-msvc
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: dist/claude-statusline-focus-x86_64-pc-windows-msvc.exe
+
+      - name: Attest focus aarch64-pc-windows-msvc
+        id: attest-focus-aarch64-pc-windows-msvc
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: dist/claude-statusline-focus-aarch64-pc-windows-msvc.exe
+
       # The bundle ships as a release asset so verification does not
       # need an authenticated GitHub CLI: the attestation API serves its bundle
       # Snappy-compressed, which a shell installer cannot decode.
@@ -384,9 +417,11 @@ jobs:
           cp "${{ steps.attest-aarch64-unknown-linux-musl.outputs.bundle-path }}" dist/claude-statusline-aarch64-unknown-linux-musl.sigstore.json
           cp "${{ steps.attest-x86_64-pc-windows-msvc.outputs.bundle-path }}"     dist/claude-statusline-x86_64-pc-windows-msvc.exe.sigstore.json
           cp "${{ steps.attest-aarch64-pc-windows-msvc.outputs.bundle-path }}"    dist/claude-statusline-aarch64-pc-windows-msvc.exe.sigstore.json
+          cp "${{ steps.attest-focus-x86_64-pc-windows-msvc.outputs.bundle-path }}"  dist/claude-statusline-focus-x86_64-pc-windows-msvc.exe.sigstore.json
+          cp "${{ steps.attest-focus-aarch64-pc-windows-msvc.outputs.bundle-path }}" dist/claude-statusline-focus-aarch64-pc-windows-msvc.exe.sigstore.json
           bundles=$(find dist -maxdepth 1 -type f -name '*.sigstore.json' | wc -l)
-          if [ "$bundles" -ne 6 ]; then
-            echo "::error::expected 6 Sigstore bundles, found $bundles."
+          if [ "$bundles" -ne 8 ]; then
+            echo "::error::expected 8 Sigstore bundles, found $bundles."
             exit 1
           fi
 

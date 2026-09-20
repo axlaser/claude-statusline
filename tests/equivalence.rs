@@ -1115,8 +1115,12 @@ const PUBLISHED_TARGETS: [&str; 6] = [
     "aarch64-pc-windows-msvc",
 ];
 
-/// Every published target builds, tests, and is attested. A target that is
-/// silently absent ships an installer that resolves a URL returning 404.
+/// The two targets the Windows click helper ships for (KTD14).
+const HELPER_TARGETS: [&str; 2] = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"];
+
+/// Every published target builds, tests, and is attested, and so does each
+/// click helper. A target that is silently absent ships an installer that
+/// resolves a URL returning 404.
 #[test]
 fn release_workflow_covers_every_published_target() {
     let wf = read_repo_file(RELEASE_WORKFLOW);
@@ -1130,6 +1134,34 @@ fn release_workflow_covers_every_published_target() {
             "has no attestation step, so the release would ship it unattested".to_string()
         });
     }
+    // The helper's steps carry distinct names, so the loop above cannot pass
+    // on a helper that was never attested.
+    for target in HELPER_TARGETS {
+        let label = format!("focus {target}");
+        failures.check(
+            &label,
+            wf.contains(&format!("Attest focus {target}")),
+            || "has no attestation step".to_string(),
+        );
+        failures.check(
+            &label,
+            wf.contains(&format!(
+                "dist/claude-statusline-focus-{target}.exe.sigstore.json"
+            )),
+            || "has no bundle copy, so the installer could not verify it".to_string(),
+        );
+        failures.check(
+            &label,
+            wf.contains("dist/claude-statusline-focus-${{ matrix.target }}${{ matrix.ext }}"),
+            || "is never staged".to_string(),
+        );
+    }
+    // Both hard counts moved together.
+    failures.check(
+        "asset-count",
+        wf.contains("-ne 8 ]") && !wf.contains("-ne 6 ]"),
+        || "the artifact and bundle counts must both be eight".to_string(),
+    );
     failures.assert_empty("published targets");
 }
 
