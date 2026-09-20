@@ -76,6 +76,16 @@ When the directory exists but does not verify — a symlink, a reparse point, a 
 
 Two-tier flow: create feature branches as `dev-<feature>` (e.g. `dev-notifications`), PR them into `dev`, and periodically release `dev` into `master` via a release PR. The repo-local `pr` and `sync` skills pick the right base/source automatically from this model.
 
+### Release Channels
+
+Three, all served by `.github/workflows/release.yml` and resolved by the installers without a token:
+
+- **Stable** -- a `vX.Y.Z` tag. The plain install command resolves it through `releases/latest`, which excludes prereleases.
+- **Prerelease** -- any other tag shape (`v1.0.0-rc.1`, `verify-*`), published as a prerelease. `--pre` resolves the newest tagged release from the atom feed, `v` and a digit only.
+- **Dev channel** -- every push to `dev`. The workflow publishes a prerelease named `dev-<date>-<sha>` for that commit and keeps the three newest, deleting older ones with their tags. `--dev` resolves the newest `dev-*` entry from the same feed and outranks `--pre`. A head commit whose message carries `[skip release]` publishes nothing.
+
+The dev tags are immutable on purpose: one moving tag would make every clone's next `git fetch` fail with "would clobber existing tag". The cost is that a clone collects the `dev-*` tags it fetched while they were live; `git fetch --prune --prune-tags` clears them. Pushing `dev` therefore builds all six targets on every push -- a stable or prerelease tag is still the only thing that publishes a release a plain or `--pre` install can reach.
+
 ### Testing
 
 ```
@@ -89,7 +99,7 @@ All three are gates on every commit. `cargo test` includes the case table, which
 - **One test file.** `tests/equivalence.rs` drives a table of named cases; a failure names the case and shows the diff. Fixtures live under `tests/fixtures/` as data files, never as additional test files. Do not add a second test file.
 - Set `STATUSLINE_DEBUG=1` to enable debug logging to `~/.claude/statusline-debug.log`, from every subcommand.
 - `claude-statusline self-check` renders the real fixture and exits non-zero on mismatch -- the fastest confirmation that a build is sound.
-- Install locally via `bash install/install.sh` (or `install/install.ps1`) to test the full flow. It requires a published release to fetch from.
+- Install locally via `bash install/install.sh` (or `install/install.ps1`) to test the full flow. It fetches a published release; `--dev` takes the newest dev-channel build, so a pushed `dev` can be uninstalled and reinstalled end to end without cutting a tag.
 
 **A green Windows run does not prove the suite passed.** Five equivalence cases skip on Windows without Developer Mode because they need symlinks; they print a reason and report as passing. Others carry `#[cfg(unix)]` assertions that simply do not compile into a Windows build — the state directory's mode check is one. CI's Unix runners are what exercise both.
 

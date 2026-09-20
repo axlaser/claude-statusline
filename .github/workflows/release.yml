@@ -1,8 +1,17 @@
 name: release
 
-# Tagged pushes produce eight native artifacts -- the binary for six targets
-# and the Windows click helper for the two Windows targets -- one
-# `checksums.txt`, and one Sigstore bundle per artifact.
+# Two triggers produce the same eight native artifacts -- the binary for six
+# targets and the Windows click helper for the two Windows targets -- one
+# `checksums.txt`, and one Sigstore bundle per artifact:
+#
+#   - a tagged push is a release: stable for exactly vX.Y.Z, a prerelease for
+#     any other tag shape;
+#   - a push to `dev` is the dev channel: a prerelease named `dev-<date>-<sha>`
+#     for that commit, which the installers reach through `--dev` and nothing
+#     else resolves. Only the three newest are kept. The names are immutable on
+#     purpose -- one moving tag would make every clone's next `git fetch` fail
+#     with "would clobber existing tag" -- and a head commit whose message
+#     carries `[skip release]` publishes nothing.
 #
 # Artifact packaging was left open. Decision: publish raw binaries, not archives.
 # The installers are POSIX sh and PowerShell with no unpacking dependency, and a
@@ -20,6 +29,10 @@ name: release
 
 on:
   push:
+    # The dev channel. The `dev-*` tags this publishes never re-trigger it:
+    # they are created with the workflow token, whose events start no runs.
+    branches:
+      - dev
     tags:
       # Stable releases.
       - "v[0-9]+.[0-9]+.[0-9]+"
@@ -34,9 +47,13 @@ on:
 permissions:
   contents: read
 
+# A tag's run is never cancelled. A dev-channel run is superseded by the next
+# push to the branch, so the one in flight stops and its minutes are spared;
+# the window where a cancellation could interrupt publishing is one step long,
+# and the next run replaces the result anyway.
 concurrency:
   group: release-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: ${{ github.ref_type == 'branch' }}
 
 defaults:
   run:
@@ -51,12 +68,37 @@ jobs:
   # surfaces later when someone asks the artifact what version it is. Cheap to
   # check, expensive to discover after six targets have built.
   version:
-    name: tag matches Cargo.toml
+    name: name the release and check the version
     runs-on: ubuntu-24.04
+    # `[skip release]` in the head commit's message skips a dev-channel run: a
+    # docs-only push has nothing new to publish and six targets to build. A tag
+    # never skips, because it was pushed deliberately. Every later job needs
+    # this one, so skipping it skips the run.
+    if: github.ref_type == 'tag' || !contains(github.event.head_commit.message, '[skip release]')
+    outputs:
+      tag: ${{ steps.name.outputs.tag }}
+      dev: ${{ steps.name.outputs.dev }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
+      # Named once, here, and read by every later job. A tag names itself. A
+      # push to `dev` names a dev-channel release after the day and the commit:
+      # immutable, so it never clobbers a tag a clone already fetched, and
+      # sortable, so a release listing reads in order.
+      - name: Name the release
+        id: name
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "dev=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+            echo "dev=true" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
       - name: The tag and the crate version agree
+        if: github.ref_type == 'tag'
         run: |
           tag="${GITHUB_REF_NAME}"
           # `verify-*` tags are pipeline checks and claim no version, so there
@@ -81,10 +123,25 @@ jobs:
       # holds the signing and release grants and deliberately has no checkout;
       # handing it the notes as an artifact keeps it that way.
       - name: Resolve the release notes
+        env:
+          DEV: ${{ steps.name.outputs.dev }}
         run: |
           notes="docs/releases/${GITHUB_REF_NAME}.md"
           mkdir -p out
-          if [ -f "$notes" ]; then
+          if [ "$DEV" = "true" ]; then
+            # The dev channel announces what it is rather than what changed:
+            # the branch head at this commit, replaced on the next push.
+            {
+              printf 'Dev channel: the dev branch at %s, built %s.\n\n' \
+                "${GITHUB_SHA::7}" "$(date -u +%Y-%m-%d)"
+              printf 'This is not a release. It tracks the integration branch, may be broken on any given day, and is replaced by the next push. Install it with --dev from the installer on the dev branch:\n\n'
+              printf '    curl -fsSL https://raw.githubusercontent.com/%s/dev/install/install.sh | bash -s -- --dev\n\n' \
+                "$GITHUB_REPOSITORY"
+              printf 'Verify before use:\n\n    sha256sum --check --ignore-missing checksums.txt\n    gh attestation verify claude-statusline-<target> --repo %s\n' \
+                "$GITHUB_REPOSITORY"
+            } > out/notes.md
+            echo "dev channel: wrote the notes for ${GITHUB_SHA::7}"
+          elif [ -f "$notes" ]; then
             cp "$notes" out/notes.md
             echo "using $notes ($(wc -l < "$notes") lines)"
           else
@@ -295,7 +352,9 @@ jobs:
 
   release:
     name: attest and publish
-    needs: checksums
+    # `version` is listed as well as reached through `checksums`: the `needs`
+    # context carries only direct dependencies, and this job reads the name.
+    needs: [checksums, version]
     runs-on: ubuntu-24.04
     permissions:
       # The only job with anything beyond read. `id-token` mints the OIDC token
@@ -322,19 +381,22 @@ jobs:
           name: release-notes
           path: notes
 
-      - name: Classify the tag
+      - name: Classify the release
         id: tag
+        env:
+          TAG: ${{ needs.version.outputs.tag }}
+          DEV: ${{ needs.version.outputs.dev }}
         run: |
-          tag="${GITHUB_REF_NAME}"
-          # Anything that is not exactly vMAJOR.MINOR.PATCH is a prerelease.
-          # Failing toward "prerelease" keeps an unexpected tag shape out of the
-          # installer's resolution rather than shipping it to every user.
-          if printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+          # Anything that is not exactly vMAJOR.MINOR.PATCH is a prerelease, and
+          # the dev channel always is. Failing toward "prerelease" keeps an
+          # unexpected tag shape out of the installer's resolution rather than
+          # shipping it to every user.
+          if [ "$DEV" != "true" ] && printf '%s' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             echo "prerelease=false" >> "$GITHUB_OUTPUT"
           else
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       # A step here used to refuse every stable tag outright, so that no release
       # could ship before the port had proved parity with the scripts it
@@ -429,10 +491,23 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
+          DEV: ${{ needs.version.outputs.dev }}
+          REPO: ${{ github.repository }}
         run: |
           flags=()
           if [ "${{ steps.tag.outputs.prerelease }}" = "true" ]; then
             flags+=(--prerelease)
+          fi
+          if [ "$DEV" = "true" ]; then
+            # The dev tag does not exist yet, so gh creates it, and --target is
+            # what points that at the pushed commit rather than the default
+            # branch's head. A re-run of the same commit on the same day replaces
+            # its own release. A tagged release is never replaced: a re-run there
+            # still fails on the release that exists, as it always has.
+            flags+=(--target "$GITHUB_SHA")
+            if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+              gh release delete "$TAG" --repo "$REPO" --cleanup-tag --yes
+            fi
           fi
           # --repo is required, not decorative: this job downloads artifacts and
           # never checks out the repository, so gh has no git remote to infer
@@ -440,9 +515,28 @@ jobs:
           # give it that context would widen the surface of the one job holding
           # the signing and release permissions.
           gh release create "$TAG" \
-            --repo "${{ github.repository }}" \
+            --repo "$REPO" \
             --title "$TAG" \
             --notes-file notes/notes.md \
             "${flags[@]}" \
             dist/claude-statusline-* \
             dist/checksums.txt
+
+      # Three dev-channel releases stay. The newest is the channel; the two
+      # behind it cover an install that resolved the feed moments before a push
+      # replaced it. Their tags go with them, so a clone holds at most the few it
+      # fetched while they were live, and the atom feed the installers read
+      # keeps room for the tagged releases `--pre` looks for.
+      - name: Prune the dev channel
+        if: needs.version.outputs.dev == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh release list --repo "$REPO" --limit 100 --json tagName,createdAt \
+              --jq '[.[] | select(.tagName | startswith("dev-"))] | sort_by(.createdAt) | reverse | .[3:] | .[].tagName' \
+            | while read -r old; do
+                [ -n "$old" ] || continue
+                echo "pruning $old"
+                gh release delete "$old" --repo "$REPO" --cleanup-tag --yes
+              done

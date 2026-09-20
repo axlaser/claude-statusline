@@ -112,10 +112,12 @@ function Invoke-Binary {
 # --- Options ---
 $requireAttestation = $false
 $allowPrerelease = $false
+$devChannel = $false
 $pinnedVersion = $env:CLAUDE_STATUSLINE_VERSION
 foreach ($a in $args) {
     if ($a -eq '--require-attestation') { $requireAttestation = $true }
     elseif ($a -eq '--pre')             { $allowPrerelease = $true }
+    elseif ($a -eq '--dev')             { $devChannel = $true }
     elseif ($a -like '--version=*')     { $pinnedVersion = $a.Substring(10) }
 }
 
@@ -162,6 +164,26 @@ Step "Resolving release"
 if ($pinnedVersion) {
     $tag = $pinnedVersion
     Ok "Pinned to $tag"
+} elseif ($devChannel) {
+    # The dev channel: the newest `dev-*` release in the same atom feed the
+    # prerelease channel reads. The release workflow publishes one from every
+    # push to `dev` and keeps the three newest, so the first match is the
+    # branch head. It outranks --pre when both are given, because a user who
+    # asked for the branch head wants exactly that.
+    $tag = $null
+    try {
+        $atom = (Invoke-WebRequest -Uri "https://github.com/$repoSlug/releases.atom" `
+            -UseBasicParsing -ErrorAction Stop).Content
+        if ($atom -match 'releases/tag/dev-[^"<]+') { $tag = $Matches[0] -replace '^releases/tag/', '' }
+    } catch {}
+    if (-not $tag) {
+        Err "Could not resolve a dev-channel release"
+        Info "None may be published yet. Try --pre, set CLAUDE_STATUSLINE_VERSION=<tag>"
+        Info "to pin a version, or check your connection."
+        Info "Your existing installation was left untouched."
+        return
+    }
+    Warn "Installing $tag (dev channel: the dev branch head, which may be unstable)"
 } elseif ($allowPrerelease) {
     # The releases atom feed lists every release newest-first, prereleases
     # included, over plain unauthenticated HTTPS. That is the whole reason to
@@ -172,11 +194,15 @@ if ($pinnedVersion) {
     # user who asks for --pre wants whatever is furthest ahead; once a stable
     # release overtakes the prereleases, that is the stable one, and silently
     # installing an older prerelease instead would be the surprising answer.
+    #
+    # Among tagged releases, that is: only a tag that names a version, `v` and
+    # a digit. The same feed carries the dev channel's `dev-*` builds, which a
+    # --pre user did not ask for and which would otherwise always be newest.
     $tag = $null
     try {
         $atom = (Invoke-WebRequest -Uri "https://github.com/$repoSlug/releases.atom" `
             -UseBasicParsing -ErrorAction Stop).Content
-        if ($atom -match 'releases/tag/([^"<]+)') { $tag = $Matches[1] }
+        if ($atom -match 'releases/tag/v[0-9][^"<]+') { $tag = $Matches[0] -replace '^releases/tag/', '' }
     } catch {}
     if (-not $tag) {
         Err "Could not resolve a prerelease"
@@ -215,8 +241,8 @@ if ($pinnedVersion) {
     }
     if (-not $tag) {
         Err "Could not resolve the latest release"
-        Info "Set CLAUDE_STATUSLINE_VERSION=<tag> to pin a version, or --pre for the"
-        Info "prerelease channel, or check your connection."
+        Info "Set CLAUDE_STATUSLINE_VERSION=<tag> to pin a version, --pre for the prerelease"
+        Info "channel, --dev for the dev channel, or check your connection."
         Info "Your existing installation was left untouched."
         return
     }
@@ -227,8 +253,8 @@ if ($pinnedVersion) {
     # the real reason.
     if ($tag -notmatch '^v[0-9]') {
         Err "No stable release has been published yet"
-        Info "Install from the prerelease channel with --pre, or pin a version with"
-        Info "CLAUDE_STATUSLINE_VERSION=<tag>."
+        Info "Install from the prerelease channel with --pre, the dev channel with"
+        Info "--dev, or pin a version with CLAUDE_STATUSLINE_VERSION=<tag>."
         Info "Your existing installation was left untouched."
         return
     }

@@ -1283,6 +1283,49 @@ fn anything_but_a_release_tag_publishes_as_a_prerelease() {
     );
 }
 
+/// A push to `dev` publishes the dev channel: one prerelease per push, named
+/// `dev-<date>-<sha>` and created at the pushed commit, with the three newest
+/// kept. The names are immutable on purpose — one moving tag makes every
+/// clone's next `git fetch` fail with "would clobber existing tag" — so
+/// pruning is what keeps the tag list from growing by one per push, and its
+/// `--cleanup-tag` is what makes pruning remove anything a clone would fetch.
+/// Without `--target`, gh would create the tag at the default branch's head,
+/// which is `master`, and the channel would silently ship the wrong commit.
+#[test]
+fn a_push_to_dev_publishes_a_pruned_dev_channel_release() {
+    let wf = read_repo_file(RELEASE_WORKFLOW);
+    assert!(
+        wf.contains("branches:\n      - dev\n"),
+        "the workflow no longer runs on a push to dev"
+    );
+    assert!(
+        wf.contains("tag=dev-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"),
+        "the dev channel's release is not named after the day and the commit"
+    );
+    assert!(
+        wf.contains(r#"--target "$GITHUB_SHA""#),
+        "the dev tag would be created at the default branch's head, not the pushed commit"
+    );
+    assert!(
+        wf.contains("startswith(\"dev-\")") && wf.contains(".[3:]"),
+        "the dev channel is no longer pruned to its three newest builds"
+    );
+    assert!(
+        wf.contains("--cleanup-tag"),
+        "pruned dev releases leave their tags behind for every clone to fetch"
+    );
+    assert!(
+        wf.contains("[skip release]"),
+        "a docs-only push has no way to skip the six-target build"
+    );
+    // The channel is a prerelease whatever the classification regex says of
+    // its name, so a plain install can never resolve to it.
+    assert!(
+        wf.contains(r#"[ "$DEV" != "true" ] &&"#),
+        "the dev channel is classified by tag shape alone, not forced to prerelease"
+    );
+}
+
 /// A tag and a `Cargo.toml` that disagree publish happily, and the mismatch
 /// surfaces later as an artifact that reports the wrong version. The gate is
 /// cheap; the thing that makes it worth a test is that it can be disabled
@@ -3133,7 +3176,10 @@ fn verification_is_pinned_and_fails_closed() {
 /// pipeline-verification tag from ever reaching a user who just ran the
 /// one-liner. `--pre` opts into the prerelease channel through the atom feed —
 /// plain unauthenticated HTTPS, so no token and no shared-IP rate limit — and
-/// a pinned version overrides both.
+/// a pinned version overrides both. `--dev` reads the same feed for the newest
+/// `dev-*` build, which is why `--pre` has to look for a `v` and a digit: the
+/// dev channel is republished on every push and would otherwise always be the
+/// newest entry, handing a `--pre` user the branch head they did not ask for.
 #[test]
 fn release_resolution_defaults_to_stable_and_opts_in_to_prereleases() {
     let mut failures = Failures::default();
@@ -3152,6 +3198,15 @@ fn release_resolution_defaults_to_stable_and_opts_in_to_prereleases() {
         });
         failures.check(rel, body.contains("CLAUDE_STATUSLINE_VERSION"), || {
             "offers no pinned-version override".to_string()
+        });
+        failures.check(rel, body.contains("--dev"), || {
+            "offers no way to opt into the dev channel".to_string()
+        });
+        failures.check(rel, body.contains("releases/tag/dev-"), || {
+            "resolves the dev channel by something other than the dev- tag prefix".to_string()
+        });
+        failures.check(rel, body.contains("releases/tag/v[0-9]"), || {
+            "--pre takes the newest entry of any shape, so a dev build would win".to_string()
         });
 
         // The API would need a token for anything useful and burns a rate limit

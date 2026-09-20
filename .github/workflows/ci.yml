@@ -83,7 +83,10 @@ jobs:
   #
   # `--pre` because the stable channel has nothing to resolve until a vX.Y.Z tag
   # exists. It performs the same resolution, download, checksum, attestation,
-  # placement, self-check and settings merge that the stable channel does.
+  # placement, self-check and settings merge that the stable channel does. Not
+  # `--dev`: the dev-channel build for this very push is being produced in
+  # parallel, so that would install the previous push's assets, or nothing at
+  # all on the first.
   installers:
     name: install ${{ matrix.name }}
     runs-on: ${{ matrix.os }}

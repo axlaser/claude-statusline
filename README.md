@@ -533,10 +533,12 @@ The stable commands above stay on `master`.
 > installer first and run `.\install.ps1 --pre` — see
 > [Without piping to a shell](#without-piping-to-a-shell).
 
-`--pre` installs whatever is furthest ahead, prereleases included. Once a stable
-release overtakes them you get that stable release instead of an older preview,
-so `--pre` is safe to leave in an update command. Everything else is unchanged:
-the checksum is still verified and refusing to match still stops the install.
+`--pre` installs whatever tagged release is furthest ahead, prereleases included.
+Once a stable release overtakes them you get that stable release instead of an
+older preview, so `--pre` is safe to leave in an update command. Everything else
+is unchanged: the checksum is still verified and refusing to match still stops
+the install. The [dev channel](#dev-channel) is not a tagged release and `--pre`
+never picks it up.
 
 To go back to stable, re-run the install command without `--pre`. To pin one
 exact version instead, set `CLAUDE_STATUSLINE_VERSION` to its tag:
@@ -544,6 +546,34 @@ exact version instead, set `CLAUDE_STATUSLINE_VERSION` to its tag:
 ```bash
 CLAUDE_STATUSLINE_VERSION=v1.0.0 bash install.sh
 ```
+
+---
+
+### Dev channel
+
+Every push to `dev` also publishes a build of that commit, so the integration
+branch can be installed without waiting for a tag. It is not a release: it may be
+broken on any given day, and it changes under you on every push. To opt in, add
+`--dev`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/install.sh | bash -s -- --dev
+```
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/install.ps1))) --dev
+```
+
+From a clone of `dev`, the same thing is `bash install/install.sh --dev` or
+`.\install\install.ps1 --dev`.
+
+Each build is named `dev-<date>-<commit>` and ships with the same
+`checksums.txt` and Sigstore attestations a release does, so every gate the
+installer runs is unchanged; only the resolution differs. `--dev` outranks
+`--pre` when both are given, and neither the plain install command nor `--pre`
+ever resolves to a dev build. Only the three newest builds are kept, and a
+commit whose message carries `[skip release]` publishes none.
+
+To leave the channel, re-run the install command without `--dev`.
 
 ---
 
@@ -557,8 +587,9 @@ bash install/install.sh      # macOS and Linux
 ```
 
 These still download the published binary rather than building one — cloning saves you
-piping a URL into a shell, not the download. To update, re-run the installer. To uninstall,
-run `install/uninstall.sh` or `install/uninstall.ps1`.
+piping a URL into a shell, not the download. Add `--dev` to install the newest build of
+`dev` instead of the latest release (see [Dev channel](#dev-channel)). To update, re-run
+the installer. To uninstall, run `install/uninstall.sh` or `install/uninstall.ps1`.
 
 To build and install from source instead, you need a Rust toolchain:
 
@@ -569,7 +600,10 @@ target/release/claude-statusline self-check    # must exit 0
 ```
 
 Then place the binary at `~/.claude/bin/claude-statusline` and register it with
-`claude-statusline settings apply --binary <that path> --all`.
+`claude-statusline settings apply --binary <that path> --all`. On Windows, also place
+`claude-statusline-focus.exe` from the same build beside it and run
+`claude-statusline settings protocol register --binary <that path>`, which is what makes
+a toast clickable.
 
 ### Without piping to a shell
 
@@ -613,8 +647,8 @@ gh attestation verify ~/.claude/bin/claude-statusline \
 To install a specific release rather than the latest, set
 `CLAUDE_STATUSLINE_VERSION` to its tag.
 
-Both installers take `--pre` here too, selecting the prerelease channel — see
-[Prereleases](#prereleases).
+Both installers take `--pre` and `--dev` here too, selecting the prerelease or the
+dev channel — see [Prereleases](#prereleases) and [Dev channel](#dev-channel).
 
 ---
 
