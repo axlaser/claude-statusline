@@ -36,7 +36,13 @@ struct Run {
 /// Runs the built binary as a fresh process, which is the only way to observe
 /// the entry contract: exit code and stderr emptiness are process-level facts.
 fn run_bin(args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Run {
-    let mut cmd = Command::new(BIN);
+    run_exe(BIN, args, stdin, env)
+}
+
+/// `run_bin` for a named executable: the entry contract covers two binaries
+/// once the click helper exists, and they share one driver.
+fn run_exe(bin: &str, args: &[&str], stdin: &str, env: &[(&str, &str)]) -> Run {
+    let mut cmd = Command::new(bin);
     cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -109,6 +115,9 @@ impl Failures {
 
 struct EntryCase {
     name: &'static str,
+    /// Which executable is under test: the main binary for every case here,
+    /// the click helper for the rows the focus section adds.
+    bin: &'static str,
     args: &'static [&'static str],
     stdin: &'static str,
 }
@@ -120,52 +129,62 @@ struct EntryCase {
 fn entry_contract_always_exits_zero_and_silent() {
     let cases = [
         EntryCase {
+            bin: BIN,
             name: "empty-stdin",
             args: &[],
             stdin: "",
         },
         EntryCase {
+            bin: BIN,
             name: "malformed-json",
             args: &[],
             stdin: "{not json",
         },
         EntryCase {
+            bin: BIN,
             name: "truncated-json",
             args: &[],
             stdin: "{\"session_id\":",
         },
         EntryCase {
+            bin: BIN,
             name: "json-not-object",
             args: &[],
             stdin: "[1,2,3]",
         },
         EntryCase {
+            bin: BIN,
             name: "whitespace-only",
             args: &[],
             stdin: "   \n\t ",
         },
         EntryCase {
+            bin: BIN,
             name: "unknown-subcommand",
             args: &["no-such-subcommand"],
             stdin: "",
         },
         EntryCase {
+            bin: BIN,
             name: "notify-no-event",
             args: &["notify"],
             stdin: "",
         },
         EntryCase {
+            bin: BIN,
             name: "git-refresh-empty",
             args: &["git-refresh"],
             stdin: "",
         },
         EntryCase {
+            bin: BIN,
             name: "subagent-empty",
             args: &["subagent"],
             stdin: "",
         },
         // an unwinding panic must not escape as stderr or a non-zero code.
         EntryCase {
+            bin: BIN,
             name: "forced-panic",
             args: &["__panic-probe"],
             stdin: "",
@@ -174,7 +193,7 @@ fn entry_contract_always_exits_zero_and_silent() {
 
     let mut failures = Failures::default();
     for c in cases {
-        let run = run_bin(c.args, c.stdin, &[]);
+        let run = run_exe(c.bin, c.args, c.stdin, &[]);
         failures.check(c.name, run.code == Some(0), || {
             format!("expected exit 0, got {:?}", run.code)
         });

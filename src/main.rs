@@ -3,11 +3,14 @@
 //! The whole file is the silent-degradation contract. Claude
 //! Code spawns this process on every refresh and renders whatever reaches
 //! stdout; anything on stderr, or a non-zero exit, breaks the user's status
-//! line. Every layer below exists because one of them alone is not enough.
+//! line. The five layers live in `entry`, shared with the click helper; this
+//! file places the two deliberate exemptions between them.
 
 use std::io::Write;
 
-use claude_statusline::{clock, cmd, config, debug, platform, self_check, session, settings};
+use claude_statusline::{
+    clock, cmd, config, debug, entry, platform, self_check, session, settings,
+};
 
 /// Reads all of stdin, treating an unreadable or non-UTF-8 stream as empty.
 ///
@@ -23,36 +26,9 @@ fn read_stdin() -> String {
 }
 
 fn main() {
-    // Layer 1: take fd 2 away before any code can write to it. The panic hook
-    // below cannot intercept a stack overflow or an allocation failure — those
-    // are written by the runtime straight to the descriptor.
-    platform::redirect_stderr_to_null();
-
-    // Layer 2: silence the default hook's multi-line panic message.
-    //
-    // Silent to the terminal always; silent to the debug log only when logging
-    // is off. README and the release notes both tell users a `panic caught`
-    // line is always worth reporting, and the catch below can only name the
-    // subcommand — the message and location live in the `PanicHookInfo` the
-    // hook receives and nowhere else. Writing them to the log costs the
-    // contract nothing: the log is a file, not fd 2.
-    if debug::is_enabled() {
-        std::panic::set_hook(Box::new(|info| {
-            let location = info
-                .location()
-                .map(|l| format!("{}:{}", l.file(), l.line()))
-                .unwrap_or_else(|| "unknown location".to_string());
-            let message = info
-                .payload()
-                .downcast_ref::<&str>()
-                .map(|s| (*s).to_string())
-                .or_else(|| info.payload().downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "unknown panic".to_string());
-            debug::log(move || format!("panic at {location}: {message}"));
-        }));
-    } else {
-        std::panic::set_hook(Box::new(|_| {}));
-    }
+    // Layers 1 and 2: fd 2 is gone and the panic hook is silent before argv
+    // is even read.
+    entry::silence();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let sub = args.first().map(String::as_str).unwrap_or("statusline");
@@ -76,16 +52,9 @@ fn main() {
         std::process::exit(settings_cli(&rest));
     }
 
-    // Layer 3: an unwinding panic anywhere below becomes a silent no-op.
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| dispatch(sub, &rest)));
-    if result.is_err() {
-        debug::log(|| format!("panic caught in subcommand `{sub}`"));
-    }
-
-    // Layer 4: flush before exiting. `std::process::exit` runs no destructors,
-    // so a buffered writer dropped here would silently discard the render and
-    // still satisfy every exit-code and stderr assertion.
-    flush();
+    // Layers 3 and 4: an unwinding panic anywhere below becomes a silent
+    // no-op, and stdout is flushed with the result checked.
+    entry::guarded(sub, || dispatch(sub, &rest));
 
     // Layer 5.
     std::process::exit(0);
@@ -278,13 +247,5 @@ fn emit(s: &str) {
     }
     if lock.flush().is_err() {
         debug::log(|| "stdout flush failed".to_string());
-    }
-}
-
-fn flush() {
-    let stdout = std::io::stdout();
-    let mut lock = stdout.lock();
-    if lock.flush().is_err() {
-        debug::log(|| "stdout flush failed at exit".to_string());
     }
 }

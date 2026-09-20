@@ -9,6 +9,7 @@ pub mod clock;
 pub mod cmd;
 pub mod config;
 pub mod debug;
+pub mod entry;
 pub mod git;
 pub mod notify_state;
 pub mod payload;
