@@ -428,9 +428,9 @@ Nothing here pipes a download into `iex` — every step is one you can inspect b
    Unblock-File $helper
    ```
 
-4. **Install BurntToast** (optional — for visual toast notifications):
+4. **Install BurntToast** (optional — for visual toast notifications). Run this from **Windows PowerShell**, not PowerShell 7: the toast is raised through Windows PowerShell 5.1, which does not see modules installed from PowerShell 7:
    ```powershell
-   Install-Module -Name BurntToast -Scope CurrentUser
+   powershell.exe -Command "Install-Module -Name BurntToast -Scope CurrentUser"
    ```
 
 5. **Create the notification config** — save as `%USERPROFILE%\.claude\notify-config.json`:
@@ -792,7 +792,7 @@ Rate limit data is only available for Claude.ai Pro and Max subscribers. API use
 
 **Linux:** Ensure your desktop environment supports notifications (GNOME, KDE, XFCE, etc.). Test with `notify-send "Test" "Hello"`. Wayland compositors may require additional configuration.
 
-**Windows:** BurntToast requires the Windows notification center. Test with `New-BurntToastNotification -Text "Test", "Hello"`. If notifications are suppressed, check **Settings > System > Notifications** and ensure notifications are enabled for PowerShell.
+**Windows:** BurntToast requires the Windows notification center. Test with `New-BurntToastNotification -Text "Test", "Hello"`. If notifications are suppressed, check **Settings > System > Notifications** and ensure notifications are enabled for PowerShell. The toast is raised through Windows PowerShell 5.1, which only sees modules under `Documents\WindowsPowerShell\Modules` and `Program Files\WindowsPowerShell\Modules` — a BurntToast installed from PowerShell 7 lands under `Documents\PowerShell\Modules` and is invisible to it, so install the module from a Windows PowerShell prompt (`powershell.exe -Command "Install-Module -Name BurntToast -Scope CurrentUser"`) and confirm with `powershell.exe -Command "Get-Module -ListAvailable BurntToast"`.
 
 **All platforms:** Set `STATUSLINE_DEBUG=1` and check `~/.claude/statusline-debug.log` for `notify:` entries to confirm the hook ran and whether the visual tool was found.
 

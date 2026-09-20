@@ -8548,6 +8548,18 @@ fn kitty_without_remote_control_keeps_the_raise_and_drops_the_kitten_step() {
     assert_eq!(step_names(&plan), vec!["activate-x11"]);
     assert!(plan.notes.iter().any(|n| n.contains("kitty")));
 
+    // kitty older than 0.29 ships no `kitten`; `kitty @` takes the same
+    // arguments and is planned in its place.
+    let only_kitty = probes_with(&[Tool::Kitty, Tool::Xdotool]);
+    let plan = cmd_focus::plan(Platform::Linux, &record, &only_kitty);
+    assert!(
+        plan.steps.iter().any(
+            |s| matches!(s, Step::KittenFocus { tool, .. } if tool == &tool_path(Tool::Kitty))
+        ),
+        "{:?}",
+        plan.steps
+    );
+
     // A record with a kitty window id and no socket never plans a kitten
     // step: the socket is what makes the id addressable.
     let no_socket = record_with(Identity {

@@ -33,6 +33,9 @@ use crate::{debug, platform, session, state};
 pub enum Tool {
     Osascript,
     Kitten,
+    /// kitty before 0.29 ships no `kitten` binary; `kitty @` takes the same
+    /// remote-control arguments.
+    Kitty,
     Wezterm,
     Tmux,
     Screen,
@@ -48,9 +51,10 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 14] = [
+    pub const ALL: [Tool; 15] = [
         Tool::Osascript,
         Tool::Kitten,
+        Tool::Kitty,
         Tool::Wezterm,
         Tool::Tmux,
         Tool::Screen,
@@ -70,6 +74,7 @@ impl Tool {
         match self {
             Tool::Osascript => "osascript",
             Tool::Kitten => "kitten",
+            Tool::Kitty => "kitty",
             Tool::Wezterm => "wezterm",
             Tool::Tmux => "tmux",
             Tool::Screen => "screen",
@@ -411,13 +416,17 @@ pub fn plan(platform: Platform, record: &Record, probes: &Probes) -> Plan {
             plan.notes
                 .push("kitty: remote control socket absent".to_string());
         } else {
-            match probes.tool(Tool::Kitten) {
-                Some(tool) => plan.steps.push(Step::KittenFocus {
+            // `kitten @` and `kitty @` take the same arguments; the older
+            // kitty releases only have the latter.
+            match probes.first_tool(&[Tool::Kitten, Tool::Kitty]) {
+                Some((_, tool)) => plan.steps.push(Step::KittenFocus {
                     tool,
                     socket: socket.clone(),
                     window_id,
                 }),
-                None => plan.notes.push("kitty: kitten not found".to_string()),
+                None => plan
+                    .notes
+                    .push("kitty: neither kitten nor kitty found".to_string()),
             }
         }
     }
