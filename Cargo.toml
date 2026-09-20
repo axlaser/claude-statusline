@@ -47,6 +47,10 @@ windows-sys = { version = "0.59", features = [
     # is found by walking the Toolhelp parent chain.
     "Win32_Security_Cryptography",
     "Win32_System_Diagnostics_ToolHelp",
+    # Click-to-focus: the terminal window is found through the console's
+    # root owner or the parent chain's windows (KTD6), marked with a window
+    # property at capture and verified through it at click (KTD9).
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # KTD7: the top-level catch_unwind is a no-op under `panic = "abort"`, so the

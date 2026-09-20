@@ -388,6 +388,67 @@ pub fn select_anchor(
     (chain.get(anchor_index).cloned(), terminal)
 }
 
+/// One visible top-level window a process owns, as capture sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowCandidate {
+    pub handle: u64,
+    pub class: String,
+    pub title: String,
+}
+
+/// Picks the terminal window among the visible top-level windows one ancestor
+/// process owns (KTD6 candidate B).
+///
+/// For VS Code the window whose title carries the workspace folder's basename
+/// is preferred; when several do, or none does and several exist, nothing is
+/// stored, because a wrong window is worse than no raise (KTD9). For every
+/// other host the process must own exactly one visible window. The pseudo-
+/// console window is never a candidate.
+pub fn select_window_candidate(
+    windows: &[WindowCandidate],
+    is_vscode: bool,
+    cwd_basename: &str,
+) -> Option<WindowCandidate> {
+    let usable: Vec<&WindowCandidate> = windows
+        .iter()
+        .filter(|w| w.class != PSEUDO_CONSOLE_CLASS && !w.class.is_empty())
+        .collect();
+    if is_vscode && !cwd_basename.is_empty() {
+        let titled: Vec<&WindowCandidate> = usable
+            .iter()
+            .copied()
+            .filter(|w| w.title.contains(cwd_basename))
+            .collect();
+        if titled.len() == 1 {
+            return Some(titled[0].clone());
+        }
+        if titled.len() > 1 {
+            return None;
+        }
+    }
+    match usable.as_slice() {
+        [one] => Some((*one).clone()),
+        _ => None,
+    }
+}
+
+/// The host kind a window class and its owner's image name imply.
+pub fn host_kind(class: &str, owner_image: &str) -> &'static str {
+    match class {
+        "CASCADIA_HOSTING_WINDOW_CLASS" => "windows-terminal",
+        "ConsoleWindowClass" => "console",
+        "Chrome_WidgetWin_1" if owner_image.eq_ignore_ascii_case("Code.exe") => "vscode",
+        _ => "other",
+    }
+}
+
+/// The name of the window property capture sets and the click verifies:
+/// session-specific, so a handle recycled inside a surviving terminal process
+/// cannot carry another session's mark.
+pub fn window_marker(session: &str) -> String {
+    format!("ClaudeStatusline.{session}")
+}
+
 /// Konsole's D-Bus identity, as its environment exports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Konsole {
@@ -1062,7 +1123,8 @@ pub fn capture_with(
 /// Production capture: observes the machine, then runs the pure core, and
 /// logs the outcome without ever logging the token.
 pub fn capture(root: &StateRoot, session_id: &str, debug: bool) -> Option<Key> {
-    let obs = crate::platform::focus::observe();
+    let safe = sanitize_session_id(session_id);
+    let obs = crate::platform::focus::observe(&safe);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())

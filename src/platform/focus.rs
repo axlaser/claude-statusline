@@ -14,12 +14,25 @@
 use crate::focus::{self, Anchor, Observation, ProcessInfo, TOKEN_BYTES};
 
 /// Everything capture needs from the machine, gathered once per alert.
-pub fn observe() -> Observation {
+///
+/// `session` is the sanitised session id, which names the window property
+/// the Windows capture sets (KTD9).
+pub fn observe(session: &str) -> Observation {
     let chain = imp::ancestor_chain();
     let claude_pid = std::env::var("CLAUDE_PID")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
     let (anchor, terminal) = focus::select_anchor(&chain, claude_pid);
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let basename = std::path::Path::new(&cwd)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let window = anchor
+        .as_ref()
+        .and_then(|a| imp::capture_window(&chain, a.pid, session, &basename));
     Observation {
         anchor: anchor.map(|p| Anchor {
             pid: p.pid,
@@ -28,10 +41,8 @@ pub fn observe() -> Observation {
         }),
         terminal: terminal.map(|p| (p.pid, p.start)),
         tty: imp::controlling_tty(),
-        cwd: std::env::current_dir()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-        window: None,
+        cwd,
+        window,
         random: imp::random_bytes(),
     }
 }
@@ -119,7 +130,16 @@ mod imp {
         walk(pid, stat)
     }
 
-    pub fn window_verifies(_window: &crate::focus::WindowIdentity) -> bool {
+    pub fn capture_window(
+        _chain: &[ProcessInfo],
+        _anchor_pid: u64,
+        _session: &str,
+        _basename: &str,
+    ) -> Option<crate::focus::WindowIdentity> {
+        None
+    }
+
+    pub fn window_verifies(_window: &crate::focus::WindowIdentity, _session: &str) -> bool {
         false
     }
 
@@ -196,7 +216,16 @@ mod imp {
         walk(pid, describe)
     }
 
-    pub fn window_verifies(_window: &crate::focus::WindowIdentity) -> bool {
+    pub fn capture_window(
+        _chain: &[ProcessInfo],
+        _anchor_pid: u64,
+        _session: &str,
+        _basename: &str,
+    ) -> Option<crate::focus::WindowIdentity> {
+        None
+    }
+
+    pub fn window_verifies(_window: &crate::focus::WindowIdentity, _session: &str) -> bool {
         false
     }
 
@@ -232,15 +261,24 @@ mod imp {
 #[cfg(windows)]
 mod imp {
     use super::{walk, ProcessInfo, TOKEN_BYTES};
+    use crate::focus::{WindowCandidate, WindowIdentity, PSEUDO_CONSOLE_CLASS, WINDOW_CLASSES};
 
-    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, FILETIME, HANDLE, HWND, LPARAM};
     use windows_sys::Win32::Security::Cryptography::ProcessPrng;
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, FreeConsole, GetConsoleWindow, GetStdHandle, SetStdHandle, STD_ERROR_HANDLE,
+        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetAncestor, GetClassNameW, GetPropW, GetWindowTextW,
+        GetWindowThreadProcessId, IsWindow, IsWindowVisible, SetPropW, GA_ROOTOWNER,
     };
 
     /// The source Rust's own standard library draws from. A zero return is a
@@ -353,8 +391,179 @@ mod imp {
         }]
     }
 
-    pub fn window_verifies(_window: &crate::focus::WindowIdentity) -> bool {
-        false
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn class_of(hwnd: HWND) -> String {
+        let mut buf = [0u16; 256];
+        let n = unsafe { GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+
+    fn title_of(hwnd: HWND) -> String {
+        let mut buf = [0u16; 512];
+        let n = unsafe { GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32) };
+        String::from_utf16_lossy(&buf[..n.max(0) as usize])
+    }
+
+    fn pid_of(hwnd: HWND) -> u64 {
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        u64::from(pid)
+    }
+
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let out = &mut *(lparam as *mut Vec<HWND>);
+        out.push(hwnd);
+        1
+    }
+
+    /// Every top-level window, once; the callers filter by pid.
+    fn top_level_windows() -> Vec<HWND> {
+        let mut out: Vec<HWND> = Vec::new();
+        unsafe { EnumWindows(Some(collect), &mut out as *mut Vec<HWND> as LPARAM) };
+        out
+    }
+
+    fn visible_windows_of(all: &[HWND], pid: u64) -> Vec<WindowCandidate> {
+        all.iter()
+            .copied()
+            .filter(|h| pid_of(*h) == pid && unsafe { IsWindowVisible(*h) } != 0)
+            .map(|h| WindowCandidate {
+                handle: h as usize as u64,
+                class: class_of(h),
+                title: title_of(h),
+            })
+            .collect()
+    }
+
+    /// The root owner of the console window this process can reach: its
+    /// own, or the console of the nearest ancestor up to the anchor.
+    ///
+    /// Claude Code spawns its children headless, so the capturing process
+    /// usually has no console of its own; attaching to Claude Code's console
+    /// yields the pseudo-console window, whose root owner under Windows
+    /// Terminal is the real hosting window (measured in U1). The three
+    /// standard handles are saved and restored around the attach so a
+    /// console swap can never redirect the tick's render.
+    fn console_root_window(chain: &[ProcessInfo], anchor_pid: u64) -> Option<HWND> {
+        let root_of = |console: HWND| -> Option<HWND> {
+            if console.is_null() {
+                return None;
+            }
+            let root = unsafe { GetAncestor(console, GA_ROOTOWNER) };
+            let root = if root.is_null() { console } else { root };
+            (class_of(root) != PSEUDO_CONSOLE_CLASS).then_some(root)
+        };
+        if let Some(root) = root_of(unsafe { GetConsoleWindow() }) {
+            return Some(root);
+        }
+        let saved: Vec<(u32, HANDLE)> = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
+            .iter()
+            .map(|id| (*id, unsafe { GetStdHandle(*id) }))
+            .collect();
+        unsafe { FreeConsole() };
+        let mut found = None;
+        for ancestor in chain.iter().skip(1) {
+            let pid = u32::try_from(ancestor.pid).unwrap_or(0);
+            if pid != 0 && unsafe { AttachConsole(pid) } != 0 {
+                let root = root_of(unsafe { GetConsoleWindow() });
+                unsafe { FreeConsole() };
+                if root.is_some() {
+                    found = root;
+                    break;
+                }
+            }
+            if ancestor.pid == anchor_pid {
+                break;
+            }
+        }
+        for (id, handle) in saved {
+            unsafe { SetStdHandle(id, handle) };
+        }
+        found
+    }
+
+    /// KTD6 candidate B: the first ancestor above this process that owns a
+    /// visible top-level window, chosen through the pure selection rule.
+    fn ancestor_window(chain: &[ProcessInfo], basename: &str) -> Option<(HWND, String)> {
+        let all = top_level_windows();
+        for ancestor in chain.iter().skip(1) {
+            let windows = visible_windows_of(&all, ancestor.pid);
+            if windows.is_empty() {
+                continue;
+            }
+            let is_vscode = ancestor.name.eq_ignore_ascii_case("Code.exe");
+            let picked = crate::focus::select_window_candidate(&windows, is_vscode, basename)?;
+            return Some((picked.handle as usize as HWND, ancestor.name.clone()));
+        }
+        None
+    }
+
+    /// Captures the terminal window: candidate A, then B, then the class
+    /// rule, then the creation time of the owner, then the marker property.
+    /// Any step that cannot be completed stores nothing (KTD9).
+    pub fn capture_window(
+        chain: &[ProcessInfo],
+        anchor_pid: u64,
+        session: &str,
+        basename: &str,
+    ) -> Option<WindowIdentity> {
+        let (hwnd, owner_image) = match console_root_window(chain, anchor_pid) {
+            Some(h) => {
+                let pid = pid_of(h);
+                let image = chain
+                    .iter()
+                    .find(|p| p.pid == pid)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_default();
+                (h, image)
+            }
+            None => ancestor_window(chain, basename)?,
+        };
+        let class = class_of(hwnd);
+        if class == PSEUDO_CONSOLE_CLASS || !WINDOW_CLASSES.contains(&class.as_str()) {
+            return None;
+        }
+        let owner_pid = pid_of(hwnd);
+        let owner_start = process_start(owner_pid)?;
+        let marker = wide(&crate::focus::window_marker(session));
+        // The value is a small constant; only its presence is ever read.
+        if unsafe { SetPropW(hwnd, marker.as_ptr(), 1usize as HANDLE) } == 0 {
+            return None;
+        }
+        Some(WindowIdentity {
+            handle: hwnd as usize as u64,
+            owner_pid,
+            owner_start,
+            class: class.clone(),
+            host: crate::focus::host_kind(&class, &owner_image).to_string(),
+        })
+    }
+
+    /// Every particular must still match: the handle is a window, its class
+    /// and owner are the recorded ones, the owner was created when the record
+    /// says, and the capture-time marker is still on it. A handle recycled
+    /// inside a surviving terminal keeps the first three, so the marker is
+    /// what proves it is the captured window (KTD9).
+    pub fn window_verifies(window: &WindowIdentity, session: &str) -> bool {
+        let hwnd = window.handle as usize as HWND;
+        if unsafe { IsWindow(hwnd) } == 0 {
+            return false;
+        }
+        let class = class_of(hwnd);
+        if class == PSEUDO_CONSOLE_CLASS || class != window.class {
+            return false;
+        }
+        if pid_of(hwnd) != window.owner_pid {
+            return false;
+        }
+        if process_start(window.owner_pid) != Some(window.owner_start) {
+            return false;
+        }
+        let marker = wide(&crate::focus::window_marker(session));
+        !unsafe { GetPropW(hwnd, marker.as_ptr()) }.is_null()
     }
 
     pub fn raise_window(_handle: u64) -> bool {
@@ -390,7 +599,16 @@ mod imp {
         Vec::new()
     }
 
-    pub fn window_verifies(_window: &crate::focus::WindowIdentity) -> bool {
+    pub fn capture_window(
+        _chain: &[ProcessInfo],
+        _anchor_pid: u64,
+        _session: &str,
+        _basename: &str,
+    ) -> Option<crate::focus::WindowIdentity> {
+        None
+    }
+
+    pub fn window_verifies(_window: &crate::focus::WindowIdentity, _session: &str) -> bool {
         false
     }
 
@@ -746,7 +964,10 @@ pub fn probe(platform: Platform, record: &Record) -> Probes {
         (Some(pid), Some(start)) => imp::process_start(pid) == Some(start),
         _ => false,
     };
-    probes.window_verifies = id.window.as_ref().is_some_and(imp::window_verifies);
+    probes.window_verifies = id
+        .window
+        .as_ref()
+        .is_some_and(|w| imp::window_verifies(w, &record.session));
     probes.kitty_socket_present = id
         .kitty_socket
         .as_deref()

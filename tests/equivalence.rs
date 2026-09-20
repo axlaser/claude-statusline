@@ -8863,3 +8863,144 @@ fn a_resolved_record_with_nothing_to_do_logs_and_exits() {
         "the click path must never unlink the record"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Click-to-focus: Windows window identity
+// ---------------------------------------------------------------------------
+
+/// The Windows identity round-trips with the handle and the creation time as
+/// unsigned 64-bit fields, which a 32-bit or signed reading would corrupt.
+#[test]
+fn the_windows_identity_round_trips_as_unsigned_64_bit_fields() {
+    let mut record = sample_record("win-1");
+    record.identity.window = Some(focus::WindowIdentity {
+        handle: 0x0000_7fff_ffff_fff0,
+        owner_pid: 4_294_967_294,
+        owner_start: 133_812_345_678_901_234,
+        class: "CASCADIA_HOSTING_WINDOW_CLASS".into(),
+        host: "windows-terminal".into(),
+    });
+    let json = record.to_json();
+    assert!(json.contains("\"handle\":140737488355312"), "{json}");
+    assert!(
+        json.contains("\"owner_start\":133812345678901234"),
+        "{json}"
+    );
+    let loaded = Record::load(json.as_bytes(), "win-1", None).expect("loads");
+    assert_eq!(loaded, record);
+}
+
+/// A capture that reached only the pseudo-console window stores no window
+/// identity, names the omission, and the toast still carries the key.
+#[test]
+fn a_pseudo_console_window_is_never_stored_and_the_key_survives() {
+    let (_dir, root) = guarded_root("focus-pseudo-console");
+    let mut obs = observation(Some([6u8; 24]));
+    obs.window = Some(focus::WindowIdentity {
+        handle: 0x1402ec,
+        owner_pid: 21768,
+        owner_start: 1,
+        class: "PseudoConsoleWindow".into(),
+        host: "other".into(),
+    });
+    let capture = focus::capture_with(
+        &root,
+        "pseudo-1",
+        false,
+        Platform::Windows,
+        &env_vars(&[("WT_SESSION", "abc")]),
+        &obs,
+        1,
+    );
+    assert_eq!(capture.outcome, CaptureOutcome::Written);
+    assert!(capture.key.is_some(), "the toast must still carry the key");
+    assert!(capture.omitted.contains(&"window"), "{:?}", capture.omitted);
+    let bytes = std::fs::read(focus::record_path(&root, "pseudo-1")).unwrap();
+    let record = Record::load(&bytes, "pseudo-1", None).unwrap();
+    assert_eq!(record.identity.window, None);
+
+    // An unknown class is refused the same way; a known one is kept.
+    let mut unknown = obs.clone();
+    unknown.window.as_mut().unwrap().class = "Notepad".into();
+    let (id, omitted) = focus::identity_from_env(Platform::Windows, &env_vars(&[]), &unknown);
+    assert_eq!(id.window, None);
+    assert!(omitted.contains(&"window"));
+    let mut known = obs.clone();
+    known.window.as_mut().unwrap().class = "CASCADIA_HOSTING_WINDOW_CLASS".into();
+    known.window.as_mut().unwrap().host = "windows-terminal".into();
+    let (id, omitted) = focus::identity_from_env(Platform::Windows, &env_vars(&[]), &known);
+    assert!(id.window.is_some());
+    assert!(omitted.is_empty());
+}
+
+/// Candidate B's selection rule: exactly one visible window for an ordinary
+/// host; for VS Code the one whose title carries the workspace basename, and
+/// nothing when that is ambiguous.
+#[test]
+fn window_candidates_select_only_an_unambiguous_window() {
+    let w = |handle: u64, class: &str, title: &str| focus::WindowCandidate {
+        handle,
+        class: class.into(),
+        title: title.into(),
+    };
+    let code = "Chrome_WidgetWin_1";
+
+    // One VS Code window with the basename in its title.
+    let one = vec![
+        w(1, code, "claude-status-line - Visual Studio Code"),
+        w(2, code, "other-repo - Visual Studio Code"),
+    ];
+    assert_eq!(
+        focus::select_window_candidate(&one, true, "claude-status-line").map(|c| c.handle),
+        Some(1)
+    );
+    // Two whose titles both carry it: nothing.
+    let two = vec![
+        w(1, code, "claude-status-line - Visual Studio Code"),
+        w(
+            2,
+            code,
+            "claude-status-line (Workspace) - Visual Studio Code",
+        ),
+    ];
+    assert_eq!(
+        focus::select_window_candidate(&two, true, "claude-status-line"),
+        None
+    );
+    // None carries it and several exist: nothing; a single window regardless
+    // of title: that one.
+    assert_eq!(
+        focus::select_window_candidate(&one, true, "elsewhere"),
+        None
+    );
+    assert_eq!(
+        focus::select_window_candidate(&one[..1], true, "elsewhere").map(|c| c.handle),
+        Some(1)
+    );
+    // An ordinary host with one visible window, or several.
+    let wt = vec![w(9, "CASCADIA_HOSTING_WINDOW_CLASS", "pwsh")];
+    assert_eq!(
+        focus::select_window_candidate(&wt, false, "").map(|c| c.handle),
+        Some(9)
+    );
+    let many = vec![
+        w(9, "CASCADIA_HOSTING_WINDOW_CLASS", "pwsh"),
+        w(10, "CASCADIA_HOSTING_WINDOW_CLASS", "bash"),
+    ];
+    assert_eq!(focus::select_window_candidate(&many, false, ""), None);
+    // The pseudo-console window is never a candidate, even alone.
+    let pseudo = vec![w(3, "PseudoConsoleWindow", "")];
+    assert_eq!(focus::select_window_candidate(&pseudo, false, ""), None);
+
+    assert_eq!(
+        focus::host_kind("CASCADIA_HOSTING_WINDOW_CLASS", "WindowsTerminal.exe"),
+        "windows-terminal"
+    );
+    assert_eq!(
+        focus::host_kind("ConsoleWindowClass", "conhost.exe"),
+        "console"
+    );
+    assert_eq!(focus::host_kind("Chrome_WidgetWin_1", "Code.exe"), "vscode");
+    assert_eq!(focus::host_kind("Chrome_WidgetWin_1", "Hyper.exe"), "other");
+    assert_eq!(focus::window_marker("s-1"), "ClaudeStatusline.s-1");
+}
