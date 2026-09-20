@@ -74,6 +74,11 @@ jobs:
     # docs-only push has nothing new to publish and six targets to build. A tag
     # never skips, because it was pushed deliberately. Every later job needs
     # this one, so skipping it skips the run.
+    #
+    # Anywhere in the message, body included, exactly as GitHub's own
+    # `[skip ci]` matches. The commit that introduced the marker skipped its own
+    # run by naming it in the body, so a commit that talks about the marker has
+    # to spell it some other way.
     if: github.ref_type == 'tag' || !contains(github.event.head_commit.message, '[skip release]')
     outputs:
       tag: ${{ steps.name.outputs.tag }}

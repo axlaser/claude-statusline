@@ -82,7 +82,7 @@ Three, all served by `.github/workflows/release.yml` and resolved by the install
 
 - **Stable** -- a `vX.Y.Z` tag. The plain install command resolves it through `releases/latest`, which excludes prereleases.
 - **Prerelease** -- any other tag shape (`v1.0.0-rc.1`, `verify-*`), published as a prerelease. `--pre` resolves the newest tagged release from the atom feed, `v` and a digit only.
-- **Dev channel** -- every push to `dev`. The workflow publishes a prerelease named `dev-<date>-<sha>` for that commit and keeps the three newest, deleting older ones with their tags. `--dev` resolves the newest `dev-*` entry from the same feed and outranks `--pre`. A head commit whose message carries `[skip release]` publishes nothing.
+- **Dev channel** -- every push to `dev`. The workflow publishes a prerelease named `dev-<date>-<sha>` for that commit and keeps the three newest, deleting older ones with their tags. `--dev` resolves the newest `dev-*` entry from the same feed and outranks `--pre`. A head commit whose message carries `[skip release]` publishes nothing -- anywhere in the message, body included, so a commit message that talks about the marker must not spell it out (the commit that introduced it skipped its own run that way).
 
 The dev tags are immutable on purpose: one moving tag would make every clone's next `git fetch` fail with "would clobber existing tag". The cost is that a clone collects the `dev-*` tags it fetched while they were live; `git fetch --prune --prune-tags` clears them. Pushing `dev` therefore builds all six targets on every push -- a stable or prerelease tag is still the only thing that publishes a release a plain or `--pre` install can reach.
 
