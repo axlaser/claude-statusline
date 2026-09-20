@@ -25,7 +25,7 @@ which half of the old model survives.
    than the floor used to. Startup is no longer the thing to optimise.
 2. **What remains is real work.** In rough order: subprocess `git` (~74 ms for the pair on
    the maintainer's Windows machine, bounded by the 5s TTL), reading and scanning the
-   transcript (linear in its size), and the syscalls around the five state files. None of
+   transcript (linear in its size), and the syscalls around the six state files. None of
    these are startup artefacts; each is doing something.
 3. **Work scales with session length only in the transcript**, and that scan is skipped
    entirely when `(mtime, size)` are unchanged. The stored record carries the message count
@@ -48,7 +48,7 @@ which half of the old model survives.
 - **No new subprocess on any per-tick path.** `git` is the only one. State the
   process-count delta in the PR description for any hot-path change.
 - **Do not reintroduce an output cache**, or any cache whose justification is startup cost.
-  The five surviving state files are data stores and render inputs, not speed
+  The six surviving state files are data stores and render inputs, not speed
   optimisations; `docs/performance.md` and CLAUDE.md both name them explicitly so that a
   future reader can tell the difference.
 - **Do not read the transcript when `(mtime, size)` are unchanged.** The trade is
@@ -628,3 +628,53 @@ claim, not the code.
 Reopen condition: a §6 row measured with a populated temp root and a real `.git`, showing
 either cost above the noise floor. Until such a row exists, the statusline medians describe
 a best case, and this entry is the reason.
+
+### Click-to-focus capture runs on the alert path only — 2026-09-20
+
+Recorded because the feature added a state file, a second executable, a DLL import and a
+subprocess lifetime, and each of those is the kind of thing §2 forbids on a per-tick path.
+
+**Nothing joins the tick.** The focus record (`statusline-focus-<session>.json`) is
+captured only when a visual alert fires: in the tick's alert branch, once per crossing,
+before the detached `notify` child is spawned, and in the hook-invoked `notify` for the
+permission, stop and compaction events. A tick that crosses nothing runs no capture, opens
+no window enumeration, and reads no registry key; the case table asserts it writes no
+record. Rendered output is byte-identical across the table.
+
+**One import was a per-tick cost until it was delay-loaded.** The window calls the click
+path needs live in `user32.dll`, which the binary never imported before. Linked normally,
+the loader maps and initialises it in every process, tick included, and the first paired
+measurement showed the tick median moving from 10.7 ms to 12.5 ms (minima 10.5 and 12.1)
+with no other per-tick change in the diff. `build.rs` now passes `/DELAYLOAD:user32.dll`
+on MSVC, so the DLL loads on the first call into it — which only a click handler or a
+visual-alert capture ever makes — and the tick is back where it was (table below).
+
+**What capture costs, per visual alert.** On Windows: one Toolhelp snapshot, one
+`EnumWindows` pass, one `GetProcessTimes` per ancestor, one registry read for the URI
+handler, and one guarded write. On macOS: one `proc_pidinfo` per ancestor and the write.
+On Linux: one `/proc/<pid>/stat` read per ancestor and the write. Measured on the alert
+path with fresh-process medians of 11, both variants interleaved, isolated profile and
+temp, the toast interpreter pointed at an empty `SystemRoot` so neither variant pays
+BurntToast (*maintainer machine* class, Windows 11 26200, PowerShell 7.6, release builds):
+
+| Path | Before (6a94436) | After | Delta |
+|---|---|---|---|
+| `statusline` tick, minimal payload, no crossing | 10.5 ms | 10.1 ms | inside run-to-run noise |
+| `notify stop` hook, visual on, capture and record | 1730.6 ms | 1736.3 ms | the alert path's whole new cost |
+
+The alert path's absolute number is not the capture's: the stop event plays the system
+sound synchronously (`PlaySoundW` with `SND_SYNC`, as the shipped handler did) on both
+sides, and the PowerShell pipeline driving the probe adds its own share. With an empty
+`SystemRoot` the toast spawn fails at once on both sides too. Read the delta, which is the
+capture and the guarded write: about 6 ms, once per visual alert.
+
+**Linux keeps one process alive per visual alert.** The click is observed by waiting on
+`notify-send`, whose action flag implies `--wait`; GNOME does not bound that, so the
+executor owns a 120-second deadline and terminates the child when it lapses. The constant
+is a constant, not a config key: revisit it only with evidence from the real-desktop rows
+that two minutes is the wrong window. It costs a sleeping process, no CPU, and nothing on
+any tick.
+
+**The helper is a second binary, not a second per-tick process.** `claude-statusline-focus`
+runs only when the shell launches it for a click, spawns nothing, and exits within the
+two-second foreground bound.

@@ -282,6 +282,8 @@ Nothing here pipes a download into a shell — every step is one you can inspect
    sudo pacman -S libnotify          # Arch
    ```
 
+   To have a click on the toast raise the terminal window, also install `xdotool` (or `wmctrl`) on X11, or `kdotool` on KDE Wayland. Both are optional; without them the click still selects the tab or pane inside tmux, kitty, WezTerm and Konsole.
+
 5. **Create the notification config** — save as `~/.claude/notify-config.json`:
    ```json
    {
@@ -390,7 +392,9 @@ Nothing here pipes a download into `iex` — every step is one you can inspect b
    # ARM: $target = "aarch64-pc-windows-msvc"
    $base = "https://github.com/axlaser/claude-statusline/releases/latest/download"
    $bin  = "$env:USERPROFILE\.claude\bin\claude-statusline.exe"
+   $helper = "$env:USERPROFILE\.claude\bin\claude-statusline-focus.exe"
    Invoke-WebRequest -Uri "$base/claude-statusline-$target.exe" -OutFile $bin -UseBasicParsing
+   Invoke-WebRequest -Uri "$base/claude-statusline-focus-$target.exe" -OutFile $helper -UseBasicParsing
    Invoke-WebRequest -Uri "$base/checksums.txt" -OutFile "$env:TEMP\claude-statusline-checksums.txt" -UseBasicParsing
    Invoke-WebRequest -Uri "https://raw.githubusercontent.com/axlaser/claude-statusline/master/assets/claude-icon.png" -OutFile "$env:USERPROFILE\.claude\claude-icon.png" -UseBasicParsing
    ```
@@ -399,7 +403,9 @@ Nothing here pipes a download into `iex` — every step is one you can inspect b
    ```powershell
    (Get-FileHash -Algorithm SHA256 $bin).Hash
    Select-String -Path "$env:TEMP\claude-statusline-checksums.txt" -Pattern "claude-statusline-$target.exe"
-   # the two hashes must match (case aside)
+   (Get-FileHash -Algorithm SHA256 $helper).Hash
+   Select-String -Path "$env:TEMP\claude-statusline-checksums.txt" -Pattern "claude-statusline-focus-$target.exe"
+   # each pair of hashes must match (case aside)
    ```
 
    Optionally verify the build provenance as well (needs the [GitHub CLI](https://cli.github.com)):
@@ -416,6 +422,11 @@ Nothing here pipes a download into `iex` — every step is one you can inspect b
    ```
 
    A non-zero exit means the binary launches but renders incorrectly — don't register it.
+
+   The click helper is launched by the shell when you click a toast, and a downloaded file carries the Mark of the Web, so clear it now or the first click raises SmartScreen instead of your terminal:
+   ```powershell
+   Unblock-File $helper
+   ```
 
 4. **Install BurntToast** (optional — for visual toast notifications):
    ```powershell
@@ -434,9 +445,10 @@ Nothing here pipes a download into `iex` — every step is one you can inspect b
    }
    ```
 
-6. **Register it in Claude Code.** The binary edits `settings.json` itself, preserving everything it did not write — and it quotes its own path, which is what keeps a profile directory containing a space from breaking the command:
+6. **Register it in Claude Code.** The binary edits `settings.json` itself, preserving everything it did not write — and it quotes its own path, which is what keeps a profile directory containing a space from breaking the command. The second command registers the `claude-statusline:` URI handler that makes a toast clickable; it writes only its own key under `HKCU\Software\Classes` and leaves the scheme alone if another program owns it:
    ```powershell
    & $bin settings apply --binary $bin --all
+   & $bin settings protocol register --binary $bin
    ```
 
    Or edit `%USERPROFILE%\.claude\settings.json` by hand. Replace `YOUR_USERNAME` with your Windows username, and keep the inner quotes — this is exactly what the command above writes:
@@ -649,7 +661,7 @@ Logging is **off unless you ask for it**. Set `STATUSLINE_DEBUG=1` in the enviro
 | macOS / Linux | `~/.claude/statusline-debug.log` |
 | Windows | `%USERPROFILE%\.claude\statusline-debug.log` |
 
-One log covers the status line and all three hooks. Most lines carry a component prefix — `git:`, `transcript:`, `subagents:`, `model-windows:`, `notify:`, `git-refresh:`, `subagent-statusline:` — so you can tell which part wrote them; a few process-level entries have none. Unset the variable to stop logging; the file is safe to delete at any time.
+One log covers the status line, all three hooks and the click handler. Most lines carry a component prefix — `git:`, `transcript:`, `subagents:`, `model-windows:`, `notify:`, `focus:`, `git-refresh:`, `subagent-statusline:` — so you can tell which part wrote them; a few process-level entries have none. The click handler is launched by the OS without your environment, so it logs when the session that raised the toast had the variable set. Unset the variable to stop logging; the file is safe to delete at any time.
 
 ### Notifications
 
@@ -687,6 +699,29 @@ Platform-native sounds — no additional software needed:
 These are optional and you install them yourself — the installer does not fetch them. If the visual tool is missing, sound notifications still work; visual silently degrades rather than failing.
 
 Toast notifications display the Claude icon ([source](https://commons.wikimedia.org/wiki/File:Claude_AI_symbol.svg), public domain). The installer downloads it to `~/.claude/claude-icon.png` automatically, and the toast simply omits it if the file is absent.
+
+#### Click to focus
+
+Clicking a toast brings the terminal that runs the session to the front, and selects its tab or pane where the terminal can be driven from outside. It is on wherever `visual` is on — there is no separate switch — and nothing focuses without a click.
+
+| Terminal | On click |
+|----------|----------|
+| Terminal.app, iTerm2 | the window comes forward and the session's tab is selected |
+| Ghostty | the session's terminal is focused, matched by tty (or by working directory, when that is unique) |
+| kitty, with `allow_remote_control` on | the window comes forward and the session's kitty window is focused |
+| WezTerm | the session's pane is activated |
+| Konsole | the session's tab is selected; the window is raised on X11 and on KDE Wayland |
+| tmux, GNU screen, zellij | the session's pane is selected inside the multiplexer, on top of the terminal's own raise |
+| Windows Terminal, the classic console, VS Code | the window comes forward (tabs cannot be selected from outside) |
+| GNOME Terminal, Alacritty, Warp, anything else | the window or the application comes forward |
+
+Per platform:
+
+- **macOS** — terminal-notifier stores the click actions with the notification, so a click from Notification Center works after the session has ended too. The first tab selection asks for **Automation** consent (terminal-notifier controlling your terminal, under System Settings > Privacy & Security > Automation); if you deny it, clicks still bring the application forward. `tccutil reset AppleEvents` clears a wrong answer.
+- **Linux** — the toast stays clickable for two minutes after it appears (the `notify` process waits that long, then exits); a later click from the notification list only dismisses it. Raising the window on X11 needs `xdotool` or `wmctrl`, and on KDE Wayland `kdotool`; GNOME on Wayland refuses activation from outside, so there the click dismisses, while tab and pane selection inside tmux, kitty, WezTerm and Konsole still work. GNOME Terminal exposes no window id, so with several GNOME Terminal windows open nothing is raised rather than the wrong one. A libnotify older than 0.7.10 (Ubuntu 22.04) rejects the action flag, and the toast is re-raised without it.
+- **Windows** — a second, console-free executable, `claude-statusline-focus.exe`, handles the click through a per-user `claude-statusline:` URI handler the installer registers. No console, PowerShell or terminal window appears, including for a click from the Action Center after the session has ended. When Windows refuses to bring the window forward — an elevated terminal is the usual case — its taskbar button flashes instead. Until the handler is registered, clicking a toast keeps BurntToast's default behaviour. Window-level focus covers Windows Terminal, the classic console, VS Code and other Electron terminals, Alacritty, WezTerm, mintty and ConEmu.
+
+The session's terminal is recorded when the toast is raised, beside the other session state (`statusline-focus-<session-id>.json` in the state directory). Once the session has ended, a click brings the application or window forward and selects nothing; the record is never used to select another session's tab.
 
 #### Configuration
 
@@ -742,7 +777,7 @@ Rate limit data is only available for Claude.ai Pro and Max subscribers. API use
 <details>
 <summary><strong>Notification sounds not playing</strong></summary>
 
-- Test directly: `echo '{}' | ~/.claude/bin/claude-statusline notify permission` (should play a sound). On Windows: `'{}' | & "$env:USERPROFILE\.claude\bin\claude-statusline.exe" notify permission`. The pipe is required — `permission` is the one event that reads stdin, so without it the command waits for EOF instead of notifying
+- Test directly: `~/.claude/bin/claude-statusline notify stop` (should play a sound). On Windows: `& "$env:USERPROFILE\.claude\bin\claude-statusline.exe" notify stop`. From an interactive shell nothing is read from the terminal; when Claude Code runs the hook, the event's JSON arrives on stdin and names the session the toast belongs to
 - Check the event is not muted in `~/.claude/notify-config.json` — `"sound": false` genuinely mutes it
 - Confirm the hooks are registered — `settings.json` should carry `claude-statusline notify <event>` entries under `PermissionRequest`, `Stop`, `PreCompact` and `PostCompact`
 - Linux: ensure PulseAudio/PipeWire is running (`paplay` requires it) or ALSA is available (`aplay`)
@@ -764,6 +799,21 @@ Rate limit data is only available for Claude.ai Pro and Max subscribers. API use
 </details>
 
 <details>
+<summary><strong>Clicking a toast does nothing, or brings the wrong thing forward</strong></summary>
+
+Set `STATUSLINE_DEBUG=1` in the environment Claude Code runs in, raise a toast, click it, and read the `focus:` lines in `~/.claude/statusline-debug.log`: they say whether a record was found, whether the session's process was still alive, and which steps ran.
+
+- **Nothing is recorded:** the toast is raised without click handling when the state directory did not verify (the `state_dir:` line says so) — or, on Windows, when the handler is not registered. `claude-statusline settings protocol has --binary <path to claude-statusline.exe>` exits 0 when it is.
+- **The session had ended:** the application or window comes forward and no tab is selected. That is deliberate; a stale record never selects another session's tab.
+- **macOS, the application comes forward but the tab is not selected:** terminal-notifier needs Automation consent to drive your terminal. Look under System Settings > Privacy & Security > Automation, or run `tccutil reset AppleEvents` and click again. VS Code, Warp and Alacritty have no tab hook; they come forward as an application.
+- **Linux, nothing comes forward:** the click window is two minutes; on X11 install `xdotool` or `wmctrl`, on KDE Wayland `kdotool`; on GNOME Wayland the compositor refuses activation from outside. Several GNOME Terminal windows open means none is raised, because GNOME Terminal exposes no window id.
+- **Linux or macOS, the terminal you were in sets a different `TMPDIR` than your login environment:** the click handler looks for the record under the login environment's temp directory, finds nothing, and dismisses.
+- **kitty:** tab selection needs `allow_remote_control yes` and a unix listen socket (`listen_on unix:/tmp/kitty`).
+- **Windows, the taskbar button flashes instead:** Windows refused to bring the window forward — an elevated terminal, for instance. The flash is the fallback.
+
+</details>
+
+<details>
 <summary><strong>Errors in the debug log</strong></summary>
 
 Set `STATUSLINE_DEBUG=1` and check `~/.claude/statusline-debug.log`. Common causes:
@@ -781,7 +831,7 @@ Because of the silent-degradation contract, a panic inside the binary is caught 
 
 Claude Code pipes a JSON object to the binary's stdin on each update. The JSON contains session data — model info, context window usage, cost, rate limits, transcript path, and more. The binary parses this data, optionally reads the conversation transcript for additional metrics (message count, token breakdown, idle/working state), and outputs ANSI-colored text that Claude Code renders as the status bar.
 
-It is a single multi-call binary: the status line, the notification handler, the git-refresh hook and the subagent feed handler are all subcommands of `claude-statusline`, so an install is one file plus `settings.json` entries pointing at it.
+It is a single multi-call binary: the status line, the notification handler, the git-refresh hook, the subagent feed handler and the click handler are all subcommands of `claude-statusline`, so an install on macOS and Linux is one file plus `settings.json` entries pointing at it. Windows adds a second file, `claude-statusline-focus.exe`: the shell launches it when a toast is clicked, and it is built without a console so the click never opens a window of its own.
 
 Git status is cached for up to 5 seconds and invalidated as soon as `.git/index` changes (or immediately by the git-refresh hook after file-modifying tools), so it stays effectively real-time without re-running git on every refresh. The transcript is read only when its size or modification time has changed — an unchanged transcript re-displays the stored totals without opening the file, which is what keeps refreshes fast in long sessions.
 

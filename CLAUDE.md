@@ -5,7 +5,7 @@ Cross-platform custom status line for Claude Code, shipped as one Rust binary. C
 ## Project Structure
 
 ```
-src/                 the crate: one multi-call binary, one subcommand per former runtime script
+src/                 the crate: one multi-call binary, one subcommand per former runtime script, plus the Windows click helper in src/bin/focus.rs
 install/             install.sh + uninstall.sh (macOS and Linux), install.ps1 + uninstall.ps1 (Windows)
 tests/equivalence.rs the single integration test file; a table of named cases
 tests/fixtures/      golden captures, one directory per case
@@ -25,15 +25,16 @@ One binary, `claude-statusline`, dispatching on an argv token rather than `argv[
 - `git-refresh` -- cache invalidation hook registered as PostToolUse, clears stale git status after file-modifying tools
 - `subagent` -- subagentStatusLine handler, tees Claude Code's per-task feed to a session state file for the status line to read; prints nothing so the default agent panel stays intact
 - `self-check` -- renders a compiled-in fixture and compares it to the compiled-in expectation; the installer's gate against a binary that launches but renders wrongly
-- `settings <apply|remove|has|has-foreign|has-legacy>` -- the installers' `settings.json` editor
+- `focus <session>.<token>` -- the click handler: resolves the focus record a toast named and brings the session's terminal forward, selecting its tab or pane where the terminal allows it. Reached three ways: terminal-notifier's stored `-execute` action on macOS, the `notify` arm on Linux once notify-send reports the click, and `claude-statusline-focus.exe` on Windows, a second GUI-subsystem executable the shell launches through the `claude-statusline:` URI handler so no console ever appears
+- `settings <apply|remove|has|has-foreign|has-legacy>` -- the installers' `settings.json` editor; `settings protocol <register|unregister|has>` owns the Windows URI handler the same way, and shares the exit-code exemption
 
-The crate is lib+bin so the single test file can reach internal behaviour a binary-only crate cannot expose.
+The crate is lib+bin so the single test file can reach internal behaviour a binary-only crate cannot expose. It has two binaries -- the helper is built on every host and shipped only for Windows -- which is why `Cargo.toml` carries `default-run = "claude-statusline"`: `cargo run` cannot pick between two otherwise. The entry layers live in `src/entry.rs` so both `main`s share them verbatim. On MSVC `build.rs` delay-loads `user32.dll`, which only the click path calls, so the per-tick process does not pay for loading it.
 
 **"The scripts", in code comments, means the three per-platform trees this binary replaced.** Roughly 150 comments explain a choice by reference to them — a threshold copied verbatim, a guard reproduced deliberately, a bug not reproduced on purpose — and every one of those is still the reason the code looks the way it does. They were deleted at `1f5acf2`; `eb56345` is their final state if you need to read one. Do not delete these comments as stale: the fixtures were captured from exactly that code, so the reasoning is what makes a fixture failure interpretable.
 
 **Two subcommands are deliberately exempt from the exit-0 contract**: `self-check` must be able to fail, or the installer cannot tell a bad build from a good one, and `settings` must be able to fail, or an installer reports success having written nothing. Everything else exits 0 always (see Silent Degradation).
 
-There is no output cache. The display recomputes per tick -- the caches in the scripts existed to dodge an interpreter startup cost the migration removed. Five files survive as **data stores, not performance caches**: the learned model-to-window map, the per-task subagent done-linger stamp, the per-session notification latch, the per-session subagent tasks feed, and the per-session transcript token record. The git status cache keeps its 5s TTL, because `git` is still a subprocess and the TTL doubles as the staleness bound for an invalidation key known to be incomplete.
+There is no output cache. The display recomputes per tick -- the caches in the scripts existed to dodge an interpreter startup cost the migration removed. Six files survive as **data stores, not performance caches**: the learned model-to-window map, the per-task subagent done-linger stamp, the per-session notification latch, the per-session subagent tasks feed, the per-session transcript token record, and the per-session focus record that a toast's click resolves. The git status cache keeps its 5s TTL, because `git` is still a subprocess and the TTL doubles as the staleness bound for an invalidation key known to be incomplete.
 
 ### JSON Input Contract
 
@@ -51,9 +52,9 @@ Second input contract beside the stdin JSON: Claude Code's `subagentStatusLine` 
 
 ### State Directory
 
-Every temp-resident state file is written inside `<temp>/claude-statusline-<owner>/`, where `<temp>` is `$TMPDIR` (`%TEMP%` on Windows) and `<owner>` is the uid on Unix and a digest of the token SID on Windows. Six families live there: `statusline-git-*`, `statusline-tasks-*`, `statusline-notify-*`, `statusline-tokens-*`, `statusline-sa-*-task-*`, and `statusline-sa-*-<agent-base>`. A seventh pattern, `statusline-oc-*`, is delete-only and now vestigial: the binary never writes an output cache, and the `git-refresh` unlink that cleaned up after a script-era install resolves against the state directory, where such a file can never exist. The live cleanup for it is the flat sweep both uninstallers still perform.
+Every temp-resident state file is written inside `<temp>/claude-statusline-<owner>/`, where `<temp>` is `$TMPDIR` (`%TEMP%` on Windows) and `<owner>` is the uid on Unix and a digest of the token SID on Windows. Seven families live there: `statusline-git-*`, `statusline-tasks-*`, `statusline-notify-*`, `statusline-tokens-*`, `statusline-focus-*`, `statusline-sa-*-task-*`, and `statusline-sa-*-<agent-base>`. The focus record is written only when this directory verifies: on the flat fallback below, capture is skipped and the toast goes out without click handling, because a record another local user could plant must never name a window to raise. A seventh pattern, `statusline-oc-*`, is delete-only and now vestigial: the binary never writes an output cache, and the `git-refresh` unlink that cleaned up after a script-era install resolves against the state directory, where such a file can never exist. The live cleanup for it is the flat sweep both uninstallers still perform.
 
-`session::state_dir` is the only resolver, and three call sites use it: `Roots::from_env` and the `git-refresh` and `subagent` dispatch arms. **`temp: &Path` throughout the crate now means this directory, not the OS temp root.** `session::temp_dir` remains the escape hatch for anything that genuinely needs the root.
+`session::state_dir` is the only resolver, and four call sites use it: `Roots::from_env`, the `git-refresh` and `subagent` dispatch arms, and the `notify` arm's capture of the focus record. **`temp: &Path` throughout the crate now means this directory, not the OS temp root.** `session::temp_dir` remains the escape hatch for anything that genuinely needs the root.
 
 Two rules the design rests on, both with a test behind them:
 
@@ -67,7 +68,7 @@ When the directory exists but does not verify — a symlink, a reparse point, a 
 - **Runtime:** none. `git` is required only for the git status row; without it that row is absent. No `jq`, no Bash version floor, no PowerShell version floor.
 - **Build:** a Rust toolchain. Linux targets link statically against musl so one artifact runs on any distribution, including Alpine and older glibc.
 - **Install:** `curl` (macOS/Linux) or `Invoke-WebRequest` (Windows), plus a SHA-256 tool -- `sha256sum`, `shasum`, or `Get-FileHash`. `gh` is optional and enables provenance verification.
-- **Optional, for visual notifications:** `terminal-notifier` on macOS, `libnotify` on Linux, the `BurntToast` module on Windows.
+- **Optional, for visual notifications:** `terminal-notifier` on macOS, `libnotify` on Linux, the `BurntToast` module on Windows. For raising the window on a toast click, Linux additionally uses `xdotool` or `wmctrl` on X11 and `kdotool` on KDE Wayland when they are installed; tab and pane selection reaches `osascript`, `kitten`, `wezterm`, `tmux`, `screen`, `zellij` and a Konsole D-Bus caller by absolute path, each optional.
 
 ## Development
 
@@ -124,7 +125,7 @@ Naming: Rust conventions throughout the crate (`snake_case` items, `SCREAMING_CA
 
 There is one implementation. Platform-conditional code is confined to four areas and nowhere else:
 
-1. **notification delivery** -- the per-OS sound and toast mechanisms,
+1. **notification delivery** -- the per-OS sound and toast mechanisms, and the click side of them: capturing which terminal window a session runs in, the click transport, and the Windows URI registration,
 2. **file-ownership checks** -- the uid and ACL guards,
 3. **process and stream handling** -- redirecting fd 2 at entry, and creation flags on spawned children,
 4. **environment spelling** -- `%USERPROFILE%` against `$HOME`, `%TEMP%` against `$TMPDIR`, and whether a stored command needs quoting.
@@ -169,7 +170,7 @@ Nothing irreversible happens before `claude-statusline self-check` passes: not r
 
 The hot cost is no longer an interpreter. Every refresh still spawns a fresh process, but it is a native binary with no startup floor to amortise, so the remaining costs are real work: subprocess `git`, reading the transcript, and the syscalls around state files. Full rules, cost model, and the mandatory PR checklist live in `docs/performance.md`. The non-negotiables:
 
-- No new subprocess on a per-tick path. `git` is the only one, and it is bounded by the 5s TTL.
+- No new subprocess on a per-tick path. `git` is the only one, and it is bounded by the 5s TTL. The focus capture runs only when a visual alert fires, in the tick's alert branch or the hook, never per tick.
 - Do not reintroduce an output cache. It was deleted deliberately; the cost it hid is gone.
 - Do not read the transcript when `(mtime, size)` are unchanged -- everything the tokens and model rows render is reconstructable from the stored record. This is measured, not assumed: an unconditional scan cost ~50 ms on 8 MB and made the port 4x slower than the script on Linux.
 - Performance changes must keep rendered output byte-identical (verified by the case table) and must be measured with fresh-process probes, never warm loops -- end-to-end before/after medians only.
