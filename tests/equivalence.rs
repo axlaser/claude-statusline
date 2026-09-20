@@ -9936,3 +9936,166 @@ fn the_execute_command_is_single_quoted_or_absent() {
     );
     failures.assert_empty("macOS execute command");
 }
+
+// ---------------------------------------------------------------------------
+// Click-to-focus: the Linux click wait
+// ---------------------------------------------------------------------------
+
+/// With a key the Linux toast carries `-A default=Focus` and a 120-second
+/// click wait; without one it is today's argv and no wait.
+#[test]
+fn the_linux_toast_carries_the_click_action_only_with_a_key() {
+    let key = Key::parse(&format!("s1.{}", "k".repeat(32))).unwrap();
+    let plan_for = |key: Option<&Key>| {
+        notify::plan(
+            Platform::Linux,
+            "permission",
+            "",
+            PERMISSION_PAYLOAD,
+            &NotifyConfig::default(),
+            &full_env(),
+            key,
+        )
+    };
+    let with = plan_for(Some(&key));
+    assert_eq!(
+        as_records(&with),
+        vec![
+            "notify-send\tClaude Code\tBash: git status --porcelain\t--urgency=normal\t-A\tdefault=Focus"
+                .to_string(),
+            "paplay\t/usr/share/sounds/freedesktop/stereo/bell.oga".to_string(),
+        ]
+    );
+    let toast = with
+        .iter()
+        .find_map(|a| match a {
+            Action::Spawn { program, click, .. } if program == "notify-send" => Some(click.clone()),
+            _ => None,
+        })
+        .expect("a notify-send action");
+    assert_eq!(
+        toast,
+        Some(notify::ClickWait {
+            key: key.as_string(),
+            deadline_secs: 120,
+        })
+    );
+
+    let without = plan_for(None);
+    assert_eq!(
+        as_records(&without),
+        vec![
+            "notify-send\tClaude Code\tBash: git status --porcelain\t--urgency=normal".to_string(),
+            "paplay\t/usr/share/sounds/freedesktop/stereo/bell.oga".to_string(),
+        ]
+    );
+    assert!(without
+        .iter()
+        .all(|a| !matches!(a, Action::Spawn { click: Some(_), .. })));
+    assert_eq!(
+        platform::notify::strip_click_action(&[
+            "Claude Code".into(),
+            "msg".into(),
+            "-A".into(),
+            "default=Focus".into()
+        ]),
+        vec!["Claude Code".to_string(), "msg".to_string()]
+    );
+}
+
+/// The executor: a `default` line is the click and the key comes back; an
+/// immediate non-zero exit with empty stdout re-raises once without the
+/// action flag and yields no click; a child past the deadline is terminated
+/// and yields no click. Stub programs stand in for notify-send.
+#[cfg(unix)]
+#[test]
+fn the_click_wait_reports_the_click_retries_without_the_flag_and_bounds_the_wait() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("click-wait");
+    let write_stub = |name: &str, body: &str| -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, body).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path.to_str().unwrap().to_string()
+    };
+    let key = format!("s1.{}", "k".repeat(32));
+    let args: Vec<String> = [
+        "Claude Code",
+        "msg",
+        "--urgency=normal",
+        "-A",
+        "default=Focus",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    // The click.
+    let clicked = write_stub("clicked.sh", "#!/bin/sh\necho default\n");
+    assert_eq!(
+        platform::notify::wait_for_click(&clicked, &args, &key, std::time::Duration::from_secs(5)),
+        Some(key.clone())
+    );
+
+    // Dismissed: exits 0 with nothing to say.
+    let dismissed = write_stub("dismissed.sh", "#!/bin/sh\nexit 0\n");
+    assert_eq!(
+        platform::notify::wait_for_click(
+            &dismissed,
+            &args,
+            &key,
+            std::time::Duration::from_secs(5)
+        ),
+        None
+    );
+
+    // An old libnotify: exits non-zero at once with nothing on stdout. The
+    // stub records every argv it was called with, so the retry is visible.
+    let log = dir.join("calls.log");
+    let rejecting = write_stub(
+        "rejecting.sh",
+        &format!("#!/bin/sh\necho \"$@\" >> '{}'\nexit 1\n", log.display()),
+    );
+    assert_eq!(
+        platform::notify::wait_for_click(
+            &rejecting,
+            &args,
+            &key,
+            std::time::Duration::from_secs(5)
+        ),
+        None
+    );
+    // The second spawn is not awaited; give it a moment to land.
+    let mut calls = String::new();
+    for _ in 0..50 {
+        calls = std::fs::read_to_string(&log).unwrap_or_default();
+        if calls.lines().count() >= 2 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let lines: Vec<&str> = calls.lines().collect();
+    assert_eq!(lines.len(), 2, "one raise and one retry: {calls:?}");
+    assert!(lines[0].contains("-A default=Focus"), "{calls:?}");
+    assert!(
+        !lines[1].contains("-A") && lines[1].contains("--urgency=normal"),
+        "the retry must drop the flag and keep the rest: {calls:?}"
+    );
+
+    // Past the deadline: terminated, no click, and back within the bound.
+    let sleeper = write_stub("sleeper.sh", "#!/bin/sh\nsleep 30\necho default\n");
+    let started = std::time::Instant::now();
+    assert_eq!(
+        platform::notify::wait_for_click(
+            &sleeper,
+            &args,
+            &key,
+            std::time::Duration::from_millis(400)
+        ),
+        None
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the wait must end at the deadline, not when the child does"
+    );
+}

@@ -339,7 +339,12 @@ fn dispatch(sub: &str, rest: &[&str], os_rest: &[std::ffi::OsString]) {
                 &env,
                 key.as_ref(),
             ) {
-                platform::notify::execute(&action);
+                // On Linux the executor waits for the click and hands the key
+                // back here; the same `run` the subcommand and the Windows
+                // helper use takes it from there (KTD3).
+                if let Some(clicked) = platform::notify::execute(&action) {
+                    cmd::focus::run(&[std::ffi::OsString::from(clicked)]);
+                }
             }
         }
         "git-refresh" => {

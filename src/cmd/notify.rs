@@ -54,15 +54,39 @@ impl Platform {
 /// both slower and a visible behaviour change. That is also why Windows has no
 /// captured sound fixture — an in-process call leaves nothing for a `PATH` shim
 /// to record.
+/// Linux: the toast's click is observed by waiting on notify-send (KTD3).
+///
+/// The action flag implies `--wait`, and `--wait` is not reliably bounded on
+/// GNOME, so the executor owns the deadline: it reads notify-send's stdout,
+/// treats a first line of `default` as the click, and terminates the child
+/// when the deadline lapses. The key travels here, not in argv, so
+/// `as_records` and the captured fixtures never see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickWait {
+    pub key: String,
+    pub deadline_secs: u64,
+}
+
+/// How long a Linux toast stays clickable: the notify process's lifetime
+/// per visual alert. A constant, revisited only with evidence from the
+/// real-desktop rows.
+pub const LINUX_CLICK_WAIT_SECS: u64 = 120;
+
+/// The notify-send action: the body click, which GNOME and KDE report as
+/// `default` on stdout.
+pub const LINUX_CLICK_ACTION: &str = "default=Focus";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Run an external helper. `stdin` is fed to the child; `background` means
-    /// the notifier does not wait for it.
+    /// the notifier does not wait for it; `click` means the executor waits for
+    /// the toast's click instead and hands the key back.
     Spawn {
         program: String,
         args: Vec<String>,
         stdin: Option<String>,
         background: bool,
+        click: Option<ClickWait>,
     },
     /// Windows: play a `.wav` in-process, blocking, as `PlaySync` did.
     PlayWav(PathBuf),
@@ -432,6 +456,7 @@ fn unix_sound(platform: Platform, event: &str, env: &Env) -> Option<Action> {
             args: vec![format!("/System/Library/Sounds/{file}")],
             stdin: None,
             background: true,
+            click: None,
         }),
         // Linux does check: the asset ships in a package that is often absent,
         // and three different players might be installed.
@@ -457,6 +482,7 @@ fn unix_sound(platform: Platform, event: &str, env: &Env) -> Option<Action> {
                 args,
                 stdin: None,
                 background: true,
+                click: None,
             })
         }
         Platform::Windows => None,
@@ -502,6 +528,7 @@ fn unix_visual(platform: Platform, msg: &str, env: &Env, key: Option<&Key>) -> O
                 args,
                 stdin: None,
                 background: false,
+                click: None,
             })
         }
         Platform::Linux => {
@@ -516,11 +543,22 @@ fn unix_visual(platform: Platform, msg: &str, env: &Env, key: Option<&Key>) -> O
             if let Some(icon) = icon {
                 args.push(format!("--icon={}", icon.to_string_lossy()));
             }
+            // The click action, only with a key (KTD3). The flag implies
+            // `--wait`; the executor bounds it and hands the click back.
+            let click = key.map(|key| {
+                args.push("-A".to_string());
+                args.push(LINUX_CLICK_ACTION.to_string());
+                ClickWait {
+                    key: key.as_string(),
+                    deadline_secs: LINUX_CLICK_WAIT_SECS,
+                }
+            });
             Some(Action::Spawn {
                 program: "notify-send".to_string(),
                 args,
                 stdin: None,
                 background: false,
+                click,
             })
         }
         Platform::Windows => None,
@@ -572,6 +610,7 @@ fn windows_toast(msg: &str, env: &Env, key: Option<&Key>) -> Action {
         ],
         stdin: Some(payload.to_string()),
         background: false,
+        click: None,
     }
 }
 
