@@ -3214,6 +3214,11 @@ fn the_self_check_gates_every_destructive_step() {
             after: &[
                 "Remove-Item $path -Force",
                 "'settings', 'apply', '--binary'",
+                // The click helper is placed and registered only behind the
+                // same gate: a binary that renders wrongly must not gain a
+                // URI handler pointing beside it.
+                "Move-Item -Path $script:helperStage -Destination $helperPath",
+                "'settings', 'protocol', 'register'",
             ],
         },
     ];
@@ -9360,4 +9365,388 @@ fn the_helper_source_is_a_thin_caller() {
     assert!(cargo.contains("default-run = \"claude-statusline\""));
     assert!(cargo.contains("name = \"claude-statusline-focus\""));
     assert!(cargo.contains("test = false"));
+}
+
+// ---------------------------------------------------------------------------
+// Click-to-focus: `settings protocol` and the URI handler
+// ---------------------------------------------------------------------------
+
+/// The registration decision, from the current command and the helper.
+#[test]
+fn the_protocol_registration_decision_covers_every_state() {
+    use settings::ProtocolRegistration;
+    let helper = Path::new("C:\\Users\\u\\.claude\\bin\\claude-statusline-focus.exe");
+    let ours = notify::protocol_command(helper);
+    assert_eq!(
+        settings::protocol_registration(None, helper),
+        ProtocolRegistration::Write
+    );
+    assert_eq!(
+        settings::protocol_registration(Some(""), helper),
+        ProtocolRegistration::Write
+    );
+    assert_eq!(
+        settings::protocol_registration(Some(&ours), helper),
+        ProtocolRegistration::Unchanged
+    );
+    assert_eq!(
+        settings::protocol_registration(Some(&ours.to_ascii_uppercase()), helper),
+        ProtocolRegistration::Unchanged
+    );
+    assert_eq!(
+        settings::protocol_registration(
+            Some("\"D:\\old\\claude-statusline-focus.exe\" \"%1\""),
+            helper
+        ),
+        ProtocolRegistration::Rewrite
+    );
+    let foreign = "\"C:\\Program Files\\Other\\other.exe\" \"%1\"";
+    assert_eq!(
+        settings::protocol_registration(Some(foreign), helper),
+        ProtocolRegistration::Foreign(foreign.to_string())
+    );
+    assert!(settings::helper_path_is_registrable(helper));
+    assert!(!settings::helper_path_is_registrable(Path::new(
+        "C:\\Users\\u\\pct%TEMP%\\claude-statusline-focus.exe"
+    )));
+    assert!(!settings::helper_path_is_registrable(Path::new(
+        "C:\\Users\\u\\q\"uote\\claude-statusline-focus.exe"
+    )));
+}
+
+/// Off Windows every `protocol` verb is unsupported and exits non-zero; the
+/// installers never call it there.
+#[cfg(not(windows))]
+#[test]
+fn the_protocol_verb_is_unsupported_off_windows() {
+    for verb in ["register", "unregister", "has"] {
+        let run = run_bin(
+            &[
+                "settings",
+                "protocol",
+                verb,
+                "--binary",
+                "/home/u/.claude/bin/claude-statusline",
+            ],
+            "",
+            &[],
+        );
+        assert_eq!(run.code, Some(1), "[{verb}]");
+        assert!(
+            run.stdout.contains("Windows-only"),
+            "[{verb}] {}",
+            run.stdout
+        );
+    }
+}
+
+/// `register`, `unregister` and `has` against a scratch key under HKCU: the
+/// four values are written, a rerun changes nothing, a missing helper writes
+/// nothing, a foreign command is left alone and named, a stale path of ours
+/// is rewritten, and a helper path with `%` or `"` is refused.
+#[cfg(windows)]
+#[test]
+fn the_protocol_verb_owns_only_its_own_registration() {
+    let dir = scratch_dir("protocol-verb");
+    let bin_dir = dir.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let binary = bin_dir.join("claude-statusline.exe");
+    let helper = bin_dir.join("claude-statusline-focus.exe");
+    let binary_s = binary.to_str().unwrap().to_string();
+    let key = format!(
+        "Software\\Classes\\claude-statusline-test-{}",
+        std::process::id()
+    );
+    let key_arg = key.clone();
+
+    let reg_query = |sub: &str| -> Option<String> {
+        let out = Command::new("reg.exe")
+            .args(["query", &format!("HKCU\\{key}{sub}"), "/ve"])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let protocol = |verb: &str| -> Run {
+        run_bin(
+            &[
+                "settings", "protocol", verb, "--binary", &binary_s, "--key", &key_arg,
+            ],
+            "",
+            &[],
+        )
+    };
+    let cleanup = || {
+        let _ = Command::new("reg.exe")
+            .args(["delete", &format!("HKCU\\{key}"), "/f"])
+            .output();
+    };
+    cleanup();
+
+    let mut failures = Failures::default();
+
+    // Without the helper: exit non-zero, nothing written.
+    let missing = protocol("register");
+    failures.check("missing-helper-exit", missing.code == Some(1), || {
+        format!("exit {:?}: {}", missing.code, missing.stdout)
+    });
+    failures.check(
+        "missing-helper-writes-nothing",
+        reg_query("").is_none(),
+        || "the key exists although the helper does not".to_string(),
+    );
+
+    // With the helper: the four values.
+    std::fs::write(&helper, b"MZ").unwrap();
+    let first = protocol("register");
+    failures.check("register-exit", first.code == Some(0), || {
+        format!("exit {:?}: {}", first.code, first.stdout)
+    });
+    let root = reg_query("").unwrap_or_default();
+    failures.check(
+        "default-value",
+        root.contains("URL:claude-statusline"),
+        || root.clone(),
+    );
+    let url_protocol = Command::new("reg.exe")
+        .args(["query", &format!("HKCU\\{key}"), "/v", "URL Protocol"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    failures.check("url-protocol", url_protocol, || {
+        "URL Protocol is missing".to_string()
+    });
+    let icon = reg_query("\\DefaultIcon").unwrap_or_default();
+    failures.check(
+        "default-icon",
+        icon.contains("claude-statusline-focus.exe\",0"),
+        || icon.clone(),
+    );
+    let command = reg_query("\\shell\\open\\command").unwrap_or_default();
+    failures.check(
+        "open-command",
+        command.contains(&notify::protocol_command(&helper)),
+        || command.clone(),
+    );
+    failures.check(
+        "has-after-register",
+        protocol("has").code == Some(0),
+        || "has does not see the registration".to_string(),
+    );
+
+    // Running it again changes nothing and still succeeds.
+    let again = protocol("register");
+    failures.check(
+        "rerun",
+        again.code == Some(0) && reg_query("\\shell\\open\\command") == Some(command.clone()),
+        || "a rerun rewrote or failed".to_string(),
+    );
+
+    // A stale path of ours is rewritten in place.
+    let stale = "\"D:\\old\\bin\\claude-statusline-focus.exe\" \"%1\"";
+    let _ = Command::new("reg.exe")
+        .args([
+            "add",
+            &format!("HKCU\\{key}\\shell\\open\\command"),
+            "/ve",
+            "/d",
+            stale,
+            "/f",
+        ])
+        .output();
+    let rewritten = protocol("register");
+    let command_now = reg_query("\\shell\\open\\command").unwrap_or_default();
+    failures.check(
+        "stale-rewritten",
+        rewritten.code == Some(0) && command_now.contains(&notify::protocol_command(&helper)),
+        || format!("exit {:?}, command {command_now}", rewritten.code),
+    );
+
+    // A foreign command is left alone and named; `has` says no; `unregister`
+    // keeps it.
+    let foreign = "\"C:\\Program Files\\Other\\other.exe\" \"%1\"";
+    let _ = Command::new("reg.exe")
+        .args([
+            "add",
+            &format!("HKCU\\{key}\\shell\\open\\command"),
+            "/ve",
+            "/d",
+            foreign,
+            "/f",
+        ])
+        .output();
+    let left = protocol("register");
+    let command_now = reg_query("\\shell\\open\\command").unwrap_or_default();
+    failures.check(
+        "foreign-left-alone",
+        left.code == Some(1)
+            && command_now.contains("other.exe")
+            && left.stdout.contains("another program"),
+        || {
+            format!(
+                "exit {:?}, stdout {}, command {command_now}",
+                left.code, left.stdout
+            )
+        },
+    );
+    failures.check("has-foreign", protocol("has").code == Some(1), || {
+        "has claims a foreign registration".to_string()
+    });
+    let kept = protocol("unregister");
+    failures.check(
+        "unregister-keeps-foreign",
+        kept.code == Some(0) && reg_query("\\shell\\open\\command").is_some(),
+        || "unregister removed a foreign command".to_string(),
+    );
+
+    // Ours is deleted; an absent key still succeeds.
+    let _ = Command::new("reg.exe")
+        .args([
+            "add",
+            &format!("HKCU\\{key}\\shell\\open\\command"),
+            "/ve",
+            "/d",
+            &notify::protocol_command(&helper),
+            "/f",
+        ])
+        .output();
+    let gone = protocol("unregister");
+    failures.check(
+        "unregister-deletes-ours",
+        gone.code == Some(0) && reg_query("").is_none(),
+        || format!("exit {:?}, key still present", gone.code),
+    );
+    failures.check(
+        "unregister-absent",
+        protocol("unregister").code == Some(0),
+        || "unregister failed on an absent key".to_string(),
+    );
+    failures.check("has-absent", protocol("has").code == Some(1), || {
+        "has claims a registration that is gone".to_string()
+    });
+
+    // A helper path with a percent sign is refused before anything is written.
+    let pct_dir = dir.join("pct%TEMP%");
+    std::fs::create_dir_all(&pct_dir).unwrap();
+    std::fs::write(pct_dir.join("claude-statusline-focus.exe"), b"MZ").unwrap();
+    let pct_binary = pct_dir.join("claude-statusline.exe");
+    let refused = run_bin(
+        &[
+            "settings",
+            "protocol",
+            "register",
+            "--binary",
+            pct_binary.to_str().unwrap(),
+            "--key",
+            &key_arg,
+        ],
+        "",
+        &[],
+    );
+    failures.check(
+        "percent-refused",
+        refused.code == Some(1) && reg_query("").is_none(),
+        || format!("exit {:?}: {}", refused.code, refused.stdout),
+    );
+
+    cleanup();
+    failures.assert_empty("protocol verb");
+}
+
+/// The click helper's installer contract: a helper that fails its smoke run
+/// is deleted before anything could register it, `settings apply` precedes
+/// `settings protocol register`, the uninstaller unregisters before it
+/// removes the settings entries or any binary, and both uninstallers sweep
+/// the focus record family.
+#[test]
+fn the_installers_place_register_and_remove_the_click_helper_in_order() {
+    let install = read_repo_file("install/install.ps1");
+    let mut failures = Failures::default();
+    let pos = |body: &str, marker: &str| body.find(marker);
+    let smoke_delete = pos(
+        &install,
+        "if ($script:helperStage) { Remove-Item $script:helperStage",
+    );
+    let register = pos(&install, "'settings', 'protocol', 'register'");
+    let apply = pos(&install, "'settings', 'apply', '--binary'");
+    let unblock = pos(&install, "Unblock-File -Path $script:helperStage");
+    let smoke = pos(&install, "Invoke-Binary $script:helperStage @() -Gui");
+    let place = pos(
+        &install,
+        "Move-Item -Path $script:helperStage -Destination $helperPath",
+    );
+    for (name, present) in [
+        ("smoke-failure-deletion", smoke_delete.is_some()),
+        ("registration", register.is_some()),
+        ("unblock-file", unblock.is_some()),
+        ("gui-smoke", smoke.is_some()),
+        ("placement", place.is_some()),
+    ] {
+        failures.check(name, present, || {
+            "marker missing from install.ps1".to_string()
+        });
+    }
+    if let (Some(d), Some(r), Some(a), Some(u), Some(s), Some(p)) =
+        (smoke_delete, register, apply, unblock, smoke, place)
+    {
+        failures.check("delete-before-register", d < r, || {
+            "a failing helper could be registered before it is deleted".to_string()
+        });
+        failures.check("apply-before-register", a < r, || {
+            "settings.json must point at the binary before the scheme points at the helper"
+                .to_string()
+        });
+        failures.check("unblock-before-smoke-before-place", u < s && s < p, || {
+            "the helper must be unblocked, then smoked, then placed".to_string()
+        });
+    }
+    failures.check(
+        "gui-switch",
+        install.contains("param([string]$Exe, [string[]]$BinArgs, [switch]$Gui)")
+            && install.contains("Start-Process -FilePath $Exe -Wait -PassThru"),
+        || "the GUI smoke must go through Invoke-Binary's -Gui switch".to_string(),
+    );
+
+    let uninstall = read_repo_file("install/uninstall.ps1");
+    let unregister = pos(&uninstall, "'settings', 'protocol', 'unregister'");
+    let remove = pos(&uninstall, "'settings', 'remove', '--binary'");
+    let move_binary = pos(
+        &uninstall,
+        "Move-Item -Path $binPath -Destination $sidecarPath",
+    );
+    failures.check("unregister-present", unregister.is_some(), || {
+        "uninstall.ps1 never unregisters the scheme".to_string()
+    });
+    if let (Some(u), Some(r), Some(m)) = (unregister, remove, move_binary) {
+        failures.check("unregister-first", u < r && u < m, || {
+            "the scheme must be unregistered while the binary that owns it still exists".to_string()
+        });
+    }
+    failures.check(
+        "guarded-cmdlet-fallback",
+        uninstall.contains(r#"$command -like '*\claude-statusline-focus.exe"*'"#),
+        || "the cmdlet fallback must be guarded on the command naming our helper".to_string(),
+    );
+    failures.check(
+        "toast-history",
+        uninstall.contains("Remove-BTNotification"),
+        || "a toast left in the Action Center would still carry the scheme".to_string(),
+    );
+    failures.check(
+        "helper-removed",
+        uninstall.contains("Move-Item -Path $helperPath -Destination $helperSidecar"),
+        || "the helper must be renamed aside like the binary".to_string(),
+    );
+    failures.check(
+        "ps1-glob",
+        uninstall.contains("'statusline-focus-*.json'"),
+        || "uninstall.ps1 does not sweep the focus family".to_string(),
+    );
+    let sh = read_repo_file("install/uninstall.sh");
+    failures.check("sh-glob", sh.contains("statusline-focus-*.json"), || {
+        "uninstall.sh does not sweep the focus family".to_string()
+    });
+    failures.assert_empty("click helper installer contract");
 }

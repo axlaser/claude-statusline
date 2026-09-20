@@ -563,3 +563,52 @@ fn set_hook(root: &mut Value, event: &str, matcher: Option<&str>, binary: &str, 
     );
     list.push(Value::Object(entry));
 }
+
+/// What `settings protocol register` decides to do with the open command it
+/// found under the scheme's key (KTD5).
+///
+/// The verb owns the registration the way `apply` owns its `settings.json`
+/// entries: it writes when the key is absent or already ours, rewrites a stale
+/// path of ours in place, and leaves a foreign command alone and says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProtocolRegistration {
+    /// Nothing is registered: write every value.
+    Write,
+    /// A `claude-statusline-focus.exe` elsewhere is registered: rewrite the
+    /// values in place.
+    Rewrite,
+    /// Exactly this helper is registered already: change nothing.
+    Unchanged,
+    /// Another application owns the scheme: leave it and say so.
+    Foreign(String),
+}
+
+/// True when a registered open command names a `claude-statusline-focus.exe`,
+/// in any directory: our registration, possibly from an earlier install path.
+pub fn names_our_helper(command: &str) -> bool {
+    command
+        .to_ascii_lowercase()
+        .contains(&format!("\\{}\"", crate::cmd::notify::FOCUS_HELPER))
+}
+
+/// The registration decision for `register`, from the current command and the
+/// helper beside the binary.
+pub fn protocol_registration(current: Option<&str>, helper: &Path) -> ProtocolRegistration {
+    match current {
+        None => ProtocolRegistration::Write,
+        Some(c) if c.trim().is_empty() => ProtocolRegistration::Write,
+        Some(c) if crate::cmd::notify::handler_command_matches(c, helper) => {
+            ProtocolRegistration::Unchanged
+        }
+        Some(c) if names_our_helper(c) => ProtocolRegistration::Rewrite,
+        Some(c) => ProtocolRegistration::Foreign(c.to_string()),
+    }
+}
+
+/// A helper path the registration refuses: a double quote would end the
+/// quoted command early, and `%` is expanded by the shell when the command
+/// runs, so either could turn the path into a different command.
+pub fn helper_path_is_registrable(helper: &Path) -> bool {
+    let text = helper.to_string_lossy();
+    !text.contains('"') && !text.contains('%') && !text.chars().any(char::is_control)
+}

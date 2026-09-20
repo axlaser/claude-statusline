@@ -15,6 +15,9 @@ $claudeDir    = "$env:USERPROFILE\.claude"
 $binDir       = "$claudeDir\bin"
 $binPath      = "$binDir\claude-statusline.exe"
 $sidecarPath  = "$binDir\claude-statusline.exe.old"
+$helperPath   = "$binDir\claude-statusline-focus.exe"
+$helperSidecar = "$binDir\claude-statusline-focus.exe.old"
+$protocolKey  = "HKCU:\Software\Classes\claude-statusline"
 $settingsPath = "$claudeDir\settings.json"
 $configPath   = "$claudeDir\notify-config.json"
 $iconPath     = "$claudeDir\claude-icon.png"
@@ -59,7 +62,49 @@ Write-Host "  ${DIM}claude-statusline uninstaller${RESET}"
 Write-Host "  ${GRAY}-----------------------------------------${RESET}"
 Write-Host ""
 
-# --- settings.json first, while the binary that can edit it still exists ---
+# --- The URI handler first, while the binary that owns it still exists ---
+# A toast left in the Action Center carries the claude-statusline: scheme; once
+# the handler is gone a click on it would open the shell's open-with dialog, so
+# the notification history is cleared too when BurntToast is present.
+Step "Unregistering the click handler"
+$unregistered = $false
+if (Test-Path $binPath) {
+    $unreg = Invoke-Binary $binPath @('settings', 'protocol', 'unregister', '--binary', $binPath)
+    if ($unreg.Ran -and $unreg.Code -eq 0) {
+        $unregistered = $true
+        if ($unreg.Output) { Info ($unreg.Output -join ' ') }
+    }
+}
+if (-not $unregistered -and (Test-Path $protocolKey)) {
+    # The binary is gone or cannot run: remove the key here, guarded on the
+    # command naming our helper, so another program's scheme is never touched.
+    $command = $null
+    try {
+        $command = (Get-ItemProperty -Path "$protocolKey\shell\open\command" -Name '(default)' -ErrorAction Stop).'(default)'
+    } catch {}
+    if ($command -and $command -like '*\claude-statusline-focus.exe"*') {
+        Remove-Item -Path $protocolKey -Recurse -Force -ErrorAction SilentlyContinue
+        $unregistered = $true
+    } elseif ($command) {
+        Info "The claude-statusline: scheme belongs to another program and was kept"
+    }
+}
+if ($unregistered -or -not (Test-Path $protocolKey)) {
+    Ok "No claude-statusline: URI handler remains"
+} else {
+    Warn "Could not remove the claude-statusline: URI handler"
+    Info "Remove HKCU:\Software\Classes\claude-statusline by hand if it names claude-statusline-focus.exe"
+}
+if (Get-Module -ListAvailable -Name BurntToast -ErrorAction SilentlyContinue) {
+    try {
+        Import-Module BurntToast -ErrorAction Stop
+        Remove-BTNotification -ErrorAction Stop
+        Info "Cleared the notification history"
+    } catch {}
+}
+Write-Host ""
+
+# --- settings.json next, while the binary that can edit it still exists ---
 # Order matters: the merge logic lives in the binary, so removing the entries
 # has to happen before removing the tool that removes them.
 Step "Updating Claude Code settings"
@@ -108,6 +153,28 @@ if (Test-Path $binPath) {
     Warn "Binary not found (already removed?)"
 }
 
+# The click helper, the same way: renamed aside, then deleted where Windows
+# allows it.
+if (Test-Path $helperPath) {
+    $helperMoved = $false
+    try {
+        Move-Item -Path $helperPath -Destination $helperSidecar -Force -ErrorAction Stop
+        $helperMoved = $true
+    } catch {
+        Warn "Could not move $helperPath aside"
+    }
+    if ($helperMoved) {
+        Remove-Item $helperSidecar -Force -ErrorAction SilentlyContinue
+        if (Test-Path $helperSidecar) {
+            Ok "Click helper disabled (a locked copy remains as claude-statusline-focus.exe.old)"
+        } else {
+            Ok "Deleted $helperPath"
+        }
+    }
+} elseif (Test-Path $helperSidecar) {
+    Remove-Item $helperSidecar -Force -ErrorAction SilentlyContinue
+}
+
 Get-ChildItem -Path $binDir -Filter "$stagePrefix*" -Force -ErrorAction SilentlyContinue |
     Remove-Item -Force -ErrorAction SilentlyContinue
 
@@ -145,7 +212,7 @@ if (Test-Path $modelWindows) {
 # it cleans up after a script-era install that did.
 foreach ($pattern in @('statusline-oc-*.txt', 'statusline-git-*.txt', 'statusline-tasks-*.json',
                        'statusline-notify-*.json', 'statusline-sa-*.txt',
-                       'statusline-tokens-*.txt')) {
+                       'statusline-tokens-*.txt', 'statusline-focus-*.json')) {
     Get-ChildItem -Path $env:TEMP -Filter $pattern -Force -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
 }

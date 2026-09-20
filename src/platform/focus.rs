@@ -73,6 +73,24 @@ pub fn registered_protocol_command() -> Option<String> {
     imp::registered_protocol_command(PROTOCOL_KEY)
 }
 
+/// The open command under an arbitrary key path, for `settings protocol`
+/// and the case table's scratch keys.
+pub fn protocol_command_at(key: &str) -> Option<String> {
+    imp::registered_protocol_command(key)
+}
+
+/// Writes the four values of a per-user URI handler under `key`: the default
+/// value, `URL Protocol`, `DefaultIcon`, and `shell\open\command`, all as
+/// plain strings and in place. `Err` names the step that failed.
+pub fn protocol_register_at(key: &str, helper: &std::path::Path) -> Result<(), String> {
+    imp::protocol_register(key, helper)
+}
+
+/// Deletes the handler key and everything under it.
+pub fn protocol_unregister_at(key: &str) -> Result<(), String> {
+    imp::protocol_unregister(key)
+}
+
 /// Walks a chain by asking `lookup` for each parent in turn, self first,
 /// stopping at the root, a cycle, or a bound.
 fn walk(self_pid: u64, lookup: impl Fn(u64) -> Option<ProcessInfo>) -> Vec<ProcessInfo> {
@@ -177,6 +195,14 @@ mod imp {
     pub fn registered_protocol_command(_key: &str) -> Option<String> {
         None
     }
+
+    pub fn protocol_register(_key: &str, _helper: &std::path::Path) -> Result<(), String> {
+        Err("URI handler registration is Windows-only".to_string())
+    }
+
+    pub fn protocol_unregister(_key: &str) -> Result<(), String> {
+        Err("URI handler registration is Windows-only".to_string())
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -273,6 +299,14 @@ mod imp {
     pub fn registered_protocol_command(_key: &str) -> Option<String> {
         None
     }
+
+    pub fn protocol_register(_key: &str, _helper: &std::path::Path) -> Result<(), String> {
+        Err("URI handler registration is Windows-only".to_string())
+    }
+
+    pub fn protocol_unregister(_key: &str) -> Result<(), String> {
+        Err("URI handler registration is Windows-only".to_string())
+    }
 }
 
 #[cfg(windows)]
@@ -281,7 +315,8 @@ mod imp {
     use crate::focus::{WindowCandidate, WindowIdentity, PSEUDO_CONSOLE_CLASS, WINDOW_CLASSES};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, BOOL, ERROR_SUCCESS, FILETIME, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
+        CloseHandle, BOOL, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, FILETIME, HANDLE, HWND, LPARAM,
+        LRESULT, WPARAM,
     };
     use windows_sys::Win32::Security::Cryptography::ProcessPrng;
     use windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent;
@@ -290,7 +325,10 @@ mod imp {
         TH32CS_SNAPPROCESS,
     };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegGetValueW, RegSetValueExW, HKEY,
+        HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
+    };
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -804,6 +842,84 @@ mod imp {
         let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
         Some(String::from_utf16_lossy(&buf[..end]))
     }
+
+    fn set_string(hkey: HKEY, name: Option<&str>, value: &str) -> Result<(), String> {
+        let wide_value = wide(value);
+        let wide_name = name.map(wide);
+        let rc = unsafe {
+            RegSetValueExW(
+                hkey,
+                wide_name.as_ref().map_or(std::ptr::null(), |n| n.as_ptr()),
+                0,
+                REG_SZ,
+                wide_value.as_ptr() as *const u8,
+                (wide_value.len() * 2) as u32,
+            )
+        };
+        if rc == ERROR_SUCCESS {
+            Ok(())
+        } else {
+            Err(format!(
+                "cannot write {} (error {rc})",
+                name.unwrap_or("the default value")
+            ))
+        }
+    }
+
+    fn create_key(path: &str) -> Result<HKEY, String> {
+        let wide_path = wide(path);
+        let mut hkey: HKEY = std::ptr::null_mut();
+        let rc = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                wide_path.as_ptr(),
+                0,
+                std::ptr::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_WRITE,
+                std::ptr::null(),
+                &mut hkey,
+                std::ptr::null_mut(),
+            )
+        };
+        if rc == ERROR_SUCCESS && !hkey.is_null() {
+            Ok(hkey)
+        } else {
+            Err(format!("cannot create {path} (error {rc})"))
+        }
+    }
+
+    /// The four values, each written in place (KTD5). The icon is the
+    /// helper's own, index 0, which is the binary's resource icon or the
+    /// generic executable glyph.
+    pub fn protocol_register(key: &str, helper: &std::path::Path) -> Result<(), String> {
+        let helper_text = helper.to_string_lossy().into_owned();
+        let root = create_key(key)?;
+        let written = set_string(root, None, "URL:claude-statusline")
+            .and_then(|()| set_string(root, Some("URL Protocol"), ""));
+        unsafe { RegCloseKey(root) };
+        written?;
+
+        let icon = create_key(&format!("{key}\\DefaultIcon"))?;
+        let written = set_string(icon, None, &format!("\"{helper_text}\",0"));
+        unsafe { RegCloseKey(icon) };
+        written?;
+
+        let command = create_key(&format!("{key}\\shell\\open\\command"))?;
+        let written = set_string(command, None, &crate::cmd::notify::protocol_command(helper));
+        unsafe { RegCloseKey(command) };
+        written
+    }
+
+    pub fn protocol_unregister(key: &str) -> Result<(), String> {
+        let wide_key = wide(key);
+        let rc = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, wide_key.as_ptr()) };
+        if rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND {
+            Ok(())
+        } else {
+            Err(format!("cannot delete {key} (error {rc})"))
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -836,6 +952,14 @@ mod imp {
 
     pub fn registered_protocol_command(_key: &str) -> Option<String> {
         None
+    }
+
+    pub fn protocol_register(_key: &str, _helper: &std::path::Path) -> Result<(), String> {
+        Err("URI handler registration is Windows-only".to_string())
+    }
+
+    pub fn protocol_unregister(_key: &str) -> Result<(), String> {
+        Err("URI handler registration is Windows-only".to_string())
     }
 
     pub fn capture_window(

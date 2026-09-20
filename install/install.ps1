@@ -22,6 +22,8 @@ $claudeDir    = "$env:USERPROFILE\.claude"
 $binDir       = "$claudeDir\bin"
 $binPath      = "$binDir\claude-statusline.exe"
 $sidecarPath  = "$binDir\claude-statusline.exe.old"
+$helperPath   = "$binDir\claude-statusline-focus.exe"
+$helperSidecar = "$binDir\claude-statusline-focus.exe.old"
 $settingsPath = "$claudeDir\settings.json"
 $configPath   = "$claudeDir\notify-config.json"
 $iconPath     = "$claudeDir\claude-icon.png"
@@ -53,7 +55,8 @@ function Format-Size([long]$bytes) {
 #: a staged file left behind is an unverified binary sitting in the
 # install directory.
 function Remove-Stage {
-    foreach ($p in @($script:stagePath, $script:sumsPath, $script:bundlePath)) {
+    foreach ($p in @($script:stagePath, $script:sumsPath, $script:bundlePath,
+                     $script:helperStage, $script:helperBundle)) {
         if ($p -and (Test-Path $p)) { Remove-Item $p -Force -ErrorAction SilentlyContinue }
     }
 }
@@ -76,7 +79,23 @@ function Remove-Stage {
 # gate below distinguish "answered no" from "could not answer", and pick its own
 # safe direction for the second case.
 function Invoke-Binary {
-    param([string]$Exe, [string[]]$BinArgs)
+    param([string]$Exe, [string[]]$BinArgs, [switch]$Gui)
+    # A GUI-subsystem program -- the click helper -- returns to `&` the moment
+    # it starts, before it has exited, so its exit code has to be read through
+    # Start-Process -Wait instead. Same shape of answer: Ran, Code, Output.
+    if ($Gui) {
+        $proc = $null
+        try {
+            if ($BinArgs -and $BinArgs.Count -gt 0) {
+                $proc = Start-Process -FilePath $Exe -ArgumentList $BinArgs -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+            } else {
+                $proc = Start-Process -FilePath $Exe -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+            }
+        } catch {
+            return [PSCustomObject]@{ Ran = $false; Code = $null; Output = $_.Exception.Message }
+        }
+        return [PSCustomObject]@{ Ran = $true; Code = $proc.ExitCode; Output = '' }
+    }
     $global:LASTEXITCODE = $null
     $output = $null
     try {
@@ -134,6 +153,7 @@ if (-not $arch) {
 }
 $target = "$arch-pc-windows-msvc"
 $asset  = "claude-statusline-$target.exe"
+$helperAsset = "claude-statusline-focus-$target.exe"
 Ok $target
 Write-Host ""
 
@@ -334,6 +354,8 @@ Step "Downloading"
 $script:stagePath  = Join-Path $binDir "$stagePrefix$PID"
 $script:sumsPath   = Join-Path $binDir "$stagePrefix$PID.sums"
 $script:bundlePath = Join-Path $binDir "$stagePrefix$PID.sigstore.json"
+$script:helperStage  = Join-Path $binDir "$stagePrefix$PID.focus"
+$script:helperBundle = Join-Path $binDir "$stagePrefix$PID.focus.sigstore.json"
 
 $oldProgress = $ProgressPreference
 $ProgressPreference = 'SilentlyContinue'
@@ -471,7 +493,8 @@ try {
     Remove-Stage
     return
 }
-Remove-Item $script:sumsPath, $script:bundlePath -Force -ErrorAction SilentlyContinue
+# checksums.txt stays until the click helper below has been checked against it.
+Remove-Item $script:bundlePath -Force -ErrorAction SilentlyContinue
 Ok $binPath
 Info (Format-Size (Get-Item $binPath).Length)
 Write-Host ""
@@ -556,6 +579,100 @@ Remove-Item (Join-Path $binDir "claude-statusline.failed") -Force -ErrorAction S
 # run sweeps whatever is left.
 if (Test-Path $sidecarPath) { Remove-Item $sidecarPath -Force -ErrorAction SilentlyContinue }
 Ok "Renders correctly"
+Write-Host ""
+
+# --- The click helper ---
+# A second, Windows-only executable: the shell launches it, console-free, when
+# a notification toast is clicked, and it brings the session's terminal to the
+# front. Placed only now, after the self-check above passed, and registered
+# only after settings.json is written below. Every failure here is tolerated:
+# a missing or failing helper costs click handling and nothing else, and a
+# helper that fails its smoke run is deleted before anything could register it.
+Step "Installing the click helper"
+$helperReady = $false
+$helperWhy = ""
+$helperFetched = $false
+$oldProgress = $ProgressPreference
+$ProgressPreference = 'SilentlyContinue'
+try {
+    Invoke-WebRequest -Uri "$baseUrl/$helperAsset" -OutFile $script:helperStage -UseBasicParsing -ErrorAction Stop
+    $helperFetched = $true
+} catch {
+    $helperWhy = "the helper is not published for $tag"
+}
+$ProgressPreference = $oldProgress
+if ($helperFetched) {
+    # The same gates as the binary, against the same checksums.txt.
+    $helperExpected = $null
+    if (Test-Path $script:sumsPath) {
+        foreach ($line in (Get-Content $script:sumsPath)) {
+            $parts = $line -split '\s+', 2
+            if ($parts.Count -eq 2 -and $parts[1].Trim() -eq $helperAsset) { $helperExpected = $parts[0].Trim(); break }
+        }
+    }
+    $helperActual = $null
+    try { $helperActual = (Get-FileHash -Algorithm SHA256 $script:helperStage -ErrorAction Stop).Hash } catch {}
+    if (-not $helperExpected) {
+        $helperWhy = "checksums.txt has no entry for $helperAsset"
+    } elseif (-not $helperActual -or $helperActual.ToLower() -ne $helperExpected.ToLower()) {
+        $helperWhy = "checksum mismatch for $helperAsset"
+    } elseif (Get-Command gh -ErrorAction SilentlyContinue) {
+        $gotHelperBundle = $false
+        try {
+            Invoke-WebRequest -Uri "$baseUrl/$helperAsset.sigstore.json" -OutFile $script:helperBundle `
+                -UseBasicParsing -ErrorAction Stop
+            $gotHelperBundle = $true
+        } catch {}
+        if ($gotHelperBundle) {
+            $helperVerify = Invoke-Binary 'gh' @(
+                'attestation', 'verify', $script:helperStage,
+                '--bundle', $script:helperBundle,
+                '--repo', $repoSlug,
+                '--signer-workflow', $signerWorkflow)
+            if ($helperVerify.Ran -and $helperVerify.Code -ne 0) {
+                $helperWhy = "attestation verification failed for $helperAsset"
+            } elseif (-not $helperVerify.Ran -and $requireAttestation) {
+                $helperWhy = "provenance could not be verified and --require-attestation was given"
+            }
+        } elseif ($requireAttestation) {
+            $helperWhy = "no attestation bundle published for $helperAsset"
+        }
+    } elseif ($requireAttestation) {
+        $helperWhy = "gh CLI not found and --require-attestation was given"
+    }
+}
+if ($helperFetched -and -not $helperWhy) {
+    # The download carries the Mark of the Web; without this the first
+    # protocol launch would raise SmartScreen instead of the terminal.
+    Unblock-File -Path $script:helperStage -ErrorAction SilentlyContinue
+    # Smoke it as the shell will launch it: a GUI-subsystem process, waited on.
+    $smoke = Invoke-Binary $script:helperStage @() -Gui
+    if (-not $smoke.Ran -or $smoke.Code -ne 0) {
+        $helperWhy = "the helper did not run cleanly"
+    } else {
+        if (Test-Path $helperPath) {
+            Move-Item -Path $helperPath -Destination $helperSidecar -Force -ErrorAction SilentlyContinue
+        }
+        try {
+            Move-Item -Path $script:helperStage -Destination $helperPath -Force -ErrorAction Stop
+            $script:helperStage = $null
+            $helperReady = $true
+        } catch {
+            $helperWhy = "could not place the helper at $helperPath"
+            if (Test-Path $helperSidecar) { Move-Item -Path $helperSidecar -Destination $helperPath -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+if ($helperReady) {
+    Remove-Item $helperSidecar -Force -ErrorAction SilentlyContinue
+    Ok $helperPath
+} else {
+    # Deleted, never left staged: an unverified or failing helper must not sit
+    # in the install directory where a later run could register it.
+    if ($script:helperStage) { Remove-Item $script:helperStage -Force -ErrorAction SilentlyContinue }
+    Warn "Click handling not installed - $helperWhy"
+}
+Remove-Item $script:helperBundle, $script:sumsPath -Force -ErrorAction SilentlyContinue
 Write-Host ""
 
 # --- Note the superseded scripts ---
@@ -687,6 +804,22 @@ if (-not $apply.Ran -or $apply.Code -ne 0) {
     return
 }
 Ok "Updated $settingsPath"
+
+# --- Register the click handler ---
+# The binary owns the registry key the way it owns the settings.json entries:
+# it writes the claude-statusline: handler when the key is absent or already
+# ours, and leaves another program's registration alone and says so.
+if ($helperReady) {
+    $register = Invoke-Binary $binPath @('settings', 'protocol', 'register', '--binary', $binPath)
+    if ($register.Ran -and $register.Code -eq 0) {
+        Ok "Click handling enabled - clicking a toast brings the terminal forward"
+    } else {
+        Warn "Click handling not enabled"
+        if ($register.Output) { Info ($register.Output -join ' ') }
+    }
+} else {
+    Info "Click handling not enabled - $helperWhy"
+}
 
 # --- Migrate from a script installation ---
 # Only now: the binary has proved it renders and settings.json points at it, so

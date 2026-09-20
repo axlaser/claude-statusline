@@ -106,7 +106,8 @@ fn main() {
 }
 
 /// `settings apply|remove|has|has-foreign|has-legacy`, the installers' JSON
-/// editor.
+/// editor, and `settings protocol register|unregister|has`, the Windows URI
+/// handler's owner.
 ///
 /// Returns the process exit code: 0 for success or a true query, 1 otherwise.
 /// Errors go to stdout, not stderr — fd 2 is already redirected to the null
@@ -115,6 +116,7 @@ fn main() {
 fn settings_cli(rest: &[&str]) -> i32 {
     let mut binary = String::new();
     let mut path: Option<std::path::PathBuf> = None;
+    let mut key: Option<String> = None;
     let mut spec = settings::ApplySpec {
         quote: settings::quote_for_this_platform(),
         ..Default::default()
@@ -131,6 +133,12 @@ fn settings_cli(rest: &[&str]) -> i32 {
             "--settings" => match args.next() {
                 Some(v) => path = Some(std::path::PathBuf::from(v)),
                 None => return fail("--settings needs a value"),
+            },
+            // Testing hook for `protocol`: the case table registers under a
+            // scratch key rather than the real scheme.
+            "--key" => match args.next() {
+                Some(v) => key = Some(v.to_string()),
+                None => return fail("--key needs a value"),
             },
             "--statusline" => spec.statusline = true,
             "--subagent" => spec.subagent = true,
@@ -158,14 +166,19 @@ fn settings_cli(rest: &[&str]) -> i32 {
 
     let action = match positional.first() {
         Some(a) => *a,
-        None => {
-            return fail(
-                "usage: settings <apply|remove|has|has-foreign|has-legacy> --binary <path>",
-            )
-        }
+        None => return fail(
+            "usage: settings <apply|remove|has|has-foreign|has-legacy|protocol> --binary <path>",
+        ),
     };
     if binary.is_empty() {
         return fail("--binary is required");
+    }
+
+    // The URI handler lives in the registry, not in settings.json, so it is
+    // decided before the file is loaded: a machine with no settings.json can
+    // still register, and a broken one must not stop an unregister.
+    if action == "protocol" {
+        return protocol_cli(positional.get(1).copied(), &binary, key.as_deref());
     }
 
     let path = match path.or_else(settings::default_path) {
@@ -222,6 +235,68 @@ fn settings_cli(rest: &[&str]) -> i32 {
 fn fail(message: &str) -> i32 {
     emit(&format!("claude-statusline settings: {message}\n"));
     1
+}
+
+/// `settings protocol register|unregister|has --binary <path> [--key <path>]`.
+///
+/// `register` writes the key when it is absent or already names a
+/// `claude-statusline-focus.exe`, leaves a foreign command alone and says so,
+/// and refuses a helper path a quote or a percent sign could turn into a
+/// different command. `unregister` deletes the key only when its command is
+/// ours. `has` answers whether exactly the helper beside `--binary` is
+/// registered. Off Windows every verb is unsupported (KTD5).
+fn protocol_cli(verb: Option<&str>, binary: &str, key: Option<&str>) -> i32 {
+    let key = key.unwrap_or(platform::focus::PROTOCOL_KEY);
+    let helper = cmd::notify::helper_beside(std::path::Path::new(binary));
+    if cmd::notify::Platform::current() != cmd::notify::Platform::Windows {
+        return fail("protocol registration is Windows-only");
+    }
+    let current = platform::focus::protocol_command_at(key);
+    match verb {
+        Some("register") => {
+            if !settings::helper_path_is_registrable(&helper) {
+                return fail(&format!(
+                    "refusing to register {}: the path carries a quote or a percent sign",
+                    helper.display()
+                ));
+            }
+            if !helper.is_file() {
+                return fail(&format!("the helper is not at {}", helper.display()));
+            }
+            match settings::protocol_registration(current.as_deref(), &helper) {
+                settings::ProtocolRegistration::Unchanged => 0,
+                settings::ProtocolRegistration::Write | settings::ProtocolRegistration::Rewrite => {
+                    match platform::focus::protocol_register_at(key, &helper) {
+                        Ok(()) => 0,
+                        Err(e) => fail(&e),
+                    }
+                }
+                settings::ProtocolRegistration::Foreign(command) => fail(&format!(
+                    "the claude-statusline: scheme is registered to another program and was left alone: {command}"
+                )),
+            }
+        }
+        Some("unregister") => match current {
+            None => 0,
+            Some(c) if settings::names_our_helper(&c) => {
+                match platform::focus::protocol_unregister_at(key) {
+                    Ok(()) => 0,
+                    Err(e) => fail(&e),
+                }
+            }
+            Some(c) => {
+                emit(&format!(
+                    "claude-statusline settings: the claude-statusline: scheme belongs to another program and was kept: {c}\n"
+                ));
+                0
+            }
+        },
+        Some("has") => match current {
+            Some(c) if cmd::notify::handler_command_matches(&c, &helper) && helper.is_file() => 0,
+            _ => 1,
+        },
+        _ => fail("usage: settings protocol <register|unregister|has> --binary <path>"),
+    }
 }
 
 fn dispatch(sub: &str, rest: &[&str], os_rest: &[std::ffi::OsString]) {

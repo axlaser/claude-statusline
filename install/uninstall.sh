@@ -101,7 +101,7 @@ _tmpdir="${_tmpdir%/}"
 # it cleans up after a script-era install that did.
 rm -f "$_tmpdir"/statusline-oc-*.txt "$_tmpdir"/statusline-git-*.txt \
       "$_tmpdir"/statusline-tasks-*.json "$_tmpdir"/statusline-notify-*.json \
-      "$_tmpdir"/statusline-sa-*.txt "$_tmpdir"/statusline-tokens-*.txt 2>/dev/null
+      "$_tmpdir"/statusline-sa-*.txt "$_tmpdir"/statusline-tokens-*.txt       "$_tmpdir"/statusline-focus-*.json 2>/dev/null
 # Current installs group the same files under claude-statusline-<uid>. The flat
 # globs above stay: a session upgraded mid-flight leaves its files behind in the
 # old layout, and nothing at runtime ever sweeps them.
