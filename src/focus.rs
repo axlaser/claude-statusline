@@ -183,8 +183,22 @@ fn is_kitty_socket(s: &str) -> bool {
     s.strip_prefix("unix:").is_some_and(is_abs_path)
 }
 
+/// Konsole's `KONSOLE_DBUS_SERVICE`: the well-known `org.kde.konsole-<pid>`
+/// name older releases export, or the connection's unique name `:1.<n>` that
+/// current releases export (measured on Konsole 22 under the container
+/// desktop, where the well-known form alone dropped the identity).
 fn is_konsole_service(s: &str) -> bool {
-    s.strip_prefix("org.kde.konsole-").is_some_and(is_digits)
+    if let Some(pid) = s.strip_prefix("org.kde.konsole-") {
+        return is_digits(pid);
+    }
+    let Some(rest) = s.strip_prefix(':') else {
+        return false;
+    };
+    rest.len() <= 32
+        && rest.contains('.')
+        && !rest.starts_with('.')
+        && !rest.ends_with('.')
+        && rest.bytes().all(|b| b.is_ascii_digit() || b == b'.')
 }
 
 fn is_konsole_window(s: &str) -> bool {
