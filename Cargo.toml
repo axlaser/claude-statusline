@@ -51,6 +51,9 @@ windows-sys = { version = "0.59", features = [
     # root owner or the parent chain's windows (KTD6), marked with a window
     # property at capture and verified through it at click (KTD9).
     "Win32_UI_WindowsAndMessaging",
+    # Click-to-focus: the per-user URI handler under HKCU\Software\Classes
+    # is read on every visual alert and written by `settings protocol`.
+    "Win32_System_Registry",
 ] }
 
 # KTD7: the top-level catch_unwind is a no-op under `panic = "abort"`, so the

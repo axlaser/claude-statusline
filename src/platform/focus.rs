@@ -64,6 +64,15 @@ pub fn random_bytes() -> Option<[u8; TOKEN_BYTES]> {
     imp::random_bytes()
 }
 
+/// The registry path of the per-user URI handler, under `HKEY_CURRENT_USER`.
+pub const PROTOCOL_KEY: &str = "Software\\Classes\\claude-statusline";
+
+/// The open command registered for the `claude-statusline:` scheme, or `None`
+/// when nothing is registered or the platform has no such registry.
+pub fn registered_protocol_command() -> Option<String> {
+    imp::registered_protocol_command(PROTOCOL_KEY)
+}
+
 /// Walks a chain by asking `lookup` for each parent in turn, self first,
 /// stopping at the root, a cycle, or a bound.
 fn walk(self_pid: u64, lookup: impl Fn(u64) -> Option<ProcessInfo>) -> Vec<ProcessInfo> {
@@ -164,6 +173,10 @@ mod imp {
     pub fn controlling_tty() -> Option<String> {
         None
     }
+
+    pub fn registered_protocol_command(_key: &str) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -256,6 +269,10 @@ mod imp {
         let md = std::fs::metadata(&path).ok()?;
         (md.rdev() as u32 == info.e_tdev).then_some(path)
     }
+
+    pub fn registered_protocol_command(_key: &str) -> Option<String> {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -263,16 +280,15 @@ mod imp {
     use super::{walk, ProcessInfo, TOKEN_BYTES};
     use crate::focus::{WindowCandidate, WindowIdentity, PSEUDO_CONSOLE_CLASS, WINDOW_CLASSES};
 
-    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, FILETIME, HANDLE, HWND, LPARAM};
-    use windows_sys::Win32::Security::Cryptography::ProcessPrng;
-    use windows_sys::Win32::System::Console::{
-        AttachConsole, FreeConsole, GetConsoleWindow, GetStdHandle, SetStdHandle, STD_ERROR_HANDLE,
-        STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, BOOL, ERROR_SUCCESS, FILETIME, HANDLE, HWND, LPARAM,
     };
+    use windows_sys::Win32::Security::Cryptography::ProcessPrng;
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_SZ};
     use windows_sys::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -438,59 +454,60 @@ mod imp {
             .collect()
     }
 
-    /// The root owner of the console window this process can reach: its
-    /// own, or the console of the nearest ancestor up to the anchor.
+    /// KTD6 candidate A, without attaching to anything: the terminal window
+    /// behind the console an ancestor is attached to.
     ///
-    /// Claude Code spawns its children headless, so the capturing process
-    /// usually has no console of its own; attaching to Claude Code's console
-    /// yields the pseudo-console window, whose root owner under Windows
-    /// Terminal is the real hosting window (measured in U1). The three
-    /// standard handles are saved and restored around the attach so a
-    /// console swap can never redirect the tick's render.
-    fn console_root_window(chain: &[ProcessInfo], anchor_pid: u64) -> Option<HWND> {
-        let root_of = |console: HWND| -> Option<HWND> {
-            if console.is_null() {
-                return None;
-            }
-            let root = unsafe { GetAncestor(console, GA_ROOTOWNER) };
-            let root = if root.is_null() { console } else { root };
-            (class_of(root) != PSEUDO_CONSOLE_CLASS).then_some(root)
+    /// Claude Code spawns its children headless, so this process's own
+    /// console has no window. The console windows of its ancestors are still
+    /// enumerable, though: under a ConPTY host the `PseudoConsoleWindow` is
+    /// attributed to the shell that owns the pty, and its root owner under
+    /// Windows Terminal is the real hosting window; under the classic console
+    /// the `ConsoleWindowClass` window belongs to a conhost whose parent is
+    /// the console application. Both facts were measured in U1. Walking the
+    /// chain nearest-first and asking `EnumWindows` costs no `FreeConsole`,
+    /// which matters: a process that frees its console while another thread
+    /// spawns children hands those children fresh consoles of their own.
+    fn chain_console_window(
+        chain: &[ProcessInfo],
+        procs: &std::collections::HashMap<u64, (u64, String)>,
+        all: &[HWND],
+    ) -> Option<HWND> {
+        let terminal_root = |h: HWND| -> Option<HWND> {
+            let root = unsafe { GetAncestor(h, GA_ROOTOWNER) };
+            let root = if root.is_null() { h } else { root };
+            let class = class_of(root);
+            (class != PSEUDO_CONSOLE_CLASS && WINDOW_CLASSES.contains(&class.as_str()))
+                .then_some(root)
         };
-        if let Some(root) = root_of(unsafe { GetConsoleWindow() }) {
-            return Some(root);
-        }
-        let saved: Vec<(u32, HANDLE)> = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE]
-            .iter()
-            .map(|id| (*id, unsafe { GetStdHandle(*id) }))
-            .collect();
-        unsafe { FreeConsole() };
-        let mut found = None;
         for ancestor in chain.iter().skip(1) {
-            let pid = u32::try_from(ancestor.pid).unwrap_or(0);
-            if pid != 0 && unsafe { AttachConsole(pid) } != 0 {
-                let root = root_of(unsafe { GetConsoleWindow() });
-                unsafe { FreeConsole() };
-                if root.is_some() {
-                    found = root;
-                    break;
+            for h in all {
+                let class = class_of(*h);
+                if class == PSEUDO_CONSOLE_CLASS && pid_of(*h) == ancestor.pid {
+                    if let Some(root) = terminal_root(*h) {
+                        return Some(root);
+                    }
+                } else if class == "ConsoleWindowClass" {
+                    // The window is conhost's; conhost's parent is the
+                    // console application it serves.
+                    let conhost_parent = procs.get(&pid_of(*h)).map(|(ppid, _)| *ppid);
+                    if conhost_parent == Some(ancestor.pid) {
+                        return Some(*h);
+                    }
                 }
             }
-            if ancestor.pid == anchor_pid {
-                break;
-            }
         }
-        for (id, handle) in saved {
-            unsafe { SetStdHandle(id, handle) };
-        }
-        found
+        None
     }
 
     /// KTD6 candidate B: the first ancestor above this process that owns a
     /// visible top-level window, chosen through the pure selection rule.
-    fn ancestor_window(chain: &[ProcessInfo], basename: &str) -> Option<(HWND, String)> {
-        let all = top_level_windows();
+    fn ancestor_window(
+        chain: &[ProcessInfo],
+        all: &[HWND],
+        basename: &str,
+    ) -> Option<(HWND, String)> {
         for ancestor in chain.iter().skip(1) {
-            let windows = visible_windows_of(&all, ancestor.pid);
+            let windows = visible_windows_of(all, ancestor.pid);
             if windows.is_empty() {
                 continue;
             }
@@ -510,17 +527,19 @@ mod imp {
         session: &str,
         basename: &str,
     ) -> Option<WindowIdentity> {
-        let (hwnd, owner_image) = match console_root_window(chain, anchor_pid) {
+        let _ = anchor_pid;
+        let procs = snapshot();
+        let all = top_level_windows();
+        let (hwnd, owner_image) = match chain_console_window(chain, &procs, &all) {
             Some(h) => {
                 let pid = pid_of(h);
-                let image = chain
-                    .iter()
-                    .find(|p| p.pid == pid)
-                    .map(|p| p.name.clone())
+                let image = procs
+                    .get(&pid)
+                    .map(|(_, name)| name.clone())
                     .unwrap_or_default();
                 (h, image)
             }
-            None => ancestor_window(chain, basename)?,
+            None => ancestor_window(chain, &all, basename)?,
         };
         let class = class_of(hwnd);
         if class == PSEUDO_CONSOLE_CLASS || !WINDOW_CLASSES.contains(&class.as_str()) {
@@ -569,6 +588,48 @@ mod imp {
     pub fn raise_window(_handle: u64) -> bool {
         false
     }
+
+    /// Reads `<key>\shell\open\command`'s default value from HKCU.
+    ///
+    /// A registry read on the notify path, once per visual alert, never per
+    /// tick. `RegGetValueW` with `RRF_RT_REG_SZ` refuses any other value type
+    /// and returns a terminated string, so an expandable or binary value
+    /// planted there reads as unregistered rather than as a command.
+    pub fn registered_protocol_command(key: &str) -> Option<String> {
+        let path = wide(&format!("{key}\\shell\\open\\command"));
+        let mut len: u32 = 0;
+        let rc = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                std::ptr::null(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        if rc != ERROR_SUCCESS || len == 0 || len > 8192 {
+            return None;
+        }
+        let mut buf = vec![0u16; (len as usize).div_ceil(2)];
+        let rc = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                std::ptr::null(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr() as *mut std::ffi::c_void,
+                &mut len,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return None;
+        }
+        let end = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+        Some(String::from_utf16_lossy(&buf[..end]))
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
@@ -597,6 +658,10 @@ mod imp {
 
     pub fn ancestors_of(_pid: u64) -> Vec<ProcessInfo> {
         Vec::new()
+    }
+
+    pub fn registered_protocol_command(_key: &str) -> Option<String> {
+        None
     }
 
     pub fn capture_window(

@@ -45,12 +45,26 @@ pub fn probe_env() -> Env {
         }
     }
 
+    let binary = std::env::current_exe().unwrap_or_default();
+    let handler_registered = platform == Platform::Windows && {
+        let helper = crate::cmd::notify::helper_beside(&binary);
+        crate::platform::focus::registered_protocol_command()
+            .is_some_and(|c| crate::cmd::notify::handler_command_matches(&c, &helper))
+            && helper.is_file()
+    };
     Env {
         home,
         cwd,
         system_root,
         programs,
         files,
+        binary,
+        // The bundle identifier the launching app hands every child; empty
+        // outside macOS and under an app that does not set it.
+        bundle_id: std::env::var("__CFBundleIdentifier")
+            .ok()
+            .filter(|v| !v.is_empty()),
+        handler_registered,
     }
 }
 

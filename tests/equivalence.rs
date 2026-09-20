@@ -2031,6 +2031,9 @@ fn full_env() -> Env {
         .map(|s| s.to_string())
         .collect(),
         files,
+        binary: PathBuf::from("/home/fixture/.claude/bin/claude-statusline"),
+        bundle_id: Some("com.apple.Terminal".to_string()),
+        handler_registered: true,
     }
 }
 
@@ -9003,4 +9006,112 @@ fn window_candidates_select_only_an_unambiguous_window() {
     assert_eq!(focus::host_kind("Chrome_WidgetWin_1", "Code.exe"), "vscode");
     assert_eq!(focus::host_kind("Chrome_WidgetWin_1", "Hyper.exe"), "other");
     assert_eq!(focus::window_marker("s-1"), "ClaudeStatusline.s-1");
+}
+
+// ---------------------------------------------------------------------------
+// Click-to-focus: the Windows toast's protocol content
+// ---------------------------------------------------------------------------
+
+/// The Windows toast carries `launch` in its stdin JSON only when the handler
+/// is registered and a key was passed, and argv never carries the message or
+/// the launch value.
+#[test]
+fn the_windows_toast_carries_the_launch_uri_only_when_registered_with_a_key() {
+    let key = Key::parse(&format!("s1.{}", "k".repeat(32))).unwrap();
+    let plan_for = |env: &Env, key: Option<&Key>| -> serde_json::Value {
+        let plan = notify::plan(
+            Platform::Windows,
+            "stop",
+            "",
+            "",
+            &NotifyConfig::default(),
+            env,
+            key,
+        );
+        let Some(Action::Spawn { args, stdin, .. }) = plan.first() else {
+            panic!("no toast planned: {plan:?}");
+        };
+        let payload = stdin.as_deref().unwrap_or("");
+        for arg in args {
+            assert!(
+                !arg.contains("claude-statusline:") && !arg.contains("Finished"),
+                "argv carries the launch value or the message: {arg:?}"
+            );
+        }
+        serde_json::from_str(payload).expect("stdin is JSON")
+    };
+
+    let registered = full_env();
+    let with_key = plan_for(&registered, Some(&key));
+    assert_eq!(
+        with_key["launch"],
+        serde_json::Value::String(format!("claude-statusline:s1.{}", "k".repeat(32)))
+    );
+    assert_eq!(with_key["message"], "Finished working");
+
+    let no_key = plan_for(&registered, None);
+    assert!(no_key["launch"].is_null(), "{no_key}");
+
+    let mut unregistered = full_env();
+    unregistered.handler_registered = false;
+    let unregistered = plan_for(&unregistered, Some(&key));
+    assert!(
+        unregistered["launch"].is_null(),
+        "an unregistered machine must get today's toast: {unregistered}"
+    );
+
+    // The script stays a constant without double quotes, still exits quietly
+    // without BurntToast, and falls back to today's cmdlet.
+    let script = notify::WINDOWS_TOAST_SCRIPT;
+    assert!(!script.contains('"'));
+    assert!(script.contains("if(-not (Get-Module -ListAvailable -Name BurntToast)){exit 0}"));
+    assert!(script.contains("-ActivationType Protocol -Launch $p.launch"));
+    assert!(
+        !script.contains("-AppId"),
+        "the default identity keeps the toast rendering as today"
+    );
+    assert!(script.contains("New-BurntToastNotification -Text $p.title,$p.message -Silent"));
+}
+
+/// The handler is registered only when the open command names exactly the
+/// helper beside this binary and that file exists.
+#[test]
+fn the_handler_probe_accepts_only_the_helper_beside_the_binary() {
+    let binary = Path::new("C:\\Users\\u\\.claude\\bin\\claude-statusline.exe");
+    let helper = notify::helper_beside(binary);
+    assert_eq!(
+        helper,
+        PathBuf::from("C:\\Users\\u\\.claude\\bin\\claude-statusline-focus.exe")
+    );
+    let command = notify::protocol_command(&helper);
+    assert_eq!(
+        command,
+        "\"C:\\Users\\u\\.claude\\bin\\claude-statusline-focus.exe\" \"%1\""
+    );
+    assert!(notify::handler_command_matches(&command, &helper));
+    assert!(
+        notify::handler_command_matches(&command.to_ascii_lowercase(), &helper),
+        "the registry may spell the drive differently"
+    );
+    for (name, other) in [
+        (
+            "elsewhere",
+            "\"C:\\Tools\\claude-statusline-focus.exe\" \"%1\"".to_string(),
+        ),
+        (
+            "foreign",
+            "\"C:\\Program Files\\Other\\handler.exe\" \"%1\"".to_string(),
+        ),
+        ("no-argument", format!("\"{}\"", helper.to_string_lossy())),
+        (
+            "extra-argument",
+            format!("\"{}\" \"%1\" --debug", helper.to_string_lossy()),
+        ),
+        ("empty", String::new()),
+    ] {
+        assert!(
+            !notify::handler_command_matches(&other, &helper),
+            "[{name}] accepted {other:?}"
+        );
+    }
 }

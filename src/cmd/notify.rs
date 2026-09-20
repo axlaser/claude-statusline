@@ -87,6 +87,15 @@ pub struct Env {
     pub programs: BTreeSet<String>,
     /// Files that exist — sound assets and the notification icon.
     pub files: BTreeSet<PathBuf>,
+    /// This binary's absolute path, for the macOS `-execute` action.
+    pub binary: PathBuf,
+    /// The launching application's bundle identifier on macOS, when the
+    /// inherited environment names one.
+    pub bundle_id: Option<String>,
+    /// Windows: the `claude-statusline:` handler is registered and names the
+    /// helper beside this binary, which is what makes a protocol toast safe
+    /// to raise (KTD4).
+    pub handler_registered: bool,
 }
 
 impl Env {
@@ -156,10 +165,32 @@ pub const WINDOWS_TOAST_SCRIPT: &str = concat!(
     "if(-not $p.message){exit 0};",
     "if(-not (Get-Module -ListAvailable -Name BurntToast)){exit 0};",
     "Import-Module BurntToast;",
-    "if($p.icon -and (Test-Path -LiteralPath $p.icon)){",
+    "$hasIcon=[bool]($p.icon -and (Test-Path -LiteralPath $p.icon));",
+    "$done=$false;",
+    // The click transport (KTD4): protocol activation with the launch URI the
+    // stdin JSON carries. Never `-AppId` — the default identity is what keeps
+    // the toast rendering as it does today. Any failure falls through to the
+    // cmdlet below, so a BurntToast without these cmdlets still toasts.
+    "if($p.launch){",
+    "try{",
+    "$ErrorActionPreference='Stop';",
+    "$t=@((New-BTText -Text $p.title),(New-BTText -Text $p.message));",
+    "if($hasIcon){$b=New-BTBinding -Children $t -AppLogoOverride (New-BTImage -Source $p.icon -AppLogoOverride)}",
+    "else{$b=New-BTBinding -Children $t};",
+    "$v=New-BTVisual -BindingGeneric $b;",
+    "$a=New-BTAudio -Silent;",
+    "$c=New-BTContent -Visual $v -Audio $a -ActivationType Protocol -Launch $p.launch;",
+    "Submit-BTNotification -Content $c;",
+    "$done=$true",
+    "}catch{$done=$false};",
+    "$ErrorActionPreference='SilentlyContinue'",
+    "};",
+    "if(-not $done){",
+    "if($hasIcon){",
     "New-BurntToastNotification -Text $p.title,$p.message -AppLogo $p.icon -Silent",
     "}else{",
     "New-BurntToastNotification -Text $p.title,$p.message -Silent",
+    "}",
     "}",
 );
 
@@ -321,8 +352,6 @@ pub fn plan(
     if event.is_empty() {
         return Vec::new();
     }
-    // The per-platform click transports arrive with their delivery units.
-    let _ = key;
     let flags = cfg.event(event);
     let msg = message(platform, event, value, stdin, &env.cwd);
 
@@ -330,7 +359,7 @@ pub fn plan(
     match platform {
         Platform::Windows => {
             if flags.visual && !msg.is_empty() {
-                actions.push(windows_toast(&msg, env));
+                actions.push(windows_toast(&msg, env, key));
             }
             if flags.sound {
                 actions.push(windows_sound(event, env));
@@ -457,11 +486,22 @@ fn unix_visual(platform: Platform, msg: &str, env: &Env) -> Option<Action> {
 /// Unlike the shipped handler this does not first probe for BurntToast — that
 /// check now lives inside the script, which costs nothing and saves a second
 /// interpreter launch just to answer a question the script can answer itself.
-fn windows_toast(msg: &str, env: &Env) -> Action {
+///
+/// The click key travels the same way as the message, inside the stdin JSON as
+/// `launch`, and only when the handler is registered (AE6): an unregistered
+/// machine gets today's toast, and a click on it keeps today's behaviour (R9).
+/// The launch attribute is XML on the other side; the key alphabet's exclusion
+/// of `&<>"'` is what keeps it inert there.
+fn windows_toast(msg: &str, env: &Env, key: Option<&Key>) -> Action {
+    let launch = match key {
+        Some(key) if env.handler_registered => Some(key.uri()),
+        _ => None,
+    };
     let payload = serde_json::json!({
         "title": TITLE,
         "message": msg,
         "icon": env.icon(Platform::Windows).map(|p| p.to_string_lossy().into_owned()),
+        "launch": launch,
     });
     Action::Spawn {
         program: powershell_path(&env.system_root)
@@ -476,6 +516,27 @@ fn windows_toast(msg: &str, env: &Env) -> Action {
         stdin: Some(payload.to_string()),
         background: false,
     }
+}
+
+/// The helper executable's name and where it sits: beside the binary.
+pub const FOCUS_HELPER: &str = "claude-statusline-focus.exe";
+
+pub fn helper_beside(binary: &Path) -> PathBuf {
+    let dir = binary.parent().unwrap_or(binary);
+    join(Platform::Windows, dir, &[FOCUS_HELPER])
+}
+
+/// The open command the registration writes: the helper quoted, then `"%1"`.
+pub fn protocol_command(helper: &Path) -> String {
+    format!("\"{}\" \"%1\"", helper.to_string_lossy())
+}
+
+/// Whether a registered open command names exactly the helper beside this
+/// binary (KTD5). The comparison folds case because the path came through the
+/// registry and the installer may have spelled the drive differently; it does
+/// not tolerate any other difference.
+pub fn handler_command_matches(command: &str, helper: &Path) -> bool {
+    command.eq_ignore_ascii_case(&protocol_command(helper))
 }
 
 /// Windows PowerShell 5.1's fixed location.
