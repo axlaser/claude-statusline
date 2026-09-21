@@ -9808,6 +9808,21 @@ fn the_installers_place_register_and_remove_the_click_helper_in_order() {
             && install.contains("Start-Process -FilePath $Exe -Wait -PassThru"),
         || "the GUI smoke must go through Invoke-Binary's -Gui switch".to_string(),
     );
+    // Start-Process resolves a file by its extension the way the shell does.
+    // Staged as `.focus`, the helper went to the "select an app to open this
+    // .focus file" dialog instead of running, the smoke reported "did not run
+    // cleanly", and every install refused the helper it had just verified.
+    // The first dev-channel install found it; nothing before that had run the
+    // smoke against a real staged file.
+    failures.check(
+        "stage-name-ends-in-exe",
+        install
+            .contains(r#"$script:helperStage  = Join-Path $binDir "$stagePrefix$PID.focus.exe""#),
+        || {
+            "the helper is staged under a name Start-Process will not run as an executable"
+                .to_string()
+        },
+    );
 
     let uninstall = read_repo_file("install/uninstall.ps1");
     let unregister = pos(&uninstall, "'settings', 'protocol', 'unregister'");

@@ -380,7 +380,14 @@ Step "Downloading"
 $script:stagePath  = Join-Path $binDir "$stagePrefix$PID"
 $script:sumsPath   = Join-Path $binDir "$stagePrefix$PID.sums"
 $script:bundlePath = Join-Path $binDir "$stagePrefix$PID.sigstore.json"
-$script:helperStage  = Join-Path $binDir "$stagePrefix$PID.focus"
+# The helper's stage name ends in .exe, and the binary's does not, because of
+# what each is asked to do before it is placed. The binary is only hashed and
+# moved. The helper is smoke-run in place through Start-Process, which resolves
+# a file by its extension the way the shell does: a name ending in .focus went
+# to the "select an app to open this .focus file" dialog instead of running,
+# the smoke reported "did not run cleanly", and every install refused the
+# helper it had just verified.
+$script:helperStage  = Join-Path $binDir "$stagePrefix$PID.focus.exe"
 $script:helperBundle = Join-Path $binDir "$stagePrefix$PID.focus.sigstore.json"
 
 $oldProgress = $ProgressPreference
