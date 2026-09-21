@@ -26,8 +26,7 @@ showing context usage, git state, costs, rate limits, and more — all inside a 
 |-----|---------------|
 | **repo** | Working directory (shortened relative to `$HOME`) and git branch with `↑ahead` / `↓behind` remote tracking, `+insertions` / `-deletions` / `~untracked`, and `⊟ stash` count |
 | **agent** | Agent name with compact context % and in/out tokens (when running with `--agent` flag); each active subagent also gets its own `agent` row with context bar, `used/window` tokens, model, reasoning effort (only when explicitly set), task title, and `○ working` / `✓ done` status |
-| **model** | Active model (e.g. `Opus 4.7`), reasoning effort level, and ready/working indicator |
-| **context** | Color-coded context bar with percentage and token count (green < 60%, yellow < 85%, red 85%+) |
+| **model** | Color-coded context bar with percentage and `used/window` token count (green < 60%, yellow < 85%, red 85%+), then the active model (e.g. `Opus 5`), reasoning effort level, ready/working indicator, and the Claude Code version you're running |
 | **tokens** | Cumulative session breakdown — `in` (fresh input), `cache↑` (cache writes), `cache↓` (cache reads), `out` (output) |
 | **cost** | Session cost in USD, message count, wall-clock duration, and 5-hour/7-day rate limit usage with burn-rate arrows (`⇡` over pace / `⇣` under pace) and time until reset |
 | **notifications** | Sound alerts and native OS toast popups for permission requests, task completion, context compaction, rate limit warnings, and context window warnings (enable during install) |
@@ -46,6 +45,12 @@ The rate-limit segments on the cost row don't just show usage — they show **pa
 
 ### Live working indicator
 The model row shows a real-time status — `● ready` when idle, or `○ working` while Claude is generating. You always know if the model is still thinking or waiting for you.
+
+### Claude Code version, and a nudge when it's stale
+The model row ends with the version you're running — `v2.1.278`. When a newer one exists it turns yellow and names it: `v2.1.278 ↑2.1.290`. That's read from the changelog Claude Code already caches at `~/.claude/cache/changelog.md`, so it costs no network call and no extra process — and because the cache is refreshed by Claude Code rather than by the status line, a long gap between sessions means the row stays quiet rather than claiming an update that isn't there. The version segment is absent on a Claude Code too old to report one.
+
+### A model name, not a spec sheet
+`Opus 5 (1M context)` renders as `Opus 5`. The trailing parenthetical is dropped by shape rather than by matching a list of known models, so a model that hasn't shipped yet shortens the same way with no update to this tool — and you lose nothing, because the `/1M` beside the bar reads the window Claude Code actually reports.
 
 ### Compact agent view
 When running with `--agent`, the agent row shows context usage as a percentage and cumulative in/out tokens in a compact inline format — all the essentials without taking up extra rows.

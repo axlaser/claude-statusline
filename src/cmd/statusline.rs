@@ -50,6 +50,14 @@ impl Roots {
     fn notify_config_path(&self) -> Option<PathBuf> {
         self.claude_dir().map(|d| d.join("notify-config.json"))
     }
+
+    /// Claude Code's cached copy of its own CHANGELOG, which is the only
+    /// on-disk answer to "is there a newer Claude Code". Written by the main
+    /// process, never by this one.
+    fn changelog_path(&self) -> Option<PathBuf> {
+        self.claude_dir()
+            .map(|d| d.join("cache").join("changelog.md"))
+    }
 }
 
 /// Renders one refresh and fires whatever alerts it crossed. Degraded input
@@ -89,6 +97,12 @@ pub fn run(clock: &dyn Clock, roots: &Roots, raw: &str) -> String {
     let windows = Windows::new(payload.model_id(), payload.context_window_size(), learned);
     let subagents = subagent_rows(clock, roots, &payload, &session_id, &windows);
 
+    // Gated on the payload carrying a version at all, so a Claude Code too old
+    // to send one pays nothing for a comparison it could not use. Bounded to
+    // the changelog's first 4 KB — see `crate::update` for why this file and
+    // what its answer is worth.
+    let newer = crate::update::available(roots.changelog_path().as_deref(), payload.cli_version());
+
     let output = render::render(&Inputs {
         payload: &payload,
         home: home_str.as_deref(),
@@ -97,6 +111,7 @@ pub fn run(clock: &dyn Clock, roots: &Roots, raw: &str) -> String {
         record: record.as_ref(),
         subagents: &subagents,
         now: clock.now_unix(),
+        newer_version: newer.as_deref(),
     });
 
     fire_alerts(roots, &payload, &session_id, &output);

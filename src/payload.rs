@@ -158,6 +158,15 @@ impl Payload {
         self.text(&["model", "id"])
     }
 
+    /// The Claude Code version running this session -- a plain top-level
+    /// string, unconditionally present since it was added, unlike the
+    /// conditional `effort`, `rate_limits` and `agent` blocks. The scripts
+    /// predate it and had no equivalent, so there is no `J_` name for it.
+    /// Empty on a Claude Code old enough not to send it.
+    pub fn cli_version(&self) -> &str {
+        self.text(&["version"])
+    }
+
     /// `J_CTX_SIZE`.
     pub fn context_window_size(&self) -> Option<u64> {
         self.uint(&["context_window", "context_window_size"])

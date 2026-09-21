@@ -36,11 +36,13 @@ The crate is lib+bin so the single test file can reach internal behaviour a bina
 
 There is no output cache. The display recomputes per tick -- the caches in the scripts existed to dodge an interpreter startup cost the migration removed. Six files survive as **data stores, not performance caches**: the learned model-to-window map, the per-task subagent done-linger stamp, the per-session notification latch, the per-session subagent tasks feed, the per-session transcript token record, and the per-session focus record that a toast's click resolves. The git status cache keeps its 5s TTL, because `git` is still a subprocess and the TTL doubles as the staleness bound for an invalidation key known to be incomplete.
 
+One further file is **read and never written**: `~/.claude/cache/changelog.md`, Claude Code's own cached CHANGELOG, whose first `## X.Y.Z` heading answers "is there a newer Claude Code" for the model row's version segment. The payload carries the running `version` and no update flag, and learning one first-hand would mean a network call behind a subprocess, which the per-tick path does not get. `src/update.rs` owns that read: bounded to 4 KB, through `state::read_trusted_prefix`, and skipped entirely unless the payload's `version` starts with a digit -- a version the comparison cannot read as a number would normalise to zero and make every heading beat it, so it reads as nothing to compare rather than as version zero. A stale cache under-reports, which is the safe direction, and the heading token is truncated to its dotted digits so nothing from that file can reach the row as an escape sequence.
+
 ### JSON Input Contract
 
 Claude Code pipes a JSON object to stdin on each refresh. Key top-level fields:
 
-`session_id`, `workspace.current_dir`, `cwd`, `model.display_name`, `model.id`, `context_window.context_window_size`, `context_window.used_percentage`, `context_window.total_input_tokens`, `effort.level`, `cost.total_cost_usd`, `cost.total_duration_ms`, `transcript_path`, `rate_limits.five_hour.*`, `rate_limits.seven_day.*`, `agent.name`, `context_window.current_usage.*`
+`session_id`, `version`, `workspace.current_dir`, `cwd`, `model.display_name`, `model.id`, `context_window.context_window_size`, `context_window.used_percentage`, `context_window.total_input_tokens`, `effort.level`, `cost.total_cost_usd`, `cost.total_duration_ms`, `transcript_path`, `rate_limits.five_hour.*`, `rate_limits.seven_day.*`, `agent.name`, `context_window.current_usage.*`
 
 Legacy spellings the accessors still accept as fallbacks: top-level `total_cost_usd`, and `total_duration_ms` / `duration_ms` for the duration.
 

@@ -18,6 +18,7 @@ pub mod settings;
 pub mod state;
 pub mod subagent;
 pub mod transcript;
+pub mod update;
 
 use std::path::PathBuf;
 
@@ -94,5 +95,6 @@ fn render_self_check() -> String {
         record: None,
         subagents: &[],
         now: SELF_CHECK_CLOCK,
+        newer_version: None,
     })
 }

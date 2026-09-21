@@ -202,6 +202,38 @@ observed fresh/stale outcome, not only the rendered bytes — see
   `false` the user believed was already in effect starts behaving as written. See
   `src/config.rs:83`.
 
+- *2026-09-20:* the model row absorbs the context row, and gains two segments the scripts
+  never had. Three changes, one row, all deliberate and all visible in every capture:
+  the context bar, its percentage and `used/window` now **lead** the row, ahead of the
+  model name, and the separate `context` row is gone; a display name's trailing
+  parenthetical is dropped, so `Opus 5 (1M context)` renders `Opus 5`; and the row ends
+  with the running Claude Code version, `v2.1.278`, yellow and naming the newer one
+  (`v2.1.278 ↑2.1.290`) when there is one. The parenthetical is stripped by shape rather
+  than against a list of known variants, so a model that has not shipped shortens on the
+  same rule — and nothing is lost, because the window label two segments to its left reads
+  the window the payload reports rather than a name that claims one. The box widens by the
+  bar's 30 columns, to 106 where this row is the longest; nothing clips, because
+  `assemble` sizes the frame to its widest row.
+  **The captures could not be recaptured** — the scripts are deleted and could not have
+  produced this layout anyway — so all 49 goldens carrying both rows were rewritten
+  instead: each was decomposed back into its `(section, label, content)` rows, the merge
+  applied, and `assemble` re-run, so every platform keeps exactly the content it captured
+  and only the frame moves. That rewrite is not taken on trust:
+  `rendered_output_matches_the_captured_fixtures` re-renders each case from the port and
+  compares bytes, which is what makes a wrong transformation a test failure rather than a
+  new golden. `payload-empty` (linux, macos) and `payload-malformed` render the bad-JSON
+  notice and have no box, so they were left untouched.
+  The **version segment is not covered by the golden fixtures**: no pinned payload a case
+  uses carries a `version`, exactly as the `B` and grouping tiers above sit past every
+  value the table exercises. Four named tests carry that coverage instead —
+  `the_model_row_opens_on_the_bar_and_closes_on_the_version` for the row,
+  `a_display_names_trailing_parenthetical_is_dropped_whatever_it_says` for the name rule,
+  `the_version_segment_resolves_its_changelog_through_the_real_roots` for the wiring
+  through `cmd_statusline::run` (the private `Roots::changelog_path` join is reachable no
+  other way, and a wrong join degrades to the same quiet row as "nothing to report"), and
+  `a_hostile_changelog_target_is_refused_not_followed` for the guard, which every other
+  guarded read in the crate already has.
+
 ## 5. PR checklist for hot-path changes
 
 - [ ] Subprocess delta stated. `git` is the only one that should appear.
@@ -678,3 +710,76 @@ any tick.
 **The helper is a second binary, not a second per-tick process.** `claude-statusline-focus`
 runs only when the shell launches it for a click, spawns nothing, and exits within the
 two-second foreground bound.
+
+### The update signal is a read, not a check — 2026-09-20
+
+The model row now answers "is there a newer Claude Code". The obvious way to answer it is
+the one this codebase cannot have: `npm view @anthropic-ai/claude-code version` is a
+network call behind a subprocess, on a path whose first hard rule is that `git` is the
+only subprocess. So the question was inverted — *what already knows the answer on disk?*
+
+Three candidates, all of them inspected in the installed 2.1.278 bundle and on a live
+machine:
+
+- `~/.claude/.last-update-result.json` — backward-looking. It records the outcome of the
+  last update *attempt* (`version_from`, `version_to`), so it says what happened, never
+  what is available. With `autoUpdates: false` it may not move for weeks.
+- The installed `package.json` version against the payload's `version` — real, but only
+  during the seconds between an in-place `npm install -g` and the session restarting, and
+  the path to it differs per install method (npm-global, npm-local, native). Three
+  spellings of a path to catch a window nobody is looking at the status line during.
+- `~/.claude/cache/changelog.md` — Claude Code's cached copy of its own CHANGELOG, fetched
+  from the repository's `main` branch. Its first `## X.Y.Z` heading is the newest version
+  that existed when the main process last fetched it. One path, every install method.
+
+The third one ships. What it costs, measured rather than assumed — produced by
+`tests/harness/measure-pair.ps1`, which was added for this change and is named here
+because §3 requires a paired measurement to say which tool made it. It is **not**
+`measure.sh` / `measure.ps1`: those pair a runtime script against the binary that replaced
+it, which is the migration's question, and they cannot run at all now that the script
+trees are deleted (`measure.sh:104-108`). Answering "did this commit make the binary
+slower" needs two builds of this crate, which that pair has no mode for. The new driver
+takes `tests/harness/payloads/full-with-version.json` — `full.json` plus the top-level
+`version` field, which is what gates the changelog read — and refuses to report a number
+until it has seen the after-binary actually render the version segment. Without that field
+the gate in `update::available` returns before the file is opened and the pair would time
+the same code twice; no other committed payload carries it.
+
+15 interleaved pairs per mode, one fresh process per probe, isolated `USERPROFILE`/`TEMP`,
+a 753 KB changelog and a 568 KB transcript staged into them, maintainer machine
+(Windows 11 26200, i9-10900K, rustc 1.97.1), this tree's `--release` build against one
+built from the parent commit:
+
+| Mode | Before | After | Delta |
+|---|---|---|---|
+| warm | 27.7 ms / 27.2 ms | 27.6 ms / 27.5 ms | −0.11 ms / +0.27 ms |
+| cold | 28.5 ms / 28.2 ms | 28.7 ms / 28.3 ms | +0.19 ms / +0.14 ms |
+
+Two independent repetitions whose deltas straddle zero and never exceed 0.3 ms on a ~28 ms
+tick. Read that as no measurable cost, not as a saving and not as a regression: a guarded
+open plus a 4 KB read does not register against process creation and the transcript. This
+is the same result render-path micro-optimisation gets in §1, for the same reason. An
+earlier draft of this entry reported uniformly negative deltas from a throwaway probe that
+never lived in the tree; the numbers were real and the probe did exercise the read, but
+nobody else could re-run them, which is why the driver is committed now.
+
+Unix has no twin yet. `measure-pair.sh` should be written the first time a hot-path change
+needs a Unix pair, rather than carrying an untested one.
+
+Three properties the read depends on, all of them deliberate:
+
+- **Bounded.** `state::read_trusted_prefix` stops at 4 KB. `read_trusted` would pull the
+  whole 753 KB file to find a number on line 3, which would make it the largest read on
+  the tick by an order of magnitude. A heading pushed past the bound is simply not found.
+- **Guarded.** It goes through the same symlink and foreign-owner predicate as every other
+  read in `state.rs`, because "one module owns every guard" is what stopped two of them
+  failing in opposite directions.
+- **Gated.** No `version` in the payload means no comparison is possible, so the file is
+  never opened. A Claude Code old enough not to send one pays nothing.
+
+And one property it does not have: freshness. The cache is written by the main process, so
+a user who has not started Claude Code in a week is compared against the version that was
+newest a week ago. That under-reports — the row stays quiet about an update rather than
+inventing one — which is the direction to fail in. It can also lead the registry by
+minutes, because the heading lands on `main` when the release is cut. The segment's claim
+is "a newer version exists", not "an update will install right now".

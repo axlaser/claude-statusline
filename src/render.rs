@@ -189,6 +189,23 @@ fn effort_segment(sep: &str, effort: &str) -> String {
     format!("{sep}{}{effort} effort{RESET}", effort_color(effort))
 }
 
+/// `v2.1.278`, and whether there is anything to do about it.
+///
+/// Grey when the running version is the newest one on disk: a number the user
+/// cannot act on is a label, not an alert, and the row already carries three
+/// colours that mean something. Yellow with the newer version when there is
+/// one, which is the only state worth an eye-stop. Absent entirely on a Claude
+/// Code old enough not to send `version`.
+fn version_segment(sep: &str, version: &str, newer: Option<&str>) -> String {
+    if version.is_empty() {
+        return String::new();
+    }
+    match newer {
+        Some(latest) => format!("{sep}{YELLOW}v{version} ↑{latest}{RESET}"),
+        None => format!("{sep}{GRAY}v{version}{RESET}"),
+    }
+}
+
 /// Unknown values, including the integer form agent frontmatter allows, fall
 /// through to `WHITE` rather than being rejected.
 pub fn effort_color(level: &str) -> &'static str {
@@ -243,6 +260,32 @@ pub fn prettify_model_id(id: &str) -> String {
         return format!("{capitalized} {}", version.replace('-', "."));
     }
     cleaned.to_string()
+}
+
+/// `Opus 5 (1M context)` -> `Opus 5`.
+///
+/// Stripped by shape rather than by matching the variants that exist today:
+/// Anthropic spells a variant as a trailing parenthetical, so a model that has
+/// not shipped yet shortens on the same rule and this needs no table to keep
+/// current. Nothing is lost from the row — the window label beside the bar
+/// reads `/1M` already, and it reads the window the payload reports rather
+/// than a name that claims one.
+///
+/// A name that is *only* a parenthetical keeps its text: emptying the segment
+/// would render a model row with no model in it.
+fn drop_parenthetical(name: &str) -> &str {
+    let Some(head) = name.strip_suffix(')') else {
+        return name;
+    };
+    let Some(cut) = head.rfind(" (") else {
+        return name;
+    };
+    let trimmed = name[..cut].trim_end();
+    if trimmed.is_empty() {
+        name
+    } else {
+        trimmed
+    }
 }
 
 /// `$X.YYYY` plus whether the value exceeds the cost-warning threshold.
@@ -622,6 +665,10 @@ pub struct Inputs<'a> {
     pub record: Option<&'a TokenRecord>,
     pub subagents: &'a [Row],
     pub now: i64,
+    /// A Claude Code newer than the one running, when the changelog cache
+    /// names one. Resolved by the caller, because this module does not read
+    /// files -- see [`crate::update`] for what the answer is worth.
+    pub newer_version: Option<&'a str>,
 }
 
 /// The whole status line, with no trailing newline.
@@ -645,12 +692,14 @@ pub fn render(inputs: &Inputs) -> String {
     let model_short = if display_name.is_empty() {
         "unknown".to_string()
     } else {
-        display_name
-            .strip_prefix("Claude ")
-            .unwrap_or(&display_name)
-            .chars()
-            .take(24)
-            .collect()
+        drop_parenthetical(
+            display_name
+                .strip_prefix("Claude ")
+                .unwrap_or(&display_name),
+        )
+        .chars()
+        .take(24)
+        .collect()
     };
 
     let ctx_size = p.context_window_size();
@@ -658,9 +707,10 @@ pub fn render(inputs: &Inputs) -> String {
     let pct_int = used_pct.map(round_pct);
     let pct_col = pct_int.map(pct_color).unwrap_or(WHITE);
 
-    // Always rendered, so a fresh session shows an empty bar rather than an
-    // empty row. The bar fills from the *truncated* percentage while the label
-    // shows the *rounded* one — a script quirk, kept deliberately.
+    // Always rendered, so a fresh session shows an empty bar rather than a row
+    // that opens on the model name. The bar fills from the *truncated*
+    // percentage while the label shows the *rounded* one — a script quirk,
+    // kept deliberately.
     let bar_pct = used_pct
         .map(|v| (v.trunc() as i64).clamp(0, 100))
         .unwrap_or(0);
@@ -690,9 +740,28 @@ pub fn render(inputs: &Inputs) -> String {
     } else {
         format!("{YELLOW}○{RESET}  {YELLOW}working{RESET}")
     };
-    let mut model_row = format!("{MAGENTA}{model_short}{RESET}");
+    // One row, bar first. The two were split while the bar was the row: the
+    // context reading moves every tick and is what the eye goes to, so it
+    // leads, and the name — which changes once a session — follows it. The
+    // merge costs the box the bar's 30 columns, and that is the whole width
+    // difference against the two-row form; nothing clips, because `assemble`
+    // sizes the box to its widest row.
+    let mut model_row = ctx_row;
+    model_row += &format!("{sep}{MAGENTA}{model_short}{RESET}");
     model_row += &effort_segment(&sep, &effort);
     model_row += &format!("{sep}{status_part}");
+    // Both sides of the segment get the same scrub. The newer version is the
+    // one that needs it: it comes from a file this tool neither writes nor
+    // owns, whose contents another program fetches over the network, where
+    // the running version comes from the payload. `update::latest_in` already
+    // truncates it to dotted digits; this is the sink keeping its own
+    // guarantee rather than betting the producer stays strict. The bound
+    // matches the subagent effort field's, and stops an overlong value from
+    // stretching the box to its width.
+    let newer = inputs
+        .newer_version
+        .map(|v| sanitize_display(v).chars().take(16).collect::<String>());
+    model_row += &version_segment(&sep, &sanitize_display(p.cli_version()), newer.as_deref());
 
     // --- tokens -----------------------------------------------------------
     // Totals come from this tick's scan; only the deltas come from the stored
@@ -788,11 +857,6 @@ pub fn render(inputs: &Inputs) -> String {
             section: 1,
             label: "model",
             content: model_row,
-        },
-        BoxRow {
-            section: 1,
-            label: "context",
-            content: ctx_row,
         },
         BoxRow {
             section: 1,

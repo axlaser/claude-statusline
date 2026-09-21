@@ -24,6 +24,7 @@ use claude_statusline::settings;
 use claude_statusline::state::{self, WriteOutcome};
 use claude_statusline::subagent::{self, Row, Windows};
 use claude_statusline::transcript::{self, Scan, TokenRecord};
+use claude_statusline::update;
 
 // ---------------------------------------------------------------------------
 // Harness
@@ -6364,6 +6365,336 @@ fn model_ids_prettify_without_losing_the_variant_marker_tier() {
     }
 }
 
+/// The model row's content, ANSI stripped and unframed. Three of this row's
+/// behaviours are only observable together — the merged bar, the shortened
+/// name and the version segment all share it — and no pinned payload carries a
+/// `version`, so the case table cannot cover the last of them.
+fn model_row_of(model: &str, newer: Option<&str>) -> String {
+    let raw = format!(
+        r#"{{"session_id":"render-test","workspace":{{"current_dir":"/var/repo/work"}},{model},
+            "context_window":{{"context_window_size":1000000,"used_percentage":37.4,
+                               "total_input_tokens":374000}}}}"#
+    );
+    let payload = Payload::parse(&raw).expect("the payload should parse");
+    let out = render::render(&render::Inputs {
+        payload: &payload,
+        home: None,
+        git: None,
+        scan: None,
+        record: None,
+        subagents: &[],
+        now: 1_767_225_600,
+        newer_version: newer,
+    });
+    let plain = strip_ansi(&out);
+    let line = plain
+        .lines()
+        .find(|l| l.contains("model  "))
+        .unwrap_or_default();
+    line.split('│')
+        .nth(1)
+        .unwrap_or_default()
+        .trim_end_matches('┃')
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn a_display_names_trailing_parenthetical_is_dropped_whatever_it_says() {
+    let cases: [(&str, &str); 6] = [
+        ("Opus 5 (1M context)", "Opus 5"),
+        // The rule is the shape, not the words: a model that has not shipped
+        // shortens on the same one, which is the whole reason this is not a
+        // table of known variants.
+        ("Sonnet 6 (2M context)", "Sonnet 6"),
+        ("Claude Opus 5 (1M context)", "Opus 5"),
+        ("Opus 5", "Opus 5"),
+        // Only a parenthetical: kept, because the alternative is a model row
+        // with no model in it.
+        ("(1M context)", "(1M context)"),
+        // The last one, not the first: the rest of the name is still a name.
+        ("Opus 5 (a) (b)", "Opus 5 (a)"),
+    ];
+    for (display, expected) in cases {
+        let row = model_row_of(
+            &format!(r#""model":{{"display_name":"{display}","id":"claude-opus-5"}}"#),
+            None,
+        );
+        assert!(
+            row.contains(&format!("· {expected} ·")),
+            "[{display}] rendered {row:?}"
+        );
+    }
+}
+
+#[test]
+fn the_model_row_opens_on_the_bar_and_closes_on_the_version() {
+    let model = r#""model":{"display_name":"Opus 5 (1M context)","id":"claude-opus-5[1m]"},"version":"2.1.278""#;
+
+    let current = model_row_of(model, None);
+    assert!(
+        current.starts_with('█'),
+        "the bar leads the row: {current:?}"
+    );
+    assert!(
+        current.contains("37% · 374.0K/1M · Opus 5 ·"),
+        "the merged row carries the context reading before the name: {current:?}"
+    );
+    assert!(
+        current.ends_with("· v2.1.278"),
+        "an up-to-date session shows the version alone: {current:?}"
+    );
+
+    let stale = model_row_of(model, Some("2.1.290"));
+    assert!(
+        stale.ends_with("· v2.1.278 ↑2.1.290"),
+        "a newer version is named, not just flagged: {stale:?}"
+    );
+
+    // A Claude Code old enough not to send `version` renders no segment at
+    // all, rather than a `v` with nothing after it.
+    let absent = model_row_of(
+        r#""model":{"display_name":"Opus 5","id":"claude-opus-5"}"#,
+        Some("2.1.290"),
+    );
+    assert!(
+        absent.ends_with("ready") && !absent.contains('v'),
+        "no version in the payload means no segment: {absent:?}"
+    );
+}
+
+#[test]
+fn the_changelogs_first_release_heading_is_the_version_read() {
+    // An `## Unreleased` section above the releases is skipped rather than
+    // ending the search: the heading is matched on being a number.
+    let text = "# Changelog\n\n## Unreleased\n\n- wip\n\n## 2.1.290\n\n- thing\n\n## 2.1.278\n";
+    assert_eq!(update::latest_in(text), Some("2.1.290"));
+    assert_eq!(update::latest_in("## 2.2.0 (2026-10-01)\n"), Some("2.2.0"));
+    assert_eq!(update::latest_in("# Changelog\n\nno headings\n"), None);
+    assert_eq!(update::latest_in(""), None);
+}
+
+#[test]
+fn version_comparison_orders_components_numerically_not_lexically() {
+    let cases: [(&str, &str, bool); 8] = [
+        ("2.1.290", "2.1.278", true),
+        // The lexical trap, and the reason this is not a string compare.
+        ("2.1.10", "2.1.9", true),
+        ("2.1.278", "2.1.278", false),
+        ("2.1.277", "2.1.278", false),
+        ("2.2", "2.1.278", true),
+        ("2.2.0", "2.2", false),
+        // A prerelease must not read as newer than the release it precedes.
+        ("2.2.0-rc.1", "2.2.0", false),
+        ("3.0.0", "2.99.99", true),
+    ];
+    for (candidate, running, expected) in cases {
+        assert_eq!(
+            update::is_newer(candidate, running),
+            expected,
+            "[{candidate} vs {running}]"
+        );
+    }
+}
+
+#[test]
+fn an_update_is_reported_only_when_the_cached_changelog_leads_this_session() {
+    let dir = scratch_dir("update-available");
+    let changelog = dir.join("changelog.md");
+    std::fs::write(&changelog, "# Changelog\n\n## 2.1.290\n\n- thing\n")
+        .expect("failed to stage the changelog");
+
+    assert_eq!(
+        update::available(Some(&changelog), "2.1.278").as_deref(),
+        Some("2.1.290")
+    );
+    assert_eq!(update::available(Some(&changelog), "2.1.290"), None);
+    // A session ahead of the cache is the normal shape right after an update,
+    // and it must read as quiet, not as a downgrade to advertise.
+    assert_eq!(update::available(Some(&changelog), "2.2.0"), None);
+    // No version in the payload: nothing to compare against, so nothing is
+    // read.
+    assert_eq!(update::available(Some(&changelog), ""), None);
+    // No cache, and no home to hang one off.
+    assert_eq!(
+        update::available(Some(&dir.join("absent.md")), "2.1.278"),
+        None
+    );
+    assert_eq!(update::available(None, "2.1.278"), None);
+
+    // A running version that is not numeric-leading reads as nothing to
+    // compare against, not as version zero. Without the guard `numeric_core`
+    // normalises it away and every heading beats it, so a `v`-prefixed build
+    // advertises an update to the version it is already running -- the exact
+    // inversion of the module's under-report promise.
+    for running in ["v2.1.290", "v2.1.278", "unknown", "dev", " 2.1.278"] {
+        assert_eq!(
+            update::available(Some(&changelog), running),
+            None,
+            "[{running}] must report nothing rather than invent an update"
+        );
+    }
+
+    // The read is bounded. A heading pushed past the bound is not found, which
+    // under-reports — the safe direction — instead of making a ~700 KB file
+    // the largest read on the tick.
+    let far = dir.join("far.md");
+    std::fs::write(
+        &far,
+        format!("# Changelog\n\n{}\n\n## 2.1.290\n", "x".repeat(8192)),
+    )
+    .expect("failed to stage the long changelog");
+    assert_eq!(update::available(Some(&far), "2.1.278"), None);
+}
+
+/// The producer's half of the escape-injection guard.
+///
+/// The heading token is only whitespace-delimited, and ESC is not Unicode
+/// whitespace, so without the truncation the whole token -- escape sequence
+/// and all -- would be handed to the render sink to print.
+#[test]
+fn a_hostile_changelog_heading_yields_only_its_dotted_digits() {
+    let dir = scratch_dir("update-hostile-heading");
+    let changelog = dir.join("changelog.md");
+    std::fs::write(&changelog, "# Changelog\n\n## 9\u{1b}[2J\u{1b}[1;1Hpwned\n")
+        .expect("failed to stage the hostile changelog");
+
+    assert_eq!(
+        update::available(Some(&changelog), "2.1.278").as_deref(),
+        Some("9"),
+        "the token must be cut at the first character that is not a dotted digit"
+    );
+    assert_eq!(
+        update::latest_in("## 9\u{1b}[2Jx\n").map(str::to_string),
+        Some("9".to_string())
+    );
+}
+
+/// The sink's half of the same guard, and the box-width invariant behind it.
+///
+/// `strip_sgr` only consumes `ESC [ ... m`, so an escape of any other shape
+/// would be counted as visible columns and the padding would desynchronise.
+/// Asserting the width invariant is what makes this a test of the box rather
+/// than of the scrub alone.
+#[test]
+fn a_hostile_newer_version_cannot_escape_the_row_or_skew_the_box() {
+    let payload = Payload::parse(
+        r#"{"session_id":"hostile-version","workspace":{"current_dir":"/var/repo/work"},
+            "model":{"display_name":"Opus 5","id":"claude-opus-5"},"version":"2.1.278",
+            "context_window":{"context_window_size":200000,"used_percentage":42.4}}"#,
+    )
+    .expect("the payload should parse");
+
+    let out = render::render(&render::Inputs {
+        payload: &payload,
+        home: None,
+        git: None,
+        scan: None,
+        record: None,
+        subagents: &[],
+        now: 1_767_225_600,
+        // What the producer would have to let through for this to matter.
+        // The sink keeps its own guarantee regardless.
+        newer_version: Some("2.1.290\u{1b}[2J\u{7f}|xxxxxxxxxxxxxxxxxxxx"),
+    });
+
+    assert!(
+        !out.contains("\u{1b}[2J"),
+        "a non-SGR escape reached the rendered row: {out:?}"
+    );
+    assert!(!out.contains('\u{7f}'), "DEL survived the scrub: {out:?}");
+    assert!(
+        !out.contains('|'),
+        "the forgeable column separator survived the scrub: {out:?}"
+    );
+    let widths: Vec<usize> = out.lines().map(render::visible_width).collect();
+    assert!(
+        widths.iter().all(|w| *w == widths[0]),
+        "the hostile value skewed the box: widths {widths:?}\n{out}"
+    );
+}
+
+/// The wiring, not the pieces: `Roots::changelog_path` is private and reachable
+/// only through `run`, so nothing else in the suite proves the join names the
+/// directory Claude Code actually writes. A wrong join degrades to the same
+/// quiet row as "nothing to report", which is exactly the failure shape
+/// `docs/solutions/best-practices/byte-diff-cannot-see-cache-hit-regressions.md`
+/// says byte comparison cannot see.
+#[test]
+fn the_version_segment_resolves_its_changelog_through_the_real_roots() {
+    let root = scratch_dir("version-wiring");
+    let home = root.join("home");
+    let temp = root.join("tmp");
+    let cache = home.join(".claude").join("cache");
+    std::fs::create_dir_all(&cache).expect("failed to create the cache directory");
+    std::fs::create_dir_all(&temp).expect("failed to create the temp root");
+    std::fs::write(
+        cache.join("changelog.md"),
+        "# Changelog\n\n## 2.1.290\n\n- thing\n",
+    )
+    .expect("failed to stage the changelog");
+
+    let payload = r#"{"session_id":"version-wiring","workspace":{"current_dir":"/a/b/c"},
+         "model":{"display_name":"Opus 5 (1M context)","id":"claude-opus-5[1m]"},
+         "version":"2.1.278"}"#;
+    let roots = cmd_statusline::Roots {
+        home: Some(home.clone()),
+        temp: claude_statusline::session::StateRoot::inherited(temp.clone()),
+    };
+    let clock = TestClock::at(1_767_225_600);
+
+    let rendered = strip_ansi(&cmd_statusline::run(&clock, &roots, payload));
+    assert!(
+        rendered.contains("v2.1.278 \u{2191}2.1.290"),
+        "the real changelog join must reach the staged cache: {rendered}"
+    );
+    // The name rule rides the same row and reaches the box only through this
+    // path, so it is asserted where it actually renders.
+    assert!(
+        rendered.contains("\u{b7} Opus 5 \u{b7}"),
+        "the display name should have lost its parenthetical: {rendered}"
+    );
+
+    // The quiet case has to be distinguishable from broken wiring, which is
+    // the whole reason this runs through `run` rather than calling
+    // `update::available` directly.
+    std::fs::write(cache.join("changelog.md"), "# Changelog\n\n## 2.1.278\n")
+        .expect("failed to restage the changelog");
+    let quiet = strip_ansi(&cmd_statusline::run(&clock, &roots, payload));
+    assert!(
+        quiet.contains("v2.1.278") && !quiet.contains("2.1.290"),
+        "an up-to-date session shows the version alone: {quiet}"
+    );
+}
+
+/// Every other guarded read in this crate has a case like this one. Without it
+/// a dropped or inverted guard here would be invisible: a refused changelog and
+/// an absent one render the same quiet row.
+#[test]
+fn a_hostile_changelog_target_is_refused_not_followed() {
+    let dir = scratch_dir("update-hostile-target");
+    let victim = dir.join("victim.md");
+    let link = dir.join("changelog.md");
+    std::fs::write(&victim, "# Changelog\n\n## 9.9.9\n").expect("failed to stage the victim");
+
+    if !make_symlink(&victim, &link) {
+        skipped_for_want_of_symlinks();
+        return;
+    }
+
+    assert_eq!(
+        update::available(Some(&link), "2.1.278"),
+        None,
+        "the changelog read followed a symlink"
+    );
+    // The same bytes at a path that is not hostile are reported, so the
+    // assertion above is the guard refusing rather than the parse failing.
+    assert_eq!(
+        update::available(Some(&victim), "2.1.278").as_deref(),
+        Some("9.9.9")
+    );
+}
+
 #[test]
 fn the_bar_fills_from_a_clamped_rounded_percentage() {
     let filled = |pct| {
@@ -6817,6 +7148,7 @@ fn the_box_pads_every_row_to_one_width() {
         record: None,
         subagents: &rows,
         now: 1_767_225_600,
+        newer_version: None,
     });
 
     let widths: Vec<usize> = out.lines().map(render::visible_width).collect();
@@ -7220,8 +7552,12 @@ fn the_self_check_renders_the_box_rather_than_echoing_a_literal() {
     assert_eq!(run.code, Some(0));
 
     let plain = strip_ansi(&run.stdout);
+    // Seven, not the eight this asserted before the context row merged into
+    // the model row: two frame lines, three rows and the two dividers between
+    // them. The count is a proxy for "a box, not a stub" — the frame
+    // characters and the path below carry the rest of that claim.
     assert!(
-        plain.lines().count() >= 8 && plain.contains('┏') && plain.contains('┛'),
+        plain.lines().count() >= 7 && plain.contains('┏') && plain.contains('┛'),
         "self-check output is not a rendered box: {plain:?}"
     );
     assert!(

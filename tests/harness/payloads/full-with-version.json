@@ -1,0 +1,42 @@
+{
+  "session_id": "fixture-session-0001",
+  "version": "2.1.270",
+  "cwd": "{REPO}",
+  "workspace": {
+    "current_dir": "{REPO}"
+  },
+  "model": {
+    "display_name": "Opus 5",
+    "id": "claude-opus-5"
+  },
+  "context_window": {
+    "context_window_size": 200000,
+    "used_percentage": 42.5,
+    "total_input_tokens": 85000,
+    "current_usage": {
+      "input_tokens": 84000,
+      "output_tokens": 1000
+    }
+  },
+  "effort": {
+    "level": "high"
+  },
+  "cost": {
+    "total_cost_usd": 1.2345,
+    "total_duration_ms": 654321
+  },
+  "transcript_path": "{HOME}/.claude/projects/fixtures/transcript.jsonl",
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 31,
+      "resets_at": "2026-01-01T05:00:00Z"
+    },
+    "seven_day": {
+      "used_percentage": 12,
+      "resets_at": "2026-01-05T00:00:00Z"
+    }
+  },
+  "agent": {
+    "name": "main"
+  }
+}

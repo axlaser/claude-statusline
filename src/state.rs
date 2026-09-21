@@ -83,6 +83,27 @@ pub fn read_trusted(path: &Path) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
+/// The same read, bounded to `limit` bytes.
+///
+/// Exists for a file this tool neither writes nor owns: Claude Code's cached
+/// changelog is ~700 KB and the only thing read from it is a version number on
+/// line 3. It goes through the guard with its siblings rather than opening the
+/// path directly, because "one module owns every guard" is what keeps two of
+/// them from failing in opposite directions.
+pub fn read_trusted_prefix(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if is_hostile(path) {
+        return None;
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(limit)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(buf)
+}
+
 /// Removes a hostile path and re-evaluates the guard; `false` means nothing
 /// may be written to it. The re-check is load-bearing: on a sticky directory
 /// the unlink fails silently, and a remove-then-write without it would write

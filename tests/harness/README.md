@@ -15,6 +15,7 @@ capture.sh      macOS and Linux driver (bash 4+, jq, git)
 capture.ps1     Windows driver (PowerShell 5.1+, git) — its functional twin
 measure.sh      macOS and Linux paired measurement (bash 5+, jq, git)
 measure.ps1     Windows paired measurement — its functional twin
+measure-pair.ps1  Windows binary-vs-binary measurement (two builds of this crate)
 cases.json      the case table: what to capture, with what inputs
 states.json     the docs/performance.md §4 git-state matrix, as data
 payloads/       pinned stdin payloads
@@ -26,6 +27,25 @@ shims/          recording stand-ins for the helpers a component invokes
 Both drivers read the same `cases.json` and `states.json`. A case is defined
 once and captured on all three platforms — the duplication this migration exists
 to delete does not get to reappear in the harness.
+
+`measure.sh` / `measure.ps1` pair a **runtime script against the binary that
+replaced it**, which is what the migration had to prove. They cannot answer
+"did this commit make the binary slower", and they cannot run at all now that
+the script trees are deleted. `measure-pair.ps1` is the tool for that second
+question: **two builds of this crate**, interleaved on one host, under the same
+docs/performance.md §3 rules. It takes the payload
+`payloads/full-with-version.json` — `full.json` plus the top-level `version`
+field, which is what gates the changelog read — and refuses to report a number
+until it has seen the after-binary actually render the version segment. Without
+that field the read never happens and the pair would time the same code twice.
+
+```powershell
+.\tests\harness\measure-pair.ps1 -Before <old>\claude-statusline.exe -After .\target\release\claude-statusline.exe
+```
+
+There is no `measure-pair.sh` yet: the one change that needed it was measured on
+Windows. Port it when a hot-path change needs a Unix pair, rather than carrying
+an untested twin.
 
 ## Running it
 
