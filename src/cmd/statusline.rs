@@ -111,7 +111,7 @@ pub fn run(clock: &dyn Clock, roots: &Roots, raw: &str) -> String {
         record: record.as_ref(),
         subagents: &subagents,
         now: clock.now_unix(),
-        newer_version: newer.as_deref(),
+        update_available: newer.is_some(),
     });
 
     fire_alerts(roots, &payload, &session_id, &output);

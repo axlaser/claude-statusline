@@ -95,6 +95,6 @@ fn render_self_check() -> String {
         record: None,
         subagents: &[],
         now: SELF_CHECK_CLOCK,
-        newer_version: None,
+        update_available: false,
     })
 }

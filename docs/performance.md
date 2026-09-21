@@ -251,8 +251,8 @@ observed fresh/stale outcome, not only the rendered bytes — see
   the context bar, its percentage and `used/window` now **lead** the row, ahead of the
   model name, and the separate `context` row is gone; a display name's trailing
   parenthetical is dropped, so `Opus 5 (1M context)` renders `Opus 5`; and the row ends
-  with the running Claude Code version, `v2.1.278`, yellow and naming the newer one
-  (`v2.1.278 ↑2.1.290`) when there is one. The parenthetical is stripped by shape rather
+  with the running Claude Code version, `v2.1.278`, yellow and flagging a newer one
+  (`v2.1.278 ↑`) when there is one. The parenthetical is stripped by shape rather
   than against a list of known variants, so a model that has not shipped shortens on the
   same rule — and nothing is lost, because the window label two segments to its left reads
   the window the payload reports rather than a name that claims one. The box widens by the

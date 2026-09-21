@@ -252,25 +252,31 @@ fn effort_segment(sep: &str, effort: &str) -> String {
 ///
 /// Grey when the running version is the newest one on disk: a number the user
 /// cannot act on is a label, not an alert, and the row already carries three
-/// colours that mean something. Yellow with the newer version when there is
-/// one, which is the only state worth an eye-stop. Absent entirely on a Claude
-/// Code old enough not to send `version`.
-fn version_segment(sep: &str, version: &str, newer: Option<&str>) -> String {
+/// colours that mean something. Yellow with a bare `↑` when a newer one
+/// exists, which is the only state worth an eye-stop. Absent entirely on a
+/// Claude Code old enough not to send `version`.
+///
+/// **The newer version is flagged, not named.** Naming it spent eight more
+/// columns on the busiest row to answer a question the arrow already answers —
+/// there is an update — with a number the user cannot do anything with in
+/// place. What to do about it is one click away, on the link the segment
+/// already carries in both states.
+///
+/// It also means the changelog's contents never reach the row: `newer` is a
+/// `bool`, so the untrusted string stops at the module boundary rather than
+/// being scrubbed on its way through. That is why there is no sanitiser here.
+fn version_segment(sep: &str, version: &str, newer: bool) -> String {
     if version.is_empty() {
         return String::new();
     }
     // Linked in both states, but it earns the click only in the yellow one:
     // "what changed" is the question a newer version raises.
-    match newer {
-        Some(latest) => format!(
-            "{sep}{YELLOW}{}{RESET}",
-            hyperlink(CHANGELOG_URL, &format!("v{version} ↑{latest}"))
-        ),
-        None => format!(
-            "{sep}{GRAY}{}{RESET}",
-            hyperlink(CHANGELOG_URL, &format!("v{version}"))
-        ),
-    }
+    let (colour, text) = if newer {
+        (YELLOW, format!("v{version} ↑"))
+    } else {
+        (GRAY, format!("v{version}"))
+    };
+    format!("{sep}{colour}{}{RESET}", hyperlink(CHANGELOG_URL, &text))
 }
 
 /// Unknown values, including the integer form agent frontmatter allows, fall
@@ -732,10 +738,16 @@ pub struct Inputs<'a> {
     pub record: Option<&'a TokenRecord>,
     pub subagents: &'a [Row],
     pub now: i64,
-    /// A Claude Code newer than the one running, when the changelog cache
-    /// names one. Resolved by the caller, because this module does not read
-    /// files -- see [`crate::update`] for what the answer is worth.
-    pub newer_version: Option<&'a str>,
+    /// Whether a Claude Code newer than the one running exists, as far as the
+    /// changelog cache on disk knows.
+    ///
+    /// A `bool` and not the version: the row flags the update rather than
+    /// naming it, so the string — which comes from a file this tool neither
+    /// writes nor owns, fetched over the network by another program — has no
+    /// reason to enter the renderer at all. Rendering it again would mean
+    /// restoring a sanitiser at the sink; `update::available` still returns it
+    /// for anyone who needs the number itself.
+    pub update_available: bool,
 }
 
 /// The whole status line, with no trailing newline.
@@ -825,18 +837,14 @@ pub fn render(inputs: &Inputs) -> String {
     model_row += &format!("{sep}{MAGENTA}{model_short}{RESET}");
     model_row += &effort_segment(&sep, &effort);
     model_row += &format!("{sep}{status_part}");
-    // Both sides of the segment get the same scrub. The newer version is the
-    // one that needs it: it comes from a file this tool neither writes nor
-    // owns, whose contents another program fetches over the network, where
-    // the running version comes from the payload. `update::latest_in` already
-    // truncates it to dotted digits; this is the sink keeping its own
-    // guarantee rather than betting the producer stays strict. The bound
-    // matches the subagent effort field's, and stops an overlong value from
-    // stretching the box to its width.
-    let newer = inputs
-        .newer_version
-        .map(|v| sanitize_display(v).chars().take(16).collect::<String>());
-    model_row += &version_segment(&sep, &sanitize_display(p.cli_version()), newer.as_deref());
+    // The running version still gets the scrub: it comes from the payload.
+    // The newer one no longer needs one, because it no longer arrives — see
+    // `version_segment`.
+    model_row += &version_segment(
+        &sep,
+        &sanitize_display(p.cli_version()),
+        inputs.update_available,
+    );
 
     // --- tokens -----------------------------------------------------------
     // Totals come from this tick's scan; only the deltas come from the stored

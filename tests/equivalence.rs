@@ -6555,7 +6555,7 @@ fn a_repo_remote_makes_the_path_a_link_without_costing_columns() {
         record: None,
         subagents: &[],
         now: 1_767_225_600,
-        newer_version: None,
+        update_available: false,
     };
     let out = render::render(&inputs);
 
@@ -8502,7 +8502,7 @@ fn model_ids_prettify_without_losing_the_variant_marker_tier() {
 /// behaviours are only observable together — the merged bar, the shortened
 /// name and the version segment all share it — and no pinned payload carries a
 /// `version`, so the case table cannot cover the last of them.
-fn model_row_of(model: &str, newer: Option<&str>) -> String {
+fn model_row_of(model: &str, newer: bool) -> String {
     let raw = format!(
         r#"{{"session_id":"render-test","workspace":{{"current_dir":"/var/repo/work"}},{model},
             "context_window":{{"context_window_size":1000000,"used_percentage":37.4,
@@ -8517,7 +8517,7 @@ fn model_row_of(model: &str, newer: Option<&str>) -> String {
         record: None,
         subagents: &[],
         now: 1_767_225_600,
-        newer_version: newer,
+        update_available: newer,
     });
     let plain = strip_ansi(&out);
     let line = plain
@@ -8551,7 +8551,7 @@ fn a_display_names_trailing_parenthetical_is_dropped_whatever_it_says() {
     for (display, expected) in cases {
         let row = model_row_of(
             &format!(r#""model":{{"display_name":"{display}","id":"claude-opus-5"}}"#),
-            None,
+            false,
         );
         assert!(
             row.contains(&format!("· {expected} ·")),
@@ -8564,7 +8564,7 @@ fn a_display_names_trailing_parenthetical_is_dropped_whatever_it_says() {
 fn the_model_row_opens_on_the_bar_and_closes_on_the_version() {
     let model = r#""model":{"display_name":"Opus 5 (1M context)","id":"claude-opus-5[1m]"},"version":"2.1.278""#;
 
-    let current = model_row_of(model, None);
+    let current = model_row_of(model, false);
     assert!(
         current.starts_with('█'),
         "the bar leads the row: {current:?}"
@@ -8578,17 +8578,21 @@ fn the_model_row_opens_on_the_bar_and_closes_on_the_version() {
         "an up-to-date session shows the version alone: {current:?}"
     );
 
-    let stale = model_row_of(model, Some("2.1.290"));
+    let stale = model_row_of(model, true);
     assert!(
-        stale.ends_with("· v2.1.278 ↑2.1.290"),
-        "a newer version is named, not just flagged: {stale:?}"
+        stale.ends_with("· v2.1.278 ↑"),
+        "a newer version is flagged, not named: the arrow says there is one and          the link says what changed, without spending columns on a number the          user cannot act on in place: {stale:?}"
+    );
+    assert!(
+        !stale.contains("2.1.290"),
+        "the newer version must not reach the row at all: {stale:?}"
     );
 
     // A Claude Code old enough not to send `version` renders no segment at
     // all, rather than a `v` with nothing after it.
     let absent = model_row_of(
         r#""model":{"display_name":"Opus 5","id":"claude-opus-5"}"#,
-        Some("2.1.290"),
+        true,
     );
     assert!(
         absent.ends_with("ready") && !absent.contains('v'),
@@ -8705,23 +8709,34 @@ fn a_hostile_changelog_heading_yields_only_its_dotted_digits() {
 
 /// The sink's half of the same guard, and the box-width invariant behind it.
 ///
-/// `strip_escapes` consumes only the two shapes this tool emits, so an escape
-/// of any other shape would be counted as visible columns and the padding would
-/// desynchronise. Asserting the width invariant is what makes this a test of the
-/// box rather than of the scrub alone.
+/// The *newer* version no longer has a sink half: the row flags the update
+/// rather than naming it, so `Inputs` carries a `bool` and the changelog's
+/// contents cannot reach the renderer to be scrubbed in the first place. That
+/// is a stronger guarantee than the scrub it replaced, and the type asserts it
+/// rather than this test.
 ///
-/// This payload carries a `version` and a newer one, so the row it renders also
-/// carries a real OSC 8 hyperlink. The width assertion therefore pins both
-/// halves at once: the scrub still rejects a payload-derived escape, and a
-/// renderer-emitted one still costs nothing.
+/// What still needs a sink guard is the *running* version, which comes from the
+/// payload and is rendered verbatim. `strip_escapes` consumes only the two
+/// shapes this tool emits, so an escape of any other shape would be counted as
+/// visible columns and the padding would desynchronise. Asserting the width
+/// invariant is what makes this a test of the box rather than of the scrub
+/// alone.
+///
+/// This row also carries a real OSC 8 hyperlink, because the update flag is
+/// set. The width assertion therefore pins both halves at once: the scrub still
+/// rejects a payload-derived escape, and a renderer-emitted one still costs no
+/// columns.
 #[test]
-fn a_hostile_newer_version_cannot_escape_the_row_or_skew_the_box() {
-    let payload = Payload::parse(
-        r#"{"session_id":"hostile-version","workspace":{"current_dir":"/var/repo/work"},
-            "model":{"display_name":"Opus 5","id":"claude-opus-5"},"version":"2.1.278",
-            "context_window":{"context_window_size":200000,"used_percentage":42.4}}"#,
-    )
-    .expect("the payload should parse");
+fn a_hostile_running_version_cannot_escape_the_row_or_skew_the_box() {
+    let hostile = "2.1.278\u{1b}[2J\u{7f}|xxxxxxxxxxxxxxxxxxxx";
+    let raw = format!(
+        r#"{{"session_id":"hostile-version","workspace":{{"current_dir":"/var/repo/work"}},
+            "model":{{"display_name":"Opus 5","id":"claude-opus-5"}},
+            "version":{},
+            "context_window":{{"context_window_size":200000,"used_percentage":42.4}}}}"#,
+        serde_json::Value::String(hostile.to_string())
+    );
+    let payload = Payload::parse(&raw).expect("the payload should parse");
 
     let out = render::render(&render::Inputs {
         payload: &payload,
@@ -8731,9 +8746,7 @@ fn a_hostile_newer_version_cannot_escape_the_row_or_skew_the_box() {
         record: None,
         subagents: &[],
         now: 1_767_225_600,
-        // What the producer would have to let through for this to matter.
-        // The sink keeps its own guarantee regardless.
-        newer_version: Some("2.1.290\u{1b}[2J\u{7f}|xxxxxxxxxxxxxxxxxxxx"),
+        update_available: true,
     });
 
     assert!(
@@ -8749,6 +8762,11 @@ fn a_hostile_newer_version_cannot_escape_the_row_or_skew_the_box() {
     assert!(
         widths.iter().all(|w| *w == widths[0]),
         "the hostile value skewed the box: widths {widths:?}\n{out}"
+    );
+    assert!(
+        strip_ansi(&out).contains('\u{2191}'),
+        "the update flag must actually render, or the hyperlink half of this \
+         test is asserting nothing: {out:?}"
     );
 }
 
@@ -8783,7 +8801,7 @@ fn the_version_segment_resolves_its_changelog_through_the_real_roots() {
 
     let rendered = strip_ansi(&cmd_statusline::run(&clock, &roots, payload));
     assert!(
-        rendered.contains("v2.1.278 \u{2191}2.1.290"),
+        rendered.contains("v2.1.278 \u{2191}"),
         "the real changelog join must reach the staged cache: {rendered}"
     );
     // The name rule rides the same row and reaches the box only through this
@@ -8799,8 +8817,11 @@ fn the_version_segment_resolves_its_changelog_through_the_real_roots() {
     std::fs::write(cache.join("changelog.md"), "# Changelog\n\n## 2.1.278\n")
         .expect("failed to restage the changelog");
     let quiet = strip_ansi(&cmd_statusline::run(&clock, &roots, payload));
+    // Matched on the arrow beside *this* version, not a bare one: the git row
+    // spends the same character on commits ahead of upstream, and a payload
+    // that grew a repo would make a looser check pass for the wrong reason.
     assert!(
-        quiet.contains("v2.1.278") && !quiet.contains("2.1.290"),
+        quiet.contains("v2.1.278") && !quiet.contains("v2.1.278 \u{2191}"),
         "an up-to-date session shows the version alone: {quiet}"
     );
 }
@@ -9286,7 +9307,7 @@ fn the_box_pads_every_row_to_one_width() {
         record: None,
         subagents: &rows,
         now: 1_767_225_600,
-        newer_version: None,
+        update_available: false,
     });
 
     let widths: Vec<usize> = out.lines().map(render::visible_width).collect();
