@@ -3373,6 +3373,26 @@ fn every_url_the_readme_publishes_resolves_to_a_file() {
     failures.assert_empty("published README URLs");
 }
 
+/// A `bash` on this host that has `EPOCHREALTIME`, i.e. bash 5 or newer.
+///
+/// The same list the POSIX driver re-execs through, asked the same way — by
+/// behaviour rather than by parsing a version — so the test and the script
+/// agree on what "usable" means instead of drifting apart.
+fn usable_bash() -> Option<&'static str> {
+    const CANDIDATES: [&str; 4] = [
+        "bash",
+        "/opt/homebrew/bin/bash",
+        "/usr/local/bin/bash",
+        "/usr/bin/bash",
+    ];
+    CANDIDATES.into_iter().find(|candidate| {
+        std::process::Command::new(candidate)
+            .args(["-c", "[[ -n ${EPOCHREALTIME:-} ]]"])
+            .output()
+            .is_ok_and(|out| out.status.success())
+    })
+}
+
 /// The measurement drivers are exempt from the silent-degradation contract and
 /// must fail loudly — but nothing was checking that they still *ran*. Their
 /// predecessors paired against script trees deleted at `1f5acf2`, aborted on a
@@ -3383,6 +3403,15 @@ fn every_url_the_readme_publishes_resolves_to_a_file() {
 /// number: the scratch-path refusal, both cold-cache layouts, the proof-of-work
 /// guard against a stub binary that renders nothing, and the environment
 /// restore. It needs neither variant, so it costs one subprocess.
+///
+/// **macOS CI skips this, and that is the driver working.** The POSIX driver
+/// needs `EPOCHREALTIME`, so bash 5; macOS ships bash 3.2 as `/bin/bash` and
+/// the hosted runners carry no other unless a job installs one, which
+/// `measure.yml` does and `ci.yml` has no reason to. A host that cannot run the
+/// driver at all cannot assert anything about it, and saying so is better than
+/// failing a build over a missing interpreter. The guards themselves are
+/// covered on every push regardless: Linux runs this same script, Windows runs
+/// its twin.
 #[test]
 fn harness_measure_drivers_pass_their_own_self_test() {
     // One driver per host: the POSIX twin needs bash 5, the Windows one needs
@@ -3394,11 +3423,20 @@ fn harness_measure_drivers_pass_their_own_self_test() {
             "tests/harness/measure-pair.ps1",
         )
     } else {
-        ("bash", Vec::new(), "tests/harness/measure-pair.sh")
+        (
+            usable_bash().unwrap_or("bash"),
+            Vec::new(),
+            "tests/harness/measure-pair.sh",
+        )
     };
 
     let driver = repo_file(rel);
     assert!(driver.is_file(), "{rel} is missing");
+
+    if !cfg!(windows) && usable_bash().is_none() {
+        println!("skipped: no bash 5 on this host, so the POSIX driver cannot run at all");
+        return;
+    }
 
     let mut command = std::process::Command::new(program);
     command.args(&args).arg(&driver).arg(if cfg!(windows) {
