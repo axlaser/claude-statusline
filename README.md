@@ -177,7 +177,7 @@ Nothing here pipes a download into a shell — every step is one you can inspect
      "hooks": {
        "PostToolUse": [
          {
-           "matcher": "Edit|Write|MultiEdit|Bash|NotebookEdit",
+           "matcher": "Edit|Write|MultiEdit|NotebookEdit",
            "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline git-refresh", "async": true }]
          }
        ],
@@ -322,7 +322,7 @@ Nothing here pipes a download into a shell — every step is one you can inspect
      "hooks": {
        "PostToolUse": [
          {
-           "matcher": "Edit|Write|MultiEdit|Bash|NotebookEdit",
+           "matcher": "Edit|Write|MultiEdit|NotebookEdit",
            "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline git-refresh", "async": true }]
          }
        ],
@@ -472,7 +472,7 @@ Nothing here pipes a download into `iex` — every step is one you can inspect b
      "hooks": {
        "PostToolUse": [
          {
-           "matcher": "Edit|Write|MultiEdit|Bash|NotebookEdit",
+           "matcher": "Edit|Write|MultiEdit|NotebookEdit",
            "hooks": [{ "type": "command", "command": "\"C:/Users/YOUR_USERNAME/.claude/bin/claude-statusline.exe\" git-refresh", "async": true }]
          }
        ],

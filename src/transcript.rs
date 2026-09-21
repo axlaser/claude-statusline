@@ -37,7 +37,7 @@ pub struct Scan {
 /// 16-field `v2` record is an incompatible format, and a shared version number
 /// is how a stale record gets read as fresh. Bump this whenever the field list
 /// changes.
-pub const RECORD_VERSION: &str = "v4";
+pub const RECORD_VERSION: &str = "v5";
 
 /// The per-session token record, the only part of the scripts' transcript
 /// cache that survives the port. A render input, not a performance cache: the
@@ -64,13 +64,29 @@ pub struct TokenRecord {
     pub delta_cache_write: u64,
     pub delta_cache_read: u64,
     pub delta_out: u64,
+    /// Where the last scan stopped, always a record boundary. `Scan.consumed`
+    /// is documented as one and was previously discarded.
+    pub offset: u64,
+    /// FNV-1a over exactly [`HEAD_SPAN`] bytes from the start of the file.
+    pub head: u64,
+    /// FNV-1a over the transcript's path. A **digest**, never the path itself:
+    /// the record is one pipe-separated line whose parse rejects any wrong
+    /// field count, every other field is numeric or boolean, and nothing has
+    /// ever needed escaping — a path containing a pipe would split into too
+    /// many fields and make the record permanently unreadable, which renders
+    /// full totals as one combined delta on every tick rather than once.
+    pub path_digest: u64,
+    /// Consecutive resumes since the last full read. See [`MAX_RESUMES`].
+    pub resumes: u64,
+    /// Bytes appended since the last full read. See [`MAX_RESUMED_BYTES`].
+    pub grown: u64,
 }
 
 impl TokenRecord {
     /// Serializes to the scripts' pipe-separated shape, version first.
     pub fn to_line(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             RECORD_VERSION,
             self.mtime,
             self.size,
@@ -83,7 +99,12 @@ impl TokenRecord {
             self.delta_in,
             self.delta_cache_write,
             self.delta_cache_read,
-            self.delta_out
+            self.delta_out,
+            self.offset,
+            self.head,
+            self.path_digest,
+            self.resumes,
+            self.grown
         )
     }
 
@@ -95,7 +116,7 @@ impl TokenRecord {
     /// stronger form, since an over-long run fails instead of wrapping.
     pub fn parse(raw: &str) -> Option<Self> {
         let fields: Vec<&str> = raw.trim_end_matches(['\r', '\n']).split('|').collect();
-        if fields.len() != 13 || fields[0] != RECORD_VERSION {
+        if fields.len() != 18 || fields[0] != RECORD_VERSION {
             return None;
         }
         Some(Self {
@@ -117,7 +138,16 @@ impl TokenRecord {
             delta_cache_write: fields[10].parse().ok()?,
             delta_cache_read: fields[11].parse().ok()?,
             delta_out: fields[12].parse().ok()?,
+            offset: fields[13].parse().ok()?,
+            head: fields[14].parse().ok()?,
+            path_digest: fields[15].parse().ok()?,
+            resumes: fields[16].parse().ok()?,
+            grown: fields[17].parse().ok()?,
         })
+        // An offset past the size it was taken at is not a record this code
+        // could have written, so it is rejected whole rather than clamped: the
+        // gates below would each have to defend against it separately.
+        .filter(|r: &Self| r.offset <= r.size)
     }
 
     /// Combines a fresh scan with the previous record into what renders now.
@@ -131,7 +161,13 @@ impl TokenRecord {
     /// is `cmd::statusline`'s `(mtime, size)` decision. The second return value
     /// is whether the record needs storing, false when nothing changed, which
     /// keeps idle ticks off the disk.
-    pub fn fold(prev: Option<&TokenRecord>, scan: &Scan, mtime: i64, size: u64) -> (Self, bool) {
+    pub fn fold(
+        prev: Option<&TokenRecord>,
+        scan: &Scan,
+        mtime: i64,
+        size: u64,
+        resume: &Resume,
+    ) -> (Self, bool) {
         let unchanged = prev.is_some_and(|p| p.mtime == mtime && p.size == size);
         let (prev_in, prev_cw, prev_cr, prev_out) = match prev {
             Some(p) => (
@@ -167,10 +203,30 @@ impl TokenRecord {
                 Some(p) if unchanged => p.delta_out,
                 _ => scan.output_tokens.saturating_sub(prev_out),
             },
+            offset: resume.offset,
+            head: resume.head,
+            path_digest: resume.path_digest,
+            resumes: resume.resumes,
+            grown: resume.grown,
         };
         let write = prev != Some(&record);
         (record, write)
     }
+}
+
+/// The resume half of a record: where the last scan stopped, what the file
+/// looked like there, and how far the resume chain has run.
+///
+/// Passed into [`TokenRecord::fold`] rather than filled in afterwards, so the
+/// offset and the totals land in **one atomic record line**. Split across two
+/// writes, a torn pair double-counts.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Resume {
+    pub offset: u64,
+    pub head: u64,
+    pub path_digest: u64,
+    pub resumes: u64,
+    pub grown: u64,
 }
 
 /// Where this session's token record lives. `None` for a session id that
@@ -352,4 +408,195 @@ fn skip_ws(line: &[u8], mut p: usize) -> usize {
         p += 1;
     }
     p
+}
+
+/// How many bytes of the head the checksum covers. **Always exactly this
+/// many**, never `min(4096, size)`.
+///
+/// A checksum over `min(4096, size)` covers a different span as a young file
+/// grows past 4 KB, so a naive comparison mismatches on a pure append and
+/// rescans every tick until the file passes 4 KB — a silent hit-rate bug of the
+/// class byte-diffing cannot see. [`RESUME_FLOOR`] deletes that comparison
+/// instead of fixing it: below the floor the file is read whole anyway, so the
+/// span is never partial.
+pub const HEAD_SPAN: usize = 4096;
+
+/// Below this, always read the whole file.
+///
+/// The entire benefit of resuming under it is avoiding a full scan of a small
+/// file, which at ~6.8 ms/MB is 0.03 ms against a ~6.5 ms process floor. The
+/// floor buys the deletion of a whole bug class for nothing measurable.
+pub const RESUME_FLOOR: u64 = 64 * 1024;
+
+/// A full read is forced after this many consecutive resumes.
+///
+/// The entry gates reduce the probability of a poisoned offset but cannot bound
+/// its lifetime, and the boundary anchor is probabilistic — in JSONL roughly one
+/// byte per line is a newline. Every other degradation in this project
+/// self-heals on the next tick; once an offset is stored, a wrong one is reused
+/// by every later tick and the totals stay wrong with no signal and no absurd
+/// number to notice. This is what restores that property. On an 8 MB transcript
+/// it costs about 0.9 ms per tick amortised.
+pub const MAX_RESUMES: u64 = 64;
+
+/// A full read is also forced after this much growth since the last one, so a
+/// few very large appends cannot stretch the window the count bounds.
+pub const MAX_RESUMED_BYTES: u64 = 4 * 1024 * 1024;
+
+/// FNV-1a, 64-bit.
+///
+/// Hand-rolled, and no dependency: nothing in std is safe to persist —
+/// `DefaultHasher`'s algorithm is explicitly not stable across releases, so a
+/// stored value would silently change meaning on a toolchain upgrade, an
+/// unversioned format change `RECORD_VERSION` cannot catch. A hashing crate
+/// would also risk linking a Windows DLL, measured at ~1.8 ms per tick when not
+/// delay-loaded. FNV-1a is deterministic, byte-oriented and adequate for change
+/// detection, which is the whole job.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// What the head checksum and the boundary anchor say, read only once the
+/// cheap gates have passed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Probe {
+    /// FNV-1a over exactly [`HEAD_SPAN`] bytes from the start.
+    pub head: u64,
+    /// Whether the byte immediately before the stored offset is a newline.
+    pub anchor_is_newline: bool,
+}
+
+/// Why a tick read the whole transcript instead of resuming.
+///
+/// Every variant is a fall-through to a correct-but-slower recompute, never to
+/// a wrong answer. They are named because a silent regression to the slow path
+/// renders identically — the blind spot
+/// `docs/solutions/best-practices/byte-diff-cannot-see-cache-hit-regressions.md`
+/// exists to close — so the reason is an observable a test asserts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullReason {
+    /// No record, or one this version cannot read.
+    NoRecord,
+    /// The record describes a different transcript file.
+    PathChanged,
+    /// The record is stamped later than the file it describes.
+    RecordAheadOfFile,
+    /// The file did not strictly grow. **`<=`, not `<`**: a same-size rewrite
+    /// has an empty tail, so resuming would re-display stale totals *and*
+    /// rewrite the record with the new mtime, after which the cheap skip hits
+    /// forever. Today that state self-heals through a full rescan, and this is
+    /// what stops the change converting a self-healing case into a permanent
+    /// one.
+    NotGrown,
+    /// The stored offset is past the end of the file.
+    OffsetPastEnd,
+    /// Smaller than [`RESUME_FLOOR`].
+    BelowFloor,
+    /// The ceiling fired: [`MAX_RESUMES`] or [`MAX_RESUMED_BYTES`].
+    CeilingReached,
+    /// The first [`HEAD_SPAN`] bytes are not the ones the record was taken
+    /// over, so the file was rewritten rather than appended to.
+    HeadChanged,
+    /// The byte before the offset is not a newline. A head checksum cannot see
+    /// a rewrite that preserves the first 4 KB and changes the middle, and
+    /// unlike today's divergence that error never self-heals, because every
+    /// later tick resumes from the poisoned record.
+    AnchorMoved,
+}
+
+impl FullReason {
+    /// A short tag for the debug line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoRecord => "no record",
+            Self::PathChanged => "transcript path changed",
+            Self::RecordAheadOfFile => "record newer than the file",
+            Self::NotGrown => "file did not grow",
+            Self::OffsetPastEnd => "offset past the end",
+            Self::BelowFloor => "below the resume floor",
+            Self::CeilingReached => "resume ceiling reached",
+            Self::HeadChanged => "head checksum changed",
+            Self::AnchorMoved => "boundary anchor moved",
+        }
+    }
+}
+
+/// What this tick should do with the transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// Nothing moved. Everything the rows render is already in the record.
+    Skip,
+    /// Scan the bytes from `from` onwards and add them to the stored totals.
+    Resume { from: u64 },
+    /// Scan the whole file from zero.
+    Full(FullReason),
+}
+
+/// Decides what to do, as a pure function over the record and the file's
+/// identity, with the two content checks supplied lazily by `probe`.
+///
+/// Three tiers, tested in order: the `(mtime, size)` skip that has always been
+/// here, then the resume, then the full read. Every gate that fails falls
+/// through to the full read rather than to a wrong answer, and the reason comes
+/// back with it. `probe` is a closure so the two reads it needs — 4 KB from the
+/// head and one byte before the offset — happen only once the cheap gates have
+/// passed, and so the whole state table is testable with no filesystem at all.
+pub fn decide(
+    record: Option<&TokenRecord>,
+    path_digest: u64,
+    mtime: i64,
+    size: u64,
+    probe: impl FnOnce() -> Option<Probe>,
+) -> Decision {
+    let Some(record) = record else {
+        return Decision::Full(FullReason::NoRecord);
+    };
+
+    // Tier one, unchanged: everything the tokens and model rows render is in
+    // the record already, so the file is not opened at all.
+    if record.mtime == mtime && record.size == size {
+        return Decision::Skip;
+    }
+
+    // The record is keyed on the path as well as the session id: the record
+    // path is derived from the id alone, so one session pointed at a new
+    // transcript would otherwise apply the old file's offset to the new one —
+    // and two transcripts of one session can share an identical opening, which
+    // defeats the head checksum exactly where it is needed.
+    if record.path_digest != path_digest {
+        return Decision::Full(FullReason::PathChanged);
+    }
+    if record.mtime > mtime {
+        return Decision::Full(FullReason::RecordAheadOfFile);
+    }
+    if size <= record.size {
+        return Decision::Full(FullReason::NotGrown);
+    }
+    if record.offset > size {
+        return Decision::Full(FullReason::OffsetPastEnd);
+    }
+    if size < RESUME_FLOOR {
+        return Decision::Full(FullReason::BelowFloor);
+    }
+    if record.resumes >= MAX_RESUMES || record.grown >= MAX_RESUMED_BYTES {
+        return Decision::Full(FullReason::CeilingReached);
+    }
+
+    let Some(probe) = probe() else {
+        return Decision::Full(FullReason::HeadChanged);
+    };
+    if probe.head != record.head {
+        return Decision::Full(FullReason::HeadChanged);
+    }
+    if !probe.anchor_is_newline {
+        return Decision::Full(FullReason::AnchorMoved);
+    }
+    Decision::Resume {
+        from: record.offset,
+    }
 }

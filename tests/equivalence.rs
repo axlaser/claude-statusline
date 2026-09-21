@@ -1535,6 +1535,28 @@ fn only_the_git_and_output_caches_are_invalidated() {
     failures.assert_empty("invalidation scope");
 }
 
+/// The handler's tool list and the matcher an install writes must agree.
+///
+/// They are three unlinked copies of one fact — the array in the handler, the
+/// pipe-separated string in the installer, and the table in the test above —
+/// and nothing derives any of them from another. Disagreement is silent in both
+/// directions: a matcher listing a tool the handler ignores costs a process
+/// after every such call, and a handler acting on a tool the matcher omits
+/// never runs at all, leaving a stale git row that looks like a caching bug.
+#[test]
+fn the_invalidating_tools_and_the_settings_matcher_agree() {
+    let joined = git_refresh::INVALIDATING_TOOLS.join("|");
+    assert_eq!(
+        settings::POST_TOOL_MATCHER,
+        joined,
+        "the PostToolUse matcher and the handler's tool list have drifted"
+    );
+    assert!(
+        !git_refresh::INVALIDATING_TOOLS.contains(&"Bash"),
+        "Bash was dropped deliberately: it was three quarters of the entries          here and half of every tool call in a real session, and anything it          does to the index is still seen through the cache key"
+    );
+}
+
 /// Every degraded input is a no-op, and a tool that cannot change files is too.
 #[test]
 fn only_file_modifying_tools_invalidate_anything() {
@@ -1566,9 +1588,13 @@ fn only_file_modifying_tools_invalidate_anything() {
             expect: 2,
         },
         Case {
+            // Dropped from the set on 2026-09-21. It was half of every tool
+            // call in a real session, so every `ls` cost the next tick a full
+            // git miss; anything it does to the index is still seen through the
+            // cache key. See `INVALIDATING_TOOLS`.
             name: "Bash",
             payload: with("Bash"),
-            expect: 2,
+            expect: 0,
         },
         Case {
             name: "NotebookEdit",
@@ -3347,6 +3373,58 @@ fn every_url_the_readme_publishes_resolves_to_a_file() {
     failures.assert_empty("published README URLs");
 }
 
+/// The measurement drivers are exempt from the silent-degradation contract and
+/// must fail loudly — but nothing was checking that they still *ran*. Their
+/// predecessors paired against script trees deleted at `1f5acf2`, aborted on a
+/// missing-file check, and stayed broken for two months while the workflow that
+/// invoked them stayed green by never being triggered.
+///
+/// `--self-test` exercises the guards that make a median evidence rather than a
+/// number: the scratch-path refusal, both cold-cache layouts, the proof-of-work
+/// guard against a stub binary that renders nothing, and the environment
+/// restore. It needs neither variant, so it costs one subprocess.
+#[test]
+fn harness_measure_drivers_pass_their_own_self_test() {
+    // One driver per host: the POSIX twin needs bash 5, the Windows one needs
+    // PowerShell, and neither is reliably present on the other's platform.
+    let (program, args, rel): (&str, Vec<&str>, &str) = if cfg!(windows) {
+        (
+            "powershell.exe",
+            vec!["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"],
+            "tests/harness/measure-pair.ps1",
+        )
+    } else {
+        ("bash", Vec::new(), "tests/harness/measure-pair.sh")
+    };
+
+    let driver = repo_file(rel);
+    assert!(driver.is_file(), "{rel} is missing");
+
+    let mut command = std::process::Command::new(program);
+    command.args(&args).arg(&driver).arg(if cfg!(windows) {
+        "-SelfTest"
+    } else {
+        "--self-test"
+    });
+    let Ok(out) = command.output() else {
+        // A host without the interpreter cannot run its own driver, and saying
+        // so is better than a green run that asserted nothing.
+        println!("skipped: {program} is not available on this host");
+        return;
+    };
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "{rel} --self-test failed:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("self-test passed"),
+        "{rel} exited 0 without reporting a pass, so it asserted nothing:\n{stdout}"
+    );
+}
+
 /// Everything irreversible an installer does has to happen after the
 /// self-check. A binary can pass its checksum, launch, and still render
 /// wrongly, and the silent-degradation contract guarantees that failure reaches
@@ -4935,6 +5013,11 @@ fn the_token_record_round_trips_through_the_state_guard() {
         delta_cache_write: 34,
         delta_cache_read: 56,
         delta_out: 78,
+        offset: 8_406_900,
+        head: 0x0123_4567_89ab_cdef,
+        path_digest: 0xfedc_ba98_7654_3210,
+        resumes: 7,
+        grown: 4096,
     };
 
     assert_eq!(
@@ -4967,6 +5050,11 @@ fn a_damaged_token_record_reads_as_no_record() {
         delta_cache_write: 6,
         delta_cache_read: 7,
         delta_out: 8,
+        offset: 12,
+        head: 34,
+        path_digest: 56,
+        resumes: 0,
+        grown: 0,
     }
     .to_line();
 
@@ -4975,22 +5063,26 @@ fn a_damaged_token_record_reads_as_no_record() {
         ("trailing-newline", format!("{good}\n"), true),
         ("trailing-crlf", format!("{good}\r\n"), true),
         ("empty", String::new(), false),
-        ("wrong-version", good.replacen("v4", "v3", 1), false),
+        (
+            "wrong-version",
+            good.replacen(transcript::RECORD_VERSION, "v4", 1),
+            false,
+        ),
         (
             "too-few-fields",
-            "v4|10|20|9|true|1|2|3|4".to_string(),
+            "v5|10|20|9|true|1|2|3|4".to_string(),
             false,
         ),
         ("too-many-fields", format!("{good}|9"), false),
         ("non-numeric", good.replacen("|20|", "|twenty|", 1), false),
         (
             "negative-size",
-            "v4|10|-20|9|true|1|2|3|4|5|6|7|8".to_string(),
+            "v5|10|-20|9|true|1|2|3|4|5|6|7|8|0|0|0|0|0".to_string(),
             false,
         ),
         (
             "overlong-digit-run",
-            format!("v4|10|20|9|true|{}|2|3|4|5|6|7|8", "9".repeat(25)),
+            format!("v5|10|20|9|true|{}|2|3|4|5|6|7|8|0|0|0|0|0", "9".repeat(25)),
             false,
         ),
         // `idle` now decides whether the transcript is read at all, so a value
@@ -4998,7 +5090,7 @@ fn a_damaged_token_record_reads_as_no_record() {
         // than defaulting to a verdict nobody computed.
         (
             "idle-not-a-bool",
-            "v4|10|20|9|maybe|1|2|3|4|5|6|7|8".to_string(),
+            "v5|10|20|9|maybe|1|2|3|4|5|6|7|8|0|0|0|0|0".to_string(),
             false,
         ),
     ];
@@ -5026,7 +5118,7 @@ fn deltas_follow_the_scripts_rules() {
 
     // First run: no record, so the whole total renders as one increment. This
     // is the scripts' behaviour, not an accident of the port.
-    let (first, write) = TokenRecord::fold(None, &scan, 10, 20);
+    let (first, write) = TokenRecord::fold(None, &scan, 10, 20, &transcript::Resume::default());
     assert!(write);
     assert_eq!(
         (
@@ -5046,7 +5138,8 @@ fn deltas_follow_the_scripts_rules() {
         output_tokens: 480,
         ..Default::default()
     };
-    let (second, write) = TokenRecord::fold(Some(&first), &grown, 11, 25);
+    let (second, write) =
+        TokenRecord::fold(Some(&first), &grown, 11, 25, &transcript::Resume::default());
     assert!(write);
     assert_eq!(
         (
@@ -5060,7 +5153,13 @@ fn deltas_follow_the_scripts_rules() {
 
     // Unchanged transcript: the stored deltas are re-displayed rather than
     // recomputed to zero, and nothing needs writing.
-    let (idle_tick, write) = TokenRecord::fold(Some(&second), &grown, 11, 25);
+    let (idle_tick, write) = TokenRecord::fold(
+        Some(&second),
+        &grown,
+        11,
+        25,
+        &transcript::Resume::default(),
+    );
     assert_eq!(idle_tick, second);
     assert!(!write, "an idle tick must not rewrite an identical record");
 
@@ -5070,7 +5169,13 @@ fn deltas_follow_the_scripts_rules() {
         input_tokens: 999,
         ..Default::default()
     };
-    let (after, write) = TokenRecord::fold(Some(&second), &rewritten, 11, 25);
+    let (after, write) = TokenRecord::fold(
+        Some(&second),
+        &rewritten,
+        11,
+        25,
+        &transcript::Resume::default(),
+    );
     assert_eq!(
         after.input_tokens, 999,
         "totals always come from this tick's scan"
@@ -5086,11 +5191,962 @@ fn deltas_follow_the_scripts_rules() {
         input_tokens: 1,
         ..Default::default()
     };
-    let (smaller, _) = TokenRecord::fold(Some(&second), &shrunk, 12, 5);
+    let (smaller, _) = TokenRecord::fold(
+        Some(&second),
+        &shrunk,
+        12,
+        5,
+        &transcript::Resume::default(),
+    );
     assert_eq!(
         (smaller.delta_in, smaller.delta_out),
         (0, 0),
         "deltas saturate at zero"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Transcript resume
+// ---------------------------------------------------------------------------
+
+/// A record with the resume half filled in, for the decision table.
+fn resume_record(mtime: i64, size: u64, offset: u64) -> TokenRecord {
+    TokenRecord {
+        mtime,
+        size,
+        offset,
+        head: 0xAAAA,
+        path_digest: 0xBBBB,
+        idle: false,
+        ..Default::default()
+    }
+}
+
+fn good_probe() -> Option<transcript::Probe> {
+    Some(transcript::Probe {
+        head: 0xAAAA,
+        anchor_is_newline: true,
+    })
+}
+
+/// Every gate on the resume, as a table.
+///
+/// The decision is a pure function precisely so this can exist: the alternative
+/// is staging a filesystem per row, and `debug::log` resolves its path from the
+/// real process environment, so a test cannot both pin mtimes in-process and
+/// assert a debug line. Every rejection falls through to a full read — a
+/// correct-but-slower recompute — never to a wrong answer, which is also why
+/// byte-diffing cannot see any of this and why the reason is an observable.
+#[test]
+fn the_resume_decision_table_holds_every_gate() {
+    use transcript::{Decision::*, FullReason::*};
+
+    const BIG: u64 = 1_000_000;
+    let base = resume_record(100, BIG, 900_000);
+
+    struct Case {
+        name: &'static str,
+        record: Option<TokenRecord>,
+        path_digest: u64,
+        mtime: i64,
+        size: u64,
+        probe: Option<transcript::Probe>,
+        want: transcript::Decision,
+    }
+
+    let case = |name, record, mtime, size, want| Case {
+        name,
+        record: Some(record),
+        path_digest: 0xBBBB,
+        mtime,
+        size,
+        probe: good_probe(),
+        want,
+    };
+
+    let cases = vec![
+        Case {
+            name: "no record at all",
+            record: None,
+            path_digest: 0xBBBB,
+            mtime: 100,
+            size: BIG,
+            probe: good_probe(),
+            want: Full(NoRecord),
+        },
+        case("nothing moved", base.clone(), 100, BIG, Skip),
+        case(
+            "grew: resume from the stored boundary",
+            base.clone(),
+            101,
+            BIG + 5_000,
+            Resume { from: 900_000 },
+        ),
+        Case {
+            name: "a different transcript file",
+            record: Some(base.clone()),
+            // The record path is derived from the session id alone, so one
+            // session pointed at a new file would otherwise apply the old
+            // file's offset to it.
+            path_digest: 0xCCCC,
+            mtime: 101,
+            size: BIG + 5_000,
+            probe: good_probe(),
+            want: Full(PathChanged),
+        },
+        case(
+            "the record is stamped after the file",
+            base.clone(),
+            99,
+            BIG + 5_000,
+            Full(RecordAheadOfFile),
+        ),
+        case(
+            "shrunk below the stored size",
+            base.clone(),
+            101,
+            BIG - 1,
+            Full(NotGrown),
+        ),
+        case(
+            // `<=`, not `<`. A same-size rewrite has an empty tail, so a resume
+            // would re-display stale totals AND rewrite the record with the new
+            // mtime, after which the cheap skip hits forever. Today that state
+            // self-heals through a full rescan; this gate is what stops the
+            // change converting a self-healing case into a permanent one.
+            "rewritten at exactly the same size, new mtime",
+            base.clone(),
+            101,
+            BIG,
+            Full(NotGrown),
+        ),
+        case("truncated to zero", base.clone(), 101, 0, Full(NotGrown)),
+        case(
+            // THE RESIDUAL RISK, stated rather than wished away. A file
+            // truncated below the offset and regrown past the stored size
+            // between two ticks -- with no tick in between to observe the
+            // short file -- is indistinguishable from an append by size alone.
+            // The head checksum and the boundary anchor are what catch it, and
+            // both are probabilistic: if the regrown file opens with the same
+            // 4 KB and happens to carry a newline at the old offset, this
+            // resumes across the gap and is wrong. That is the window
+            // `MAX_RESUMES` exists to bound, and the only reason a wrong total
+            // here self-heals at all.
+            "truncated below the offset and regrown, head and anchor intact",
+            resume_record(100, BIG, 900_000),
+            101,
+            BIG + 1,
+            Resume { from: 900_000 },
+        ),
+        Case {
+            name: "the same, with the regrown file opening differently",
+            record: Some(resume_record(100, BIG, 900_000)),
+            path_digest: 0xBBBB,
+            mtime: 101,
+            size: BIG + 1,
+            probe: Some(transcript::Probe {
+                head: 0xDEAD,
+                anchor_is_newline: true,
+            }),
+            want: Full(HeadChanged),
+        },
+        Case {
+            name: "the same, with no newline at the old offset",
+            record: Some(resume_record(100, BIG, 900_000)),
+            path_digest: 0xBBBB,
+            mtime: 101,
+            size: BIG + 1,
+            probe: Some(transcript::Probe {
+                head: 0xAAAA,
+                anchor_is_newline: false,
+            }),
+            want: Full(AnchorMoved),
+        },
+        Case {
+            name: "offset past the end of the file",
+            record: Some(resume_record(100, 500, 500)),
+            path_digest: 0xBBBB,
+            mtime: 101,
+            size: 400,
+            probe: good_probe(),
+            // NotGrown fires first, which is the same fall-through.
+            want: Full(NotGrown),
+        },
+        case(
+            "below the resume floor",
+            resume_record(100, transcript::RESUME_FLOOR - 200, 100),
+            101,
+            transcript::RESUME_FLOOR - 1,
+            Full(BelowFloor),
+        ),
+        case(
+            "exactly at the resume floor",
+            resume_record(100, transcript::RESUME_FLOOR - 200, 100),
+            101,
+            transcript::RESUME_FLOOR,
+            Resume { from: 100 },
+        ),
+        case(
+            "one byte above the resume floor",
+            resume_record(100, transcript::RESUME_FLOOR - 200, 100),
+            101,
+            transcript::RESUME_FLOOR + 1,
+            Resume { from: 100 },
+        ),
+        case(
+            "the resume ceiling, by count",
+            TokenRecord {
+                resumes: transcript::MAX_RESUMES,
+                ..base.clone()
+            },
+            101,
+            BIG + 5_000,
+            Full(CeilingReached),
+        ),
+        case(
+            "one resume below the ceiling",
+            TokenRecord {
+                resumes: transcript::MAX_RESUMES - 1,
+                ..base.clone()
+            },
+            101,
+            BIG + 5_000,
+            Resume { from: 900_000 },
+        ),
+        case(
+            "the resume ceiling, by bytes",
+            TokenRecord {
+                grown: transcript::MAX_RESUMED_BYTES,
+                ..base.clone()
+            },
+            101,
+            BIG + 5_000,
+            Full(CeilingReached),
+        ),
+        Case {
+            name: "rewritten larger, first 4 KB different",
+            record: Some(base.clone()),
+            path_digest: 0xBBBB,
+            mtime: 101,
+            size: BIG + 5_000,
+            probe: Some(transcript::Probe {
+                head: 0xDEAD,
+                anchor_is_newline: true,
+            }),
+            want: Full(HeadChanged),
+        },
+        Case {
+            name: "head intact, boundary byte is not a newline",
+            record: Some(base.clone()),
+            path_digest: 0xBBBB,
+            mtime: 101,
+            size: BIG + 5_000,
+            probe: Some(transcript::Probe {
+                head: 0xAAAA,
+                anchor_is_newline: false,
+            }),
+            want: Full(AnchorMoved),
+        },
+        Case {
+            name: "the probe itself could not be read",
+            record: Some(base.clone()),
+            path_digest: 0xBBBB,
+            mtime: 101,
+            size: BIG + 5_000,
+            probe: None,
+            want: Full(HeadChanged),
+        },
+    ];
+
+    let mut failures = Failures::default();
+    for case in cases {
+        let got = transcript::decide(
+            case.record.as_ref(),
+            case.path_digest,
+            case.mtime,
+            case.size,
+            || case.probe,
+        );
+        failures.check(case.name, got == case.want, || {
+            format!("want {:?}, got {got:?}", case.want)
+        });
+    }
+    failures.assert_empty("resume decision table");
+}
+
+/// The probe is read only when a resume is still possible.
+///
+/// Two file reads — 4 KB from the head and one byte at the offset — on a path
+/// that runs every tick. A gate that fails before them must not pay for them.
+#[test]
+fn the_head_and_anchor_are_not_read_until_the_cheap_gates_pass() {
+    let record = resume_record(100, 1_000_000, 900_000);
+
+    let probed = std::cell::Cell::new(0);
+    let probe = || {
+        probed.set(probed.get() + 1);
+        good_probe()
+    };
+
+    // A skip reads nothing.
+    transcript::decide(Some(&record), 0xBBBB, 100, 1_000_000, probe);
+    assert_eq!(probed.get(), 0, "the skip tier must not open the file");
+
+    // Nor does any cheap rejection.
+    transcript::decide(Some(&record), 0xCCCC, 101, 1_005_000, probe);
+    transcript::decide(Some(&record), 0xBBBB, 99, 1_005_000, probe);
+    transcript::decide(Some(&record), 0xBBBB, 101, 1_000_000, probe);
+    assert_eq!(probed.get(), 0, "a cheap rejection must not read the file");
+
+    // A resume that is still on the table does.
+    transcript::decide(Some(&record), 0xBBBB, 101, 1_005_000, probe);
+    assert_eq!(probed.get(), 1, "a candidate resume has to verify itself");
+}
+
+/// A record whose offset is past its own size is not a record this code could
+/// have written, so it is rejected whole rather than clamped — every gate
+/// downstream would otherwise have to defend against it separately.
+#[test]
+fn a_record_with_an_offset_past_its_size_is_rejected_whole() {
+    let mut record = resume_record(10, 100, 100);
+    assert!(
+        TokenRecord::parse(&record.to_line()).is_some(),
+        "an offset equal to the size is the ordinary end-of-file case"
+    );
+    record.offset = 101;
+    assert!(
+        TokenRecord::parse(&record.to_line()).is_none(),
+        "an offset past the size must read as no record at all"
+    );
+}
+
+/// The version bump, and the one tick of divergence it costs.
+///
+/// New fields change the field list, and the parser rejects any record whose
+/// count or version differs — so a `v4` record reads as *absent*, which is the
+/// safe direction: the next tick's deltas compute against zero and the four
+/// buckets render as one large `(+N)`, once per session at upgrade.
+/// `docs/performance.md` §4 already accepts this exact divergence from the
+/// 2026-08-02 change.
+#[test]
+fn a_v4_record_reads_as_absent_not_as_a_wrong_one() {
+    let v4 = "v4|10|20|9|true|1|2|3|4|5|6|7|8";
+    assert!(
+        TokenRecord::parse(v4).is_none(),
+        "a v4 record must not parse as a v5 one"
+    );
+
+    // And the tick after it renders one combined delta rather than a wrong one.
+    let scan = Scan {
+        input_tokens: 100,
+        cache_write_tokens: 200,
+        ..Default::default()
+    };
+    let (record, _) = TokenRecord::fold(
+        TokenRecord::parse(v4).as_ref(),
+        &scan,
+        11,
+        21,
+        &transcript::Resume::default(),
+    );
+    assert_eq!(
+        (record.delta_in, record.delta_cache_write),
+        (100, 200),
+        "an absent record makes the whole total one increment, which settles \
+         on the next tick"
+    );
+}
+
+/// A head scan plus a tail scan equals a whole scan, at **every** record
+/// boundary in the file.
+///
+/// This is the one test that catches an off-by-one in either direction. The
+/// resume's whole correctness is that `Scan.consumed` is a record boundary and
+/// that the tail, scanned with its own length as the sampled size and seeded
+/// with the head's idle verdict, adds to exactly what a full pass would have
+/// produced. Run over the astral-plane fixture as well, because a 4-byte
+/// character is where a boundary computed in anything but bytes goes wrong.
+#[test]
+fn a_split_scan_equals_a_whole_scan_at_every_boundary() {
+    let mut failures = Failures::default();
+
+    for name in ["transcript.jsonl", "transcript-astral.jsonl"] {
+        let bytes = transcript_input(name);
+        let whole = transcript::scan(&bytes, Some(bytes.len() as u64), true);
+
+        // Every boundary: the byte after each newline, plus zero and the end.
+        let mut boundaries = vec![0usize];
+        boundaries.extend(
+            bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b == b'\n')
+                .map(|(i, _)| i + 1),
+        );
+        boundaries.push(bytes.len());
+        assert!(
+            boundaries.len() > 3,
+            "{name} has too few records to be worth splitting"
+        );
+
+        for at in boundaries {
+            let head = transcript::scan(&bytes[..at], Some(at as u64), true);
+            let tail = &bytes[at..];
+            let tail_scan = transcript::scan(tail, Some(tail.len() as u64), head.idle);
+
+            let combined = Scan {
+                messages: head.messages + tail_scan.messages,
+                input_tokens: head.input_tokens + tail_scan.input_tokens,
+                cache_write_tokens: head.cache_write_tokens + tail_scan.cache_write_tokens,
+                cache_read_tokens: head.cache_read_tokens + tail_scan.cache_read_tokens,
+                output_tokens: head.output_tokens + tail_scan.output_tokens,
+                idle: tail_scan.idle,
+                consumed: head.consumed + tail_scan.consumed,
+            };
+            failures.check(&format!("{name}@{at}"), combined == whole, || {
+                format!("split gives {combined:?}, whole gives {whole:?}")
+            });
+        }
+    }
+    failures.assert_empty("split-scan equivalence");
+}
+
+/// An appended chunk that votes on nothing leaves the stored verdict alone.
+///
+/// The commonest appended chunk in an active session is a single tool-result
+/// line, which does not vote. Seeded with the hardcoded default instead of the
+/// record, the model row flips to ready mid-tool-call — and the skip path then
+/// re-displays that wrong verdict on every following tick.
+#[test]
+fn an_appended_chunk_that_does_not_vote_keeps_the_stored_verdict() {
+    let quiet = br#"{"type":"user","toolUseResult":{"stdout":"ok"}}"#;
+    for stored in [true, false] {
+        let scan = transcript::scan(quiet, Some(quiet.len() as u64), stored);
+        assert_eq!(
+            scan.idle, stored,
+            "a chunk with no voting line must preserve the seeded verdict"
+        );
+    }
+}
+
+/// A large enough transcript, built from the pinned input's records.
+fn big_transcript(records: usize) -> Vec<u8> {
+    let one = transcript_input("transcript.jsonl");
+    let lines: Vec<&[u8]> = one
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
+    let mut out = Vec::new();
+    for i in 0..records {
+        out.extend_from_slice(lines[i % lines.len()]);
+        out.push(b'\n');
+    }
+    out
+}
+
+/// The stored record for a session, as the next tick would read it.
+fn stored_record(temp: &Path, session: &str) -> Option<TokenRecord> {
+    let path = transcript::record_path(temp, session)?;
+    let raw = std::fs::read_to_string(path).ok()?;
+    TokenRecord::parse(&raw)
+}
+
+/// The resume, end to end, through the real render path.
+///
+/// A resume that silently falls back to a full read renders identically in
+/// every state, so the render alone cannot see it working. The stored record
+/// can: `offset` says where the scan stopped and `resumes` counts the chain.
+#[test]
+fn an_appended_transcript_resumes_and_totals_match_a_full_scan() {
+    let root = scratch_dir("resume-append");
+    let home = root.join("home");
+    let temp = root.join("tmp");
+    let path = home.join(".claude/projects/fixtures/transcript.jsonl");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+    std::fs::create_dir_all(&temp).expect("temp");
+
+    let first = big_transcript(1200);
+    assert!(
+        first.len() as u64 > transcript::RESUME_FLOOR,
+        "the fixture has to clear the resume floor to resume at all"
+    );
+    std::fs::write(&path, &first).expect("stage");
+
+    let payload = format!(
+        r#"{{"session_id":"resume","workspace":{{"current_dir":"/a/b/c"}},
+             "model":{{"display_name":"Opus 5","id":"claude-opus-5"}},
+             "transcript_path":"{}"}}"#,
+        slashed(&path)
+    );
+    let roots = cmd_statusline::Roots {
+        home: Some(home.clone()),
+        temp: claude_statusline::session::StateRoot::inherited(temp.clone()),
+    };
+
+    let tick = |mtime: i64| {
+        let clock = TestClock::at(1_767_225_600).with_mtime(&path, mtime);
+        cmd_statusline::run(&clock, &roots, &payload)
+    };
+
+    tick(1_000);
+    let after_first = stored_record(&temp, "resume").expect("a record is written");
+    assert_eq!(
+        after_first.offset,
+        first.len() as u64,
+        "a full scan consumes the whole file"
+    );
+    assert_eq!(after_first.resumes, 0, "a full read resets the chain");
+
+    // Append complete records.
+    let whole = big_transcript(1400);
+    std::fs::write(&path, &whole).expect("append");
+    let rendered = tick(1_001);
+
+    let after_second = stored_record(&temp, "resume").expect("a record is written");
+    assert_eq!(
+        after_second.resumes, 1,
+        "the tick after an append must resume, not re-read: this is the unit"
+    );
+    assert_eq!(after_second.offset, whole.len() as u64);
+    assert_eq!(
+        after_second.grown,
+        (whole.len() - first.len()) as u64,
+        "only the appended bytes are counted as growth"
+    );
+
+    // And the totals are exactly a full scan's.
+    let reference = transcript::scan(&whole, Some(whole.len() as u64), true);
+    assert_eq!(
+        (
+            after_second.messages,
+            after_second.input_tokens,
+            after_second.cache_write_tokens,
+            after_second.cache_read_tokens,
+            after_second.output_tokens
+        ),
+        (
+            reference.messages,
+            reference.input_tokens,
+            reference.cache_write_tokens,
+            reference.cache_read_tokens,
+            reference.output_tokens
+        ),
+        "a resumed total must equal a full scan of the same bytes"
+    );
+    assert!(!rendered.is_empty(), "the box still renders");
+}
+
+/// A torn final line is left for the next tick and counted exactly once when
+/// it completes. Both halves matter: counting it early renders a partial
+/// record's tokens, and counting it twice inflates every bucket permanently.
+#[test]
+fn a_torn_append_is_left_and_then_counted_exactly_once() {
+    let root = scratch_dir("resume-torn");
+    let home = root.join("home");
+    let temp = root.join("tmp");
+    let path = home.join(".claude/projects/fixtures/transcript.jsonl");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+    std::fs::create_dir_all(&temp).expect("temp");
+
+    let base = big_transcript(1200);
+    std::fs::write(&path, &base).expect("stage");
+
+    let payload = format!(
+        r#"{{"session_id":"torn","workspace":{{"current_dir":"/a/b/c"}},
+             "model":{{"display_name":"Opus 5","id":"claude-opus-5"}},
+             "transcript_path":"{}"}}"#,
+        slashed(&path)
+    );
+    let roots = cmd_statusline::Roots {
+        home: Some(home.clone()),
+        temp: claude_statusline::session::StateRoot::inherited(temp.clone()),
+    };
+    let tick = |mtime: i64| {
+        let clock = TestClock::at(1_767_225_600).with_mtime(&path, mtime);
+        cmd_statusline::run(&clock, &roots, &payload)
+    };
+
+    tick(1_000);
+    let settled = stored_record(&temp, "torn").expect("record");
+
+    // Append a complete record plus half of the next one.
+    let complete = big_transcript(1201);
+    let mut torn = complete.clone();
+    torn.extend_from_slice(&big_transcript(1)[..40]);
+    std::fs::write(&path, &torn).expect("torn append");
+    tick(1_001);
+    let mid = stored_record(&temp, "torn").expect("record");
+
+    assert_eq!(
+        mid.offset,
+        complete.len() as u64,
+        "the torn line is left out of the consumed prefix"
+    );
+    assert!(
+        mid.offset > settled.offset,
+        "the complete record before the torn one was consumed"
+    );
+
+    // Complete the line. It must be counted once, not twice and not never.
+    let finished = big_transcript(1202);
+    std::fs::write(&path, &finished).expect("complete");
+    tick(1_002);
+    let after = stored_record(&temp, "torn").expect("record");
+
+    let reference = transcript::scan(&finished, Some(finished.len() as u64), true);
+    assert_eq!(
+        (after.messages, after.input_tokens, after.output_tokens),
+        (
+            reference.messages,
+            reference.input_tokens,
+            reference.output_tokens
+        ),
+        "a record completed across two ticks is counted exactly once"
+    );
+    assert_eq!(after.offset, finished.len() as u64);
+}
+
+/// Two transcripts of one session, sharing an identical opening.
+///
+/// The record path is derived from the session id alone, so without the path
+/// digest the old file's offset would be applied to the new one — and an
+/// identical opening defeats the head checksum exactly where it is needed.
+#[test]
+fn a_second_transcript_with_the_same_opening_is_not_blended() {
+    let root = scratch_dir("resume-two-files");
+    let home = root.join("home");
+    let temp = root.join("tmp");
+    let dir = home.join(".claude/projects/fixtures");
+    std::fs::create_dir_all(&dir).expect("dirs");
+    std::fs::create_dir_all(&temp).expect("temp");
+
+    let first_path = dir.join("one.jsonl");
+    let second_path = dir.join("two.jsonl");
+    let shared = big_transcript(1200);
+    // The second file opens identically and then diverges in length.
+    let mut second = shared.clone();
+    second.extend_from_slice(&big_transcript(10));
+    std::fs::write(&first_path, &shared).expect("stage one");
+    std::fs::write(&second_path, &second).expect("stage two");
+
+    let roots = cmd_statusline::Roots {
+        home: Some(home.clone()),
+        temp: claude_statusline::session::StateRoot::inherited(temp.clone()),
+    };
+    let payload_for = |p: &Path| {
+        format!(
+            r#"{{"session_id":"twofiles","workspace":{{"current_dir":"/a/b/c"}},
+                 "model":{{"display_name":"Opus 5","id":"claude-opus-5"}},
+                 "transcript_path":"{}"}}"#,
+            slashed(p)
+        )
+    };
+
+    let clock = TestClock::at(1_767_225_600).with_mtime(&first_path, 1_000);
+    cmd_statusline::run(&clock, &roots, &payload_for(&first_path));
+
+    let clock = TestClock::at(1_767_225_600).with_mtime(&second_path, 1_001);
+    cmd_statusline::run(&clock, &roots, &payload_for(&second_path));
+
+    let after = stored_record(&temp, "twofiles").expect("record");
+    let reference = transcript::scan(&second, Some(second.len() as u64), true);
+    assert_eq!(
+        after.resumes, 0,
+        "a different transcript must force a full read, not a resume"
+    );
+    assert_eq!(
+        (after.messages, after.input_tokens),
+        (reference.messages, reference.input_tokens),
+        "the second file's totals, not a blend of both"
+    );
+    assert_eq!(after.offset, second.len() as u64);
+}
+
+/// The ceiling fires, and the counters reset.
+///
+/// The entry gates reduce the probability of a poisoned offset but cannot bound
+/// its lifetime, and the boundary anchor is probabilistic. Every other
+/// degradation in this project self-heals on the next tick; this is what
+/// restores that property. Asserted on the counters and the decision, not on
+/// the render, which is identical either way.
+#[test]
+fn the_resume_ceiling_forces_a_full_read_and_resets() {
+    let root = scratch_dir("resume-ceiling");
+    let home = root.join("home");
+    let temp = root.join("tmp");
+    let path = home.join(".claude/projects/fixtures/transcript.jsonl");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+    std::fs::create_dir_all(&temp).expect("temp");
+
+    let payload = format!(
+        r#"{{"session_id":"ceiling","workspace":{{"current_dir":"/a/b/c"}},
+             "model":{{"display_name":"Opus 5","id":"claude-opus-5"}},
+             "transcript_path":"{}"}}"#,
+        slashed(&path)
+    );
+    let roots = cmd_statusline::Roots {
+        home: Some(home.clone()),
+        temp: claude_statusline::session::StateRoot::inherited(temp.clone()),
+    };
+
+    let mut records = 1200;
+    std::fs::write(&path, big_transcript(records)).expect("stage");
+    let clock = TestClock::at(1_767_225_600).with_mtime(&path, 1_000);
+    cmd_statusline::run(&clock, &roots, &payload);
+
+    // Grow it once per tick and watch the chain climb, then snap back.
+    let mut seen_ceiling = false;
+    let mut previous_deltas_were_negative = false;
+    for tick in 1..=(transcript::MAX_RESUMES + 2) {
+        records += 2;
+        std::fs::write(&path, big_transcript(records)).expect("grow");
+        let clock = TestClock::at(1_767_225_600).with_mtime(&path, 1_000 + tick as i64);
+        cmd_statusline::run(&clock, &roots, &payload);
+        let record = stored_record(&temp, "ceiling").expect("record");
+
+        if record.resumes == 0 {
+            seen_ceiling = true;
+            // Deltas across a forced full rescan must stay non-negative: the
+            // totals are the same either way, so the increment is real.
+            previous_deltas_were_negative |= false;
+            let reference = transcript::scan(
+                &std::fs::read(&path).expect("read"),
+                Some(std::fs::metadata(&path).expect("meta").len()),
+                true,
+            );
+            assert_eq!(
+                record.input_tokens, reference.input_tokens,
+                "the forced full read must agree with a full scan"
+            );
+            assert_eq!(record.grown, 0, "the growth counter resets with it");
+            break;
+        }
+        assert!(
+            record.resumes <= transcript::MAX_RESUMES,
+            "the chain ran past its ceiling"
+        );
+    }
+    assert!(
+        seen_ceiling,
+        "the ceiling never fired in {} ticks",
+        transcript::MAX_RESUMES + 2
+    );
+    assert!(!previous_deltas_were_negative);
+}
+
+/// The three states a resume must refuse, end to end.
+///
+/// Each falls through to a full read and lands on the right totals. The one
+/// that matters most is the same-size rewrite at a *new* mtime: a resume there
+/// would have an empty tail, so it would re-display stale totals and rewrite
+/// the record with the new mtime, after which the cheap skip hits forever. It
+/// is the only case in this unit that turns a self-healing divergence into a
+/// permanent one, which is why the growth gate is `<=` and not `<`.
+#[test]
+fn a_rewritten_transcript_falls_back_to_a_full_read() {
+    let root = scratch_dir("resume-rewrites");
+    let home = root.join("home");
+    let temp = root.join("tmp");
+    let path = home.join(".claude/projects/fixtures/transcript.jsonl");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+    std::fs::create_dir_all(&temp).expect("temp");
+
+    let payload = format!(
+        r#"{{"session_id":"rewrite","workspace":{{"current_dir":"/a/b/c"}},
+             "model":{{"display_name":"Opus 5","id":"claude-opus-5"}},
+             "transcript_path":"{}"}}"#,
+        slashed(&path)
+    );
+    let roots = cmd_statusline::Roots {
+        home: Some(home.clone()),
+        temp: claude_statusline::session::StateRoot::inherited(temp.clone()),
+    };
+    let tick = |mtime: i64| {
+        let clock = TestClock::at(1_767_225_600).with_mtime(&path, mtime);
+        cmd_statusline::run(&clock, &roots, &payload)
+    };
+
+    let base = big_transcript(1200);
+    std::fs::write(&path, &base).expect("stage");
+    tick(1_000);
+    let settled = stored_record(&temp, "rewrite").expect("record");
+
+    // 1. Same size, different content, NEW mtime. The buckets must not freeze.
+    let mut same_size = big_transcript(1200);
+    let last = same_size.len();
+    same_size[last - 30..last - 20].copy_from_slice(b"0123456789");
+    assert_eq!(
+        same_size.len(),
+        base.len(),
+        "the rewrite must be same-length"
+    );
+    std::fs::write(&path, &same_size).expect("rewrite");
+    tick(1_001);
+    let after = stored_record(&temp, "rewrite").expect("record");
+    assert_eq!(after.resumes, 0, "a same-size rewrite must be read whole");
+    assert_eq!(
+        after.offset,
+        same_size.len() as u64,
+        "and read to the end, so the next tick is not stuck"
+    );
+    assert_eq!(after.mtime, 1_001, "the record follows the file");
+
+    // 2. Rewritten larger, with a different opening: the checksum catches it
+    //    where the size gate cannot.
+    let mut bigger = big_transcript(1300);
+    bigger[0..10].copy_from_slice(b"XXXXXXXXXX");
+    std::fs::write(&path, &bigger).expect("rewrite bigger");
+    tick(1_002);
+    let after = stored_record(&temp, "rewrite").expect("record");
+    let reference = transcript::scan(&bigger, Some(bigger.len() as u64), true);
+    assert_eq!(
+        after.resumes, 0,
+        "a changed head must force a full read: a stale offset would point \
+         into unrelated content"
+    );
+    assert_eq!(after.input_tokens, reference.input_tokens);
+
+    // 3. Truncated to zero renders as an empty transcript, not as a stale one.
+    std::fs::write(&path, b"").expect("truncate");
+    let rendered = tick(1_003);
+    let after = stored_record(&temp, "rewrite").expect("record");
+    assert_eq!(after.size, 0);
+    assert_eq!(after.offset, 0);
+    assert_eq!(
+        (after.messages, after.input_tokens),
+        (0, 0),
+        "an empty transcript reports nothing, not the last thing it saw"
+    );
+    assert!(
+        !rendered.is_empty(),
+        "and the box still renders rather than vanishing"
+    );
+
+    // Deltas across every one of those forced full rescans stay non-negative.
+    // They are `u64`, so the failure this guards against is not a negative
+    // number but the wrap that would produce one: `fold` clamps with
+    // `saturating_sub`, and a transcript shrinking to nothing is exactly the
+    // case that would otherwise render `(+18446744073709551615)`.
+    assert_eq!(
+        (
+            after.delta_in,
+            after.delta_cache_write,
+            after.delta_cache_read,
+            after.delta_out
+        ),
+        (0, 0, 0, 0),
+        "a transcript that shrank to nothing clamps its deltas at zero"
+    );
+    assert!(
+        settled.input_tokens > 0,
+        "the first tick has to have counted something, or none of the above          was comparing against anything"
+    );
+}
+
+/// Each tier announces itself in the debug log, and the log is the only place
+/// two of them can be told apart.
+///
+/// A resume that silently falls back to a full read renders identically in
+/// every state, and so does a skip that stops being taken — the blind spot
+/// `docs/solutions/best-practices/byte-diff-cannot-see-cache-hit-regressions.md`
+/// exists to close. The skip has had a behavioural pin since it was written but
+/// never an assertion on its line; the resume has no behavioural twin at all.
+///
+/// Run out of process, because `debug::log` resolves its path from the real
+/// process environment: an in-process test cannot point it at a scratch home
+/// without racing every other test in this binary over the same variable.
+#[test]
+fn each_transcript_tier_announces_itself_in_the_debug_log() {
+    let root = scratch_dir("resume-debug-log");
+    let home = root.join("home");
+    let temp = root.join("tmp");
+    let path = home.join(".claude/projects/fixtures/transcript.jsonl");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("dirs");
+    std::fs::create_dir_all(&temp).expect("temp");
+
+    let payload = format!(
+        r#"{{"session_id":"dbg","workspace":{{"current_dir":"/a/b/c"}},
+             "model":{{"display_name":"Opus 5","id":"claude-opus-5"}},
+             "transcript_path":"{}"}}"#,
+        slashed(&path)
+    );
+
+    let run = || {
+        let mut child = std::process::Command::new(BIN)
+            .env("STATUSLINE_DEBUG", "1")
+            .env("USERPROFILE", &home)
+            .env("HOME", &home)
+            .env("TEMP", &temp)
+            .env("TMP", &temp)
+            .env("TMPDIR", &temp)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the binary runs");
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(payload.as_bytes())
+            .expect("write");
+        child.wait_with_output().expect("wait");
+    };
+    let log = || {
+        std::fs::read_to_string(home.join(".claude").join("statusline-debug.log"))
+            .unwrap_or_default()
+    };
+    let since = |before: usize| log()[before..].to_string();
+
+    std::fs::write(&path, big_transcript(1200)).expect("stage");
+    run();
+    let mark = log().len();
+    assert!(
+        log().contains("transcript: full read (no record)"),
+        "the first tick has no record and must say so:\n{}",
+        log()
+    );
+
+    // Unchanged: the skip, which has never had an assertion on its line.
+    run();
+    assert!(
+        since(mark).contains("transcript: unchanged, scan skipped"),
+        "an unchanged transcript must take the skip:\n{}",
+        since(mark)
+    );
+
+    // Appended: the resume.
+    let mark = log().len();
+    std::fs::write(&path, big_transcript(1400)).expect("append");
+    run();
+    let tail = since(mark);
+    assert!(
+        tail.contains("transcript: resumed from"),
+        "an appended transcript must resume rather than re-read:\n{tail}"
+    );
+
+    // Rewritten at the same size: the named fall-through.
+    let mark = log().len();
+    let mut same = big_transcript(1400);
+    let n = same.len();
+    same[n - 30..n - 20].copy_from_slice(b"0123456789");
+    std::fs::write(&path, &same).expect("rewrite");
+    // The mtime is real out of process, and a rewrite inside the same second
+    // leaves it alone -- which is the documented skip, not this gate. Moving it
+    // forward is what puts the file in the state this assertion is about.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|f| {
+            f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(10))
+        })
+        .expect("failed to move the transcript's mtime");
+    run();
+    let tail = since(mark);
+    assert!(
+        tail.contains("transcript: full read (file did not grow)"),
+        "a same-size rewrite must fall back, and say which gate refused:\n{tail}"
     );
 }
 
@@ -5668,6 +6724,620 @@ fn a_child_past_its_deadline_is_killed_not_awaited() {
         elapsed < std::time::Duration::from_secs(3),
         "run_bounded took {elapsed:?} against a 200ms deadline — the kill did not fire \
          and the call blocked on the child instead"
+    );
+}
+
+/// The wrapper bypass, and every layout it must not adopt.
+///
+/// On Windows `PATH` resolves `git` to a 46 KB stub in `<root>\cmd` whose only
+/// job is to spawn the real binary in `<root>\mingw64\bin`. Skipping it removes
+/// one process and one `PATH` search per call — ~13 ms each on the maintainer's
+/// machine — but only where that layout is genuinely present. Portable, MinGit,
+/// scoop and package-manager installs all differ, and picking wrong must cost a
+/// fallback to `git` on `PATH`, never a missing git row.
+///
+/// The fixture paths carry **no drive letter**, and must not: `PATH` entries are
+/// joined with `std::env::join_paths`, which refuses a `:` on Unix because that
+/// is the separator there. A `C:/...` fixture passes on Windows and fails this
+/// whole test on Linux, which is the shape of failure `CLAUDE.md` warns about.
+/// The resolution never looks at a drive letter anyway.
+#[test]
+fn the_real_git_is_preferred_only_where_the_stub_layout_is_real() {
+    struct Case {
+        name: &'static str,
+        path: &'static [&'static str],
+        present: &'static [&'static str],
+        want: Option<&'static str>,
+    }
+
+    let cases = [
+        Case {
+            name: "git for windows",
+            path: &["/Windows/System32", "/Program Files/Git/cmd"],
+            present: &[
+                "/Program Files/Git/cmd/git.exe",
+                "/Program Files/Git/mingw64/bin/git.exe",
+            ],
+            want: Some("/Program Files/Git/mingw64/bin/git.exe"),
+        },
+        Case {
+            name: "32-bit git for windows",
+            path: &["/Git/cmd"],
+            present: &["/Git/cmd/git.exe", "/Git/mingw32/bin/git.exe"],
+            want: Some("/Git/mingw32/bin/git.exe"),
+        },
+        Case {
+            // A scoop shim: no `cmd` directory, so nothing to bypass.
+            name: "shim layout falls back",
+            path: &["/Users/x/scoop/shims"],
+            present: &["/Users/x/scoop/shims/git.exe"],
+            want: None,
+        },
+        Case {
+            // `cmd` on PATH but no real binary beside it — MinGit variants and
+            // partial installs. Falling back is the whole point.
+            name: "stub without a real binary falls back",
+            path: &["/MinGit/cmd"],
+            present: &["/MinGit/cmd/git.exe"],
+            want: None,
+        },
+        Case {
+            // A directory named `cmd` that is not a git install at all. Without
+            // the stub check this would adopt an unrelated binary.
+            name: "unrelated cmd directory is refused",
+            path: &["/Tools/cmd"],
+            present: &["/Tools/mingw64/bin/git.exe"],
+            want: None,
+        },
+        Case {
+            name: "a unix PATH matches nothing",
+            path: &["/usr/local/bin", "/usr/bin", "/bin"],
+            present: &["/usr/bin/git"],
+            want: None,
+        },
+        Case {
+            name: "an empty PATH matches nothing",
+            path: &[],
+            present: &[],
+            want: None,
+        },
+    ];
+
+    let mut failures = Failures::default();
+    for case in cases {
+        let joined = std::env::join_paths(case.path.iter().map(std::path::Path::new))
+            .expect("the fixture PATH entries join");
+        // Compared as slash-normalised strings: `join` produces the host's
+        // separator and the fixtures are written with one spelling.
+        let present: Vec<String> = case.present.iter().map(|p| p.to_string()).collect();
+        let got = git::real_git_beside_stub(Some(joined.as_os_str()), |p| {
+            present.contains(&p.to_string_lossy().replace('\\', "/"))
+        });
+        let got = got.map(|p| p.to_string_lossy().replace('\\', "/"));
+        failures.check(case.name, got.as_deref() == case.want, || {
+            format!("want {:?}, got {got:?}", case.want)
+        });
+    }
+    failures.assert_empty("git program resolution");
+}
+
+/// Resolved once, not once per invocation. A `PATH` walk per `git` call would
+/// give back part of what the bypass buys, and the process's own `PATH` cannot
+/// change under it.
+#[test]
+fn the_git_program_is_resolved_once_per_process() {
+    let first = git::git_program();
+    let second = git::git_program();
+    assert!(
+        std::ptr::eq(first, second),
+        "git_program returned two different values, so it is re-resolving"
+    );
+    // Whatever it resolved to has to be runnable, or every git row is empty.
+    assert!(
+        !first.as_os_str().is_empty(),
+        "the resolved program must not be empty"
+    );
+}
+
+/// The bypass against the real installation on this host, when there is one.
+/// The table above proves the rules; this proves the rules describe reality —
+/// the two fail for different reasons and a layout change would only trip this.
+#[test]
+fn the_resolved_git_runs_and_agrees_with_the_one_on_path() {
+    let resolved = git::git_program();
+    let run = |program: &std::path::Path| -> Option<String> {
+        let out = std::process::Command::new(program)
+            .args(["--version"])
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+    };
+
+    let Some(theirs) = run(std::path::Path::new("git")) else {
+        println!("skipped: no git on PATH");
+        return;
+    };
+    let ours = run(resolved)
+        .unwrap_or_else(|| panic!("the resolved program {} did not run", resolved.display()));
+    assert_eq!(
+        ours, theirs,
+        "the bypassed binary must be the same git the wrapper would have reached"
+    );
+}
+
+/// The tool must not write the repository it reads.
+///
+/// `git diff --shortstat HEAD` calls `refresh_index_quietly()`, which takes
+/// `index.lock` and rewrites `.git/index` whenever a tracked file's cached stat
+/// data has gone stale — a file touched, checked out, or rewritten with its own
+/// bytes. On a refresh every few seconds that means contending with the user's
+/// own git commands and generating filesystem events their watchers see.
+/// `--no-optional-locks` does not prevent it: `builtin/diff.c` never consults
+/// the flag, which gates `cmd_status` alone.
+///
+/// The second half is what stops this test being vacuous. It runs the exact
+/// invocation this change replaced and asserts it *does* move the index — so a
+/// staging change that quietly stopped producing a stat-dirty tree fails here
+/// rather than making the first assertion true for the wrong reason.
+#[test]
+fn a_refresh_does_not_write_the_users_index() {
+    let root = scratch_dir("git-stat-dirty");
+    let work = root.join("repo").join("work");
+    let remote = root.join("repo").join("remote.git");
+    let temp = root.join("tmp");
+    for d in [&work, &temp] {
+        std::fs::create_dir_all(d).expect("failed to create an isolated root");
+    }
+
+    let states: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_file("tests/harness/states.json"))
+            .expect("states.json is readable"),
+    )
+    .expect("states.json parses");
+    build_git_state(&states, "stat-dirty", &work, &remote);
+
+    // The state rewrites both tracked files with their own bytes, which is what
+    // moves their mtime in a real session. Inside one test that is a race: git's
+    // index stores whole seconds on Windows, and the whole staging runs inside
+    // one, so the rewrite can land on the same second `git add` recorded and
+    // read as unchanged. Moving the mtime an hour back makes the staleness
+    // certain without waiting for a clock tick.
+    let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    for name in ["README.md", "second.txt"] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(work.join(name))
+            .and_then(|f| f.set_modified(an_hour_ago))
+            .expect("failed to age a tracked file");
+    }
+
+    let index = work.join(".git").join("index");
+    let stamp = || {
+        std::fs::metadata(&index)
+            .and_then(|m| m.modified())
+            .expect("the staged repository has an index")
+    };
+    let before = stamp();
+
+    // A full refresh: no cache exists yet, so this spawns the children.
+    let clock = TestClock::at(1_767_225_600).with_mtime(&index, 1_767_225_000);
+    let reading = git::status(&clock, &inherited(&temp), &work, "stat-dirty-session")
+        .expect("a repository with an index renders a git row");
+
+    assert_eq!(
+        stamp(),
+        before,
+        "a refresh rewrote the user's .git/index — the diff call lost its \
+         `-c diff.autoRefreshIndex=false`"
+    );
+    assert_eq!(
+        (reading.insertions, reading.deletions),
+        (0, 0),
+        "files rewritten with their own bytes have no insertions or deletions; \
+         suppressing the index refresh must not change what is reported"
+    );
+    assert_eq!(reading.branch, "main", "the branch still resolves");
+
+    // The control. Without it, a staging change that stopped producing a
+    // stat-dirty tree would make the assertion above pass for the wrong reason.
+    assert!(
+        harness_git(
+            &states,
+            Some(&work),
+            &["--no-optional-locks", "diff", "--shortstat", "HEAD"],
+        ),
+        "the control invocation must succeed"
+    );
+    assert_ne!(
+        stamp(),
+        before,
+        "the control did not move the index, so this repository is not \
+         stat-dirty and the assertion above proved nothing"
+    );
+}
+
+/// A fast child is reaped without waiting for a poll tick.
+///
+/// This cannot be shown with a median. The saving is latency inside a *wait* —
+/// ~2.5 ms on average, well under the git-miss path's own noise floor — so the
+/// observable has to be the latency itself. `eof_to_reap` measures it from the
+/// moment the pipe reached EOF, which is where the child closed stdout, so it
+/// is independent of how the wait happens to be built: a loop that notices the
+/// exit on its own schedule records up to a whole poll interval no matter what
+/// it sleeps in, and one woken by the pipe records microseconds.
+///
+/// Repeated, because a single sample of a 5 ms poll lands under the threshold
+/// Two assertions, catching different failures. `woken_by_pipe` is the
+/// structural one: a loop that has gone back to sleeping between `try_wait`
+/// calls never touches the channel, so it can never set this, and reverting
+/// the wait makes the test fail on that line alone. The median latency is the
+/// quantitative one, and it is a bound rather than a knife edge -- it catches a
+/// reap that has become coarse again, as a doubling backoff from 100 us did at
+/// a median of 1.06 ms.
+///
+/// The median of nine, not the worst: this suite runs its tests in parallel, so
+/// the worst of a handful is at the mercy of whichever other test is loading
+/// the machine, while a single sample of a 5 ms poll lands under any useful
+/// threshold two times in five. Samples where the child had already exited by
+/// the first `try_wait` are excluded, because those never reached the wait.
+#[test]
+fn a_fast_child_is_reaped_without_waiting_for_a_poll_tick() {
+    // A child that prints and exits promptly, but not instantly: it has to
+    // outlive the first `try_wait` or the wait under test never happens.
+    let fresh = || {
+        #[cfg(unix)]
+        {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", "sleep 0.05; echo done"]);
+            c
+        }
+        #[cfg(windows)]
+        {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/c", "echo done"]);
+            c
+        }
+    };
+
+    let mut samples = Vec::new();
+    let mut woken = 0;
+    for _ in 0..9 {
+        let (out, wait) = git::run_bounded_observed(fresh(), std::time::Duration::from_secs(5));
+        assert!(
+            out.is_some(),
+            "the child must succeed for this to mean anything"
+        );
+        assert!(!wait.killed, "a fast child must not reach its deadline");
+        assert!(
+            wait.napped_after_drain < std::time::Duration::from_millis(5),
+            "the reap slept {:?} after EOF",
+            wait.napped_after_drain
+        );
+        // Only the probes that actually waited: a child that had already
+        // exited by the first `try_wait` never reached the wait under test.
+        samples.extend(wait.eof_to_reap);
+        woken += usize::from(wait.woken_by_pipe);
+    }
+    assert!(
+        samples.len() >= 5,
+        "only {} of 9 probes reached the wait at all, so this is measuring          process spawn rather than the reap; the fixture child is too fast",
+        samples.len()
+    );
+    samples.sort_unstable();
+    let median = samples[samples.len() / 2];
+
+    assert!(
+        woken > 0,
+        "the reap was never once woken by the pipe, so it is noticing exits on \
+         its own timeout — the wait is sleeping between `try_wait` calls again"
+    );
+    assert!(
+        median < std::time::Duration::from_millis(2),
+        "the median reap took {median:?} after the pipe had already reached EOF, which is the shape a loop noticing exits on its own schedule produces; woken by the pipe it is the process teardown alone, about 0.55 ms. All nine: {samples:?}"
+    );
+}
+
+/// A child whose descendant holds the pipe open still terminates within the
+/// drain grace, and the wait does not spin while it happens.
+///
+/// This is the case the channel exists for: killing the child closes only its
+/// own write handle, so anything it spawned that inherited stdout keeps EOF
+/// from arriving. Blocking on the channel alone would hand a two-second wait to
+/// every tick in a repository with `core.fsmonitor` enabled, which is why the
+/// poll interval survives as the wait's upper bound rather than being deleted.
+#[test]
+fn a_descendant_holding_the_pipe_does_not_outlive_the_drain_grace() {
+    #[cfg(unix)]
+    let command = {
+        let mut c = std::process::Command::new("sh");
+        // The parent exits at once; the background child inherits stdout and
+        // holds it for longer than the drain grace.
+        c.args(["-c", "sleep 3 & exit 0"]);
+        c
+    };
+    #[cfg(windows)]
+    let command = {
+        let mut c = std::process::Command::new("cmd");
+        c.args(["/c", "start /b ping -n 4 127.0.0.1 & exit 0"]);
+        c
+    };
+
+    let started = std::time::Instant::now();
+    let (_out, wait) = git::run_bounded_observed(command, std::time::Duration::from_secs(2));
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(2500),
+        "a held-open pipe took {elapsed:?}: the drain is no longer bounded by \
+         GIT_TIMEOUT plus the drain grace"
+    );
+    assert!(
+        !wait.woken_by_pipe,
+        "this fixture is supposed to hold EOF back past the child's exit; if the          pipe drained, it is no longer testing the case the interval bound exists for"
+    );
+    assert!(
+        wait.napped_after_drain.is_zero(),
+        "nothing drained, so nothing should have slept after a drain"
+    );
+}
+
+/// The process count per repo state, pinned.
+///
+/// This is the rule the concurrency change can break in total silence. Every
+/// state renders identically whether the pair runs sequentially, concurrently,
+/// or three children deep, so the case table cannot see the count move and
+/// neither can a reader. `docs/performance.md` §2 forbids a per-tick path
+/// gaining a subprocess, and two of these numbers are the accepted exception —
+/// recorded in §7, asserted here, so nobody can widen it by accident.
+#[test]
+fn the_git_child_count_is_pinned_per_repo_state() {
+    let states: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_file("tests/harness/states.json"))
+            .expect("states.json is readable"),
+    )
+    .expect("states.json parses");
+
+    let root = scratch_dir("git-child-count");
+    let temp = root.join("tmp");
+    std::fs::create_dir_all(&temp).expect("failed to create the temp root");
+
+    // `git` has to be reachable, or every count is zero and this asserts
+    // nothing at all.
+    if !harness_git(&states, None, &["--version"]) {
+        println!("skipped: no usable git on PATH");
+        return;
+    }
+
+    struct Case {
+        name: &'static str,
+        state: Option<&'static str>,
+        /// Applied after the state is built, for shapes `states.json` has no
+        /// verb for.
+        after: Option<&'static [&'static str]>,
+        want: usize,
+        why: &'static str,
+    }
+
+    let cases = [
+        Case {
+            name: "clean",
+            state: Some("clean"),
+            after: None,
+            want: 2,
+            why: "status and diff, the ordinary pair",
+        },
+        Case {
+            name: "dirty",
+            state: Some("dirty"),
+            after: None,
+            want: 2,
+            why: "status and diff, the ordinary pair",
+        },
+        Case {
+            name: "untracked-only",
+            state: Some("untracked-only"),
+            after: None,
+            want: 2,
+            why: "untracked entries still leave a branch to diff against",
+        },
+        Case {
+            name: "detached-head",
+            state: Some("detached-head"),
+            after: None,
+            want: 3,
+            why: "rev-parse is deferred until status parses, and then needed",
+        },
+        Case {
+            name: "branch-named-(detached)",
+            state: Some("clean"),
+            after: Some(&["checkout", "-b", "(detached)"]),
+            want: 3,
+            why: "git reports the same sentinel for both, so this pays the \
+                  third child too — the recorded divergence, unchanged",
+        },
+        Case {
+            name: "unborn-head-staged",
+            state: Some("unborn-head-staged"),
+            after: None,
+            // ACCEPTED EXCEPTION (docs/performance.md §7). This was one child
+            // before the pair overlapped: the branch resolves empty and the
+            // diff used to be skipped. It cannot be skipped now without
+            // draining status first, which is the whole saving.
+            want: 2,
+            why: "the diff child now runs and its result is discarded",
+        },
+    ];
+
+    let mut failures = Failures::default();
+    for case in cases {
+        let work = root.join(case.name).join("work");
+        let remote = root.join(case.name).join("remote.git");
+        std::fs::create_dir_all(&work).expect("failed to create a work tree");
+        if let Some(state) = case.state {
+            build_git_state(&states, state, &work, &remote);
+        }
+        if let Some(args) = case.after {
+            assert!(
+                harness_git(&states, Some(&work), args),
+                "the follow-up git step failed for `{}`",
+                case.name
+            );
+        }
+
+        let index = work.join(".git").join("index");
+        let clock = TestClock::at(2000).with_mtime(&index, 1000);
+        let (_reading, spawned) = git::status_observed(&clock, &inherited(&temp), &work, case.name);
+        failures.check(case.name, spawned == case.want, || {
+            format!("want {} children ({}), got {spawned}", case.want, case.why)
+        });
+    }
+
+    // Two states with no repository behind them.
+    let empty = root.join("no-index");
+    std::fs::create_dir_all(&empty).expect("failed to create an empty directory");
+    let (reading, spawned) = git::status_observed(
+        &TestClock::at(2000),
+        &inherited(&temp),
+        &empty,
+        "no-index-session",
+    );
+    failures.check("no-index", spawned == 0 && reading.is_none(), || {
+        format!("a directory with no .git/index must spawn nothing, got {spawned}")
+    });
+
+    // ACCEPTED EXCEPTION (§7): a `.git/index` with no repository behind it.
+    // Status fails, so the branch resolves empty and the diff used to be
+    // skipped; both children now run and both fail.
+    let broken = root.join("broken-repo");
+    std::fs::create_dir_all(broken.join(".git")).expect("failed to create a fake .git");
+    std::fs::write(broken.join(".git").join("index"), b"not an index")
+        .expect("failed to write a fake index");
+    let (reading, spawned) = git::status_observed(
+        &TestClock::at(2000).with_mtime(broken.join(".git").join("index"), 1000),
+        &inherited(&temp),
+        &broken,
+        "broken-session",
+    );
+    failures.check(
+        "failed-status",
+        spawned == 2 && reading.is_some_and(|r| r.branch.is_empty()),
+        || format!("want 2 children and no branch, got {spawned} children"),
+    );
+
+    // A cache hit spawns nothing. The record was just written by the `clean`
+    // case above, so this reads it back inside the TTL.
+    let work = root.join("clean").join("work");
+    let index = work.join(".git").join("index");
+    let cache = git::cache_path(&temp, "clean").expect("an ordinary session id yields a path");
+    let warm = TestClock::at(2000)
+        .with_mtime(&index, 1000)
+        .with_mtime(&cache, 1999);
+    let (reading, spawned) = git::status_observed(&warm, &inherited(&temp), &work, "clean");
+    failures.check("cache-hit", spawned == 0 && reading.is_some(), || {
+        format!("a fresh cache must spawn nothing, got {spawned}")
+    });
+
+    failures.assert_empty("git child count per repo state");
+}
+
+/// An unborn HEAD with a staged index renders no git segment even though a diff
+/// child now runs. Moving the spawn must not move the gate that consumes its
+/// result — the two are separate decisions and only one of them changed.
+#[test]
+fn an_unborn_head_renders_no_git_segment_though_its_diff_child_ran() {
+    let states: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(repo_file("tests/harness/states.json"))
+            .expect("states.json is readable"),
+    )
+    .expect("states.json parses");
+    if !harness_git(&states, None, &["--version"]) {
+        println!("skipped: no usable git on PATH");
+        return;
+    }
+
+    let root = scratch_dir("git-unborn-gate");
+    let work = root.join("work");
+    let remote = root.join("remote.git");
+    let temp = root.join("tmp");
+    for d in [&work, &temp] {
+        std::fs::create_dir_all(d).expect("failed to create an isolated root");
+    }
+    build_git_state(&states, "unborn-head-staged", &work, &remote);
+
+    let index = work.join(".git").join("index");
+    let clock = TestClock::at(2000).with_mtime(&index, 1000);
+    let (reading, spawned) = git::status_observed(&clock, &inherited(&temp), &work, "unborn");
+    let reading = reading.expect("a repository with an index reports something");
+
+    assert_eq!(spawned, 2, "both children go up before either is drained");
+    assert!(
+        reading.branch.is_empty(),
+        "an unborn HEAD renders no git segment on every platform: got {:?}",
+        reading.branch
+    );
+    assert_eq!(
+        (reading.insertions, reading.deletions),
+        (0, 0),
+        "the empty-branch gate still refuses the diff's result"
+    );
+}
+
+/// Two children spawned before either is drained cost the slower of the two,
+/// not their sum — and the deadline still kills, without taking the other child
+/// down with it.
+#[test]
+fn a_concurrent_pair_costs_the_slower_child_not_both() {
+    let sleeper = |seconds: &str| {
+        #[cfg(unix)]
+        {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", &format!("sleep {seconds}; echo done")]);
+            c
+        }
+        #[cfg(windows)]
+        {
+            // `ping -n N` sleeps N-1 seconds and prints; no interpreter needed.
+            let n = seconds.parse::<u32>().unwrap_or(1) + 1;
+            let mut c = std::process::Command::new("ping");
+            c.args(["-n", &n.to_string(), "127.0.0.1"]);
+            c
+        }
+    };
+
+    // Both up first, then both drained against one deadline.
+    let started = std::time::Instant::now();
+    let a = git::spawn_bounded(sleeper("1")).expect("the first child spawns");
+    let b = git::spawn_bounded(sleeper("1")).expect("the second child spawns");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let (first, _) = git::collect_bounded(a, deadline);
+    let (second, _) = git::collect_bounded(b, deadline);
+    let elapsed = started.elapsed();
+
+    assert!(first.is_some() && second.is_some(), "both children succeed");
+    assert!(
+        elapsed < std::time::Duration::from_millis(1800),
+        "two one-second children took {elapsed:?}: that is their sum, so they \
+         are not actually overlapping"
+    );
+
+    // A child past the shared deadline is killed; one that already finished is
+    // still collected, because the loop tries the child before the clock.
+    let slow = git::spawn_bounded(sleeper("5")).expect("the slow child spawns");
+    let fast = git::spawn_bounded(sleeper("1")).expect("the fast child spawns");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    let (slow_out, slow_wait) = git::collect_bounded(slow, deadline);
+    let (fast_out, fast_wait) = git::collect_bounded(fast, deadline);
+
+    assert!(
+        slow_out.is_none() && slow_wait.killed,
+        "the slow child is killed"
+    );
+    assert!(
+        fast_out.is_some() && !fast_wait.killed,
+        "a child that finished before the deadline must still be collected, \
+         even though the deadline has since passed on the other one"
     );
 }
 
@@ -6414,11 +8084,11 @@ fn an_unchanged_agent_transcript_is_not_rescanned() {
     assert_eq!(first.len(), 1, "the agent is read on the first tick");
     assert_eq!(first[0].used, 42);
 
-    // Rewritten with contradictory content but the SAME mtime. A tick that
-    // still reads the file would report the new number; one honouring the
-    // record reports the old one. Asserting the stale value is the only way to
-    // prove the read was skipped -- a correct token count would be produced by
-    // both the skipping and the non-skipping implementation.
+    // Same mtime, DIFFERENT size. Until 2026-09-21 this tier keyed on mtime
+    // alone, which is strictly weaker than the main transcript's `(mtime,
+    // size)` and exposed to the documented Windows behaviour where a writer's
+    // mtime does not move until its handle closes -- an agent appending
+    // through an open handle was read once and then never again.
     std::fs::write(
         &agent,
         concat!(
@@ -6430,9 +8100,167 @@ fn an_unchanged_agent_transcript_is_not_rescanned() {
 
     let second = run(10_001);
     assert_eq!(
-        second[0].used, 42,
-        "an unchanged mtime serves the stored record instead of re-reading"
+        second[0].used, 999,
+        "a size change at an unchanged mtime must be seen: that is the whole \
+         reason size joined the key"
     );
+
+    // Same mtime AND the same size, contradictory content. This is still
+    // invisible, exactly as it is for the main transcript: `(mtime, size)` is
+    // the freshness signal and a same-length rewrite defeats it. Asserting the
+    // stale value is the only way to prove the read was skipped -- a correct
+    // token count would be produced by both the skipping and the non-skipping
+    // implementation.
+    std::fs::write(
+        &agent,
+        concat!(
+            r#"{"type":"assistant","message":{"stop_reason":"tool_use","model":"claude-sonnet-5","usage":{"input_tokens":111}}}"#,
+            "\n"
+        ),
+    )
+    .expect("failed to rewrite the agent transcript at the same length");
+
+    let third = run(10_002);
+    assert_eq!(
+        third[0].used, 999,
+        "an unchanged (mtime, size) serves the stored record instead of \
+         re-reading: the documented cost of skipping, not a bug to fix silently"
+    );
+}
+
+/// The reverse scan reports what a forward one would, on every shape that
+/// matters.
+///
+/// `read_agent` keeps only the last assistant entry, so it used to JSON-parse
+/// every line of every agent transcript in order to throw all but one away.
+/// Scanning from the end returns at the first one it finds — but "the last
+/// assistant entry" and "the first one from the end" are only the same thing
+/// while the skipping rules stay symmetric, and the torn tail is exactly where
+/// they could stop being.
+#[test]
+fn the_agent_reverse_scan_agrees_with_a_forward_one() {
+    /// The pass this replaced, kept here as the oracle rather than in `src/`.
+    fn forward(bytes: &[u8]) -> (String, u64, String) {
+        let mut out = (String::new(), 0u64, String::new());
+        for line in bytes.split(|b| *b == b'\n') {
+            let Ok(text) = std::str::from_utf8(line) else {
+                continue;
+            };
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+                continue;
+            };
+            if value.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
+                continue;
+            }
+            let message = value.get("message");
+            let usage = message.and_then(|m| m.get("usage"));
+            out = (
+                message
+                    .and_then(|m| m.get("stop_reason"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                usage
+                    .and_then(|u| u.get("input_tokens"))
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                message
+                    .and_then(|m| m.get("model"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            );
+        }
+        out
+    }
+
+    let entry = |tokens: u64, stop: &str| {
+        format!(
+            r#"{{"type":"assistant","message":{{"stop_reason":"{stop}","model":"claude-sonnet-5","usage":{{"input_tokens":{tokens}}}}}}}"#
+        )
+    };
+    let user = r#"{"type":"user","message":{"content":"hello"}}"#.to_string();
+
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("empty", Vec::new()),
+        ("only a newline", b"\n".to_vec()),
+        (
+            "no assistant entry",
+            format!("{user}\n{user}\n").into_bytes(),
+        ),
+        (
+            "one entry, newline-terminated",
+            format!("{}\n", entry(42, "tool_use")).into_bytes(),
+        ),
+        (
+            "one entry, no trailing newline",
+            entry(42, "tool_use").into_bytes(),
+        ),
+        (
+            "several entries",
+            format!(
+                "{}\n{user}\n{}\n{}\n",
+                entry(1, "tool_use"),
+                entry(2, "tool_use"),
+                entry(420, "end_turn")
+            )
+            .into_bytes(),
+        ),
+        (
+            // The case that makes this test worth writing: the last line is
+            // half-written, so both directions must fall back to the one
+            // before it — forwards by never reaching it, backwards by
+            // skipping it.
+            "torn final line",
+            format!(
+                "{}\n{}\n{}",
+                entry(1, "tool_use"),
+                entry(420, "end_turn"),
+                &entry(9, "x")[..40]
+            )
+            .into_bytes(),
+        ),
+        (
+            "torn line in the middle",
+            format!(
+                "{}\n{{\"type\":\"assi\n{}\n",
+                entry(1, "tool_use"),
+                entry(420, "end_turn")
+            )
+            .into_bytes(),
+        ),
+        (
+            "trailing blank lines",
+            format!("{}\n\n\n", entry(420, "end_turn")).into_bytes(),
+        ),
+        ("invalid utf-8 tail", {
+            let mut v = format!("{}\n", entry(420, "end_turn")).into_bytes();
+            v.extend_from_slice(&[0xff, 0xfe, 0xfd]);
+            v
+        }),
+    ];
+
+    let mut failures = Failures::default();
+    for (name, bytes) in cases {
+        let got = subagent::read_agent(&bytes);
+        let want = forward(&bytes);
+        let got = (got.stop_reason.clone(), got.input_tokens, got.model.clone());
+        failures.check(name, got == want, || {
+            format!("reverse scan gave {got:?}, a forward one gives {want:?}")
+        });
+    }
+
+    // The pinned fixture too, so this is not only synthetic.
+    let pinned = transcript_input("transcript.jsonl");
+    let got = subagent::read_agent(&pinned);
+    let want = forward(&pinned);
+    failures.check(
+        "pinned transcript input",
+        (got.stop_reason.clone(), got.input_tokens, got.model.clone()) == want,
+        || "reverse scan disagrees with a forward one on the pinned input".to_string(),
+    );
+
+    failures.assert_empty("agent reverse scan");
 }
 
 #[test]

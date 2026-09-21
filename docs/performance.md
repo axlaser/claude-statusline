@@ -97,18 +97,41 @@ process per tick, so measurements must too.
   version it came from. Rows without one are unusable as baselines.
 - **Measure both the warm and the cold state.** A warm-only pair flatters whichever variant
   caches more; the script's output cache was keyed on a 5-second bucket, so a whole run
-  finished inside one and most of its probes rendered nothing at all. `measure.sh` and
-  `measure.ps1` take `--cold-cache` / `-ColdCache` for this.
+  finished inside one and most of its probes rendered nothing at all. `measure-pair.sh` /
+  `measure-pair.ps1` take `--mode` / `-Mode`, which selects between `warm`, `git-miss` and
+  `cold` rather than offering one switch.
 - **Guard every probe with a proof of work.** A probe that silently no-opped reads as a
   spectacular speed-up: that guard is what caught a measurement of an unimplemented
   subcommand, and on 2026-09-21 it caught a `cmd.exe` quoting bug that made a 188 ms tick
   read as 14.6 ms. Assert the box rendered (`┏` and the model name), or that the handler
   wrote its file, before believing any median.
-- **`tests/harness/measure.sh` / `measure.ps1` implement every rule above but no longer
-  run** — they pair against the script trees deleted at `1f5acf2`, and `measure-pair.ps1`
-  only accepts a pair that straddles the version-segment change. Until a replacement
-  exists, measure the subcommand directly and carry the rules above by hand. See the note
-  at the end of §6.
+- **`tests/harness/measure-pair.sh` / `measure-pair.ps1` implement every rule above** and
+  are the only measurement drivers. They pair two builds of *this crate*, stage a real
+  `.git` from `states.json`, spawn the binary directly, and take the proof-of-work
+  assertion as a parameter. Their `--self-test` mode is run by `cargo test`, because their
+  predecessors rotted into unrunnable shape and nothing noticed for two months.
+- **The host's own process floor drifts, so only deltas survive.** On 2026-09-21 the
+  maintainer's machine measured a 9.6 ms bare-process floor in the morning and ~18–20 ms
+  the same evening — `hostname.exe`, which does nothing, cost 20.5 ms in the second
+  sitting. Absolute rows are comparable only within one sitting; an interleaved pair is
+  immune, which is the whole reason interleaving is mandatory rather than advised.
+- **Establish the noise floor in the same sitting, do not quote one.** Run the before
+  binary against a copy of itself through the same driver, same run count. On 2026-09-21
+  that control came back at +0.35 ms on the git-miss path and ±0.02 ms on the cold path
+  over 21 interleaved pairs, which retired a long-standing "anything under 5 ms here is
+  noise" rule of thumb that had been inherited from a by-hand probe and was costing real
+  findings.
+- **Give each variant its own state root when a stored format changes.** The drivers do
+  this by default now, per-child rather than per-driver. Two builds sharing one `TEMP`
+  reject each other's records the moment a field list or a `RECORD_VERSION` differs, so
+  every probe on both sides measures a miss — it read as −41.94 ms on a *warm* tick once,
+  a path where nothing had moved. See "The agent transcript is scanned backwards" in §7.
+- **An identical-binary control measures the machine, not the method.** Two builds that
+  differ by any code at all differ in code layout too, and under whole-crate LTO that was
+  worth **+3.4 ms on the cold tick** for a change whose mechanism could not account for
+  0.02 ms — see "Caching the process owner" in §7. Below about 1 ms, a paired median is
+  necessary and not sufficient: price the mechanism as well, or the layout lottery will
+  hand you a finding in whichever direction it feels like.
 - **Bash on Git Bash: process counts are portable, milliseconds are not** (emulated fork is
   ~20–50× a real one). This applied to the scripts; it still applies to anything measured
   through an MSYS shell.
@@ -186,6 +209,16 @@ observed fresh/stale outcome, not only the rendered bytes — see
   reads as never-notified, so a session already over threshold re-fires its context or rate
   alert once. Accepted rather than migrated: a sweep would add a delete path over
   predictable names in a shared directory, which is the surface the guards exist for.
+- *2026-09-21:* a user who upgrades mid-session abandons that session's token record and
+  its per-agent records, because both formats gained fields — the token record is `v5` and
+  the per-agent record is nine fields — and the parsers reject any record whose count or
+  version differs rather than guessing at a missing one. Two effects, both one tick and both
+  self-correcting, and both already on this list from the 2026-08-02 change: the token
+  record reads as absent, so the next tick's deltas compute against zero and the four
+  buckets render their totals as one large `(+N)`; and the fallback tier re-reads each agent
+  transcript once. Rejecting is the safe direction — the alternative is reading a `v4`
+  record's thirteen fields as a `v5` record's eighteen, which is a wrong number rather than
+  a missing one.
 - *2026-08-03:* two number formats gain a tier the scripts never had, both for the same
   reason — the scripts predate the magnitudes. `format_tokens` gains `B`, so a cumulative
   count past a billion renders `1.23B` where it used to render `1000.0M`; the ladder exists
@@ -245,6 +278,35 @@ observed fresh/stale outcome, not only the rendered bytes — see
   `a_hostile_changelog_target_is_refused_not_followed` for the guard, which every other
   guarded read in the crate already has.
 
+### Accepted divergence: `Bash` no longer invalidates the git cache — 2026-09-21
+
+The PostToolUse hook fired for `Edit`, `Write`, `MultiEdit`, `Bash` and `NotebookEdit`, and
+deleted the git cache for each. Measured across 85 recent sessions and 19.8 h of active
+time, **`Bash` was 2,109 of the 2,849 invalidating calls — 74% of them, and just over half
+of every tool call made.** Every `ls`, every `grep`, every `cargo test` cost the next tick a
+full git miss.
+
+It is dropped from both the handler's list and the matcher an install writes. What this
+changes, precisely:
+
+- A shell command that touches `.git/index` — `git commit`, `git add`, `git checkout` — is
+  **still seen on the very next tick**, because the cache is keyed on that file's mtime and
+  the key does not care what moved it.
+- A shell command that alters only untracked or worktree state — `touch new-file`,
+  `sed -i` on a tracked file — is seen **within the 5 s TTL** rather than immediately. That
+  is the divergence, and it is the same staleness bound the TTL already provides for
+  `git fetch`, which nothing observes either.
+
+Rejected alternatives: marking the cache stale instead of deleting it saves nothing,
+because deletion already coalesces; and reading the payload's `tool_input.command` to tell
+`git commit` from `ls` adds parsing to a path that runs after every tool call, and replaces
+one guess with another.
+
+An install made before this still carries the old matcher in its `settings.json`, so the
+hook keeps running after every shell call and finds nothing to do — which is what it costs
+today. The saving lands without a reinstall, because it comes from the cache not being
+deleted rather than from the hook not running.
+
 ## 5. PR checklist for hot-path changes
 
 - [ ] Subprocess delta stated. `git` is the only one that should appear.
@@ -287,31 +349,54 @@ numbers are MSYS shape-only and were never a milliseconds claim).
 | bash forks, six-row subagent render | 39 |
 | Interpreter floor (`powershell.exe -NoProfile`, empty script) | ~124 ms |
 
-### Current — the binary (2026-09-21, `3f5f919`)
+### Current — the binary (2026-09-21, after the per-tick cost work)
 
-**These are the live reference.** Read them, not the 2026-07-27 pairs below, as the
-baseline a change must not regress. Release build, rustc 1.97.1, git 2.48.1. Median of 15
-fresh processes per probe, isolated `HOME`/`TEMP`, `STATUSLINE_DEBUG` cleared, 8 MB
-generated transcript, proof-of-work guard on every row.
+**These are the live reference.** Read them, not the 2026-07-27 pairs below, as the baseline
+a change must not regress. Release build with LTO, rustc 1.97.1, git 2.48.1. Median of 21
+fresh processes per probe through `tests/harness/measure-pair.*`, isolated `HOME`/`TEMP`,
+one state root per variant, `STATUSLINE_DEBUG` cleared, 8 MB generated transcript, a real
+`.git` in the `dirty` state, proof-of-work guard on every row.
 
 | Tick shape | Windows 11 26200 (*maintainer machine*) | `rust:latest` container on WSL2, same box (*not bare metal, not a runner*) |
 |---|---|---|
-| Floor — malformed or empty input | 9.6 ms | ~1.1 ms |
-| Warm — nothing changed since the last tick | 11.3 ms | 1.4 ms |
-| Git TTL expired — the tick after a >5s pause | 132 ms | 22.7 ms |
-| Cold — a new message *and* a git miss | 187 ms | 79.3 ms |
-| `subagent` | 11.2 ms | 1.3 ms |
-| `git-refresh` | 9.6 ms | 1.1 ms |
-| `self-check` | 9.6 ms | 1.2 ms |
+| Floor — malformed or empty input | 18.2 ms | 0.74 ms |
+| Warm — nothing changed since the last tick | 19.4 ms | 1.30 ms |
+| **After a new message** — the transcript grew | **25.0 ms** | **1.49 ms** |
+| **Git TTL expired** — the tick after a >5 s pause | **61.1 ms** | **2.99 ms** |
+| Cold — a full transcript read *and* a git miss | 116.4 ms | 59.7 ms |
+| `subagent` | 19.5 ms | 0.86 ms |
+| `git-refresh` | 18.3 ms | 0.75 ms |
+| `self-check` | 17.8 ms | 0.74 ms |
 
-Attribution on Windows from the same run: process plus the five entry layers 9.7 ms,
-render and state I/O ~1.6 ms, transcript scan 57 ms at 8 MB, and the `git` pair 121 ms as
-the tick pays it — 92.3 ms for the two children timed alone, ~30 ms more for the parent to
-spawn and drain them.
+**Read the Windows column against its own floor, not against the previous table.** A bare
+`hostname.exe` — a program that prints one line — measured **22.5 ms** in this same sitting,
+and `/bin/true` measured 0.56 ms in the container. The rows above were taken hours after the
+morning's, on the same machine, where the same bare-process floor was 9.6 ms. Nothing in the
+binary accounts for that; process creation on this host simply costs about twice as much in
+the evening as it did in the morning. **Every absolute number here is only comparable within
+one sitting**, which is why §3 mandates interleaving and why every claim in §7 is a paired
+delta rather than a difference of two tables.
 
-**Cold is not a once-per-session cost.** The scan is skipped only while `(mtime, size)` are
-unchanged, and every new message appends to the transcript, so the next tick rescans the
-whole file. Transcript scan, cold, no `.git`, Windows — linear at **~6.8 ms/MB**:
+Against the morning's measurements of the same work, the two ticks the plan set out to cut:
+
+| Tick shape | Before (2026-09-21, `3f5f919`) | After | Windows delta |
+|---|---|---|---|
+| Git TTL expired | 123.1 ms | 61.1 ms | **−50%** |
+| After a new message, 8 MB | 76.1 ms | 25.0 ms | **−67%** |
+
+Both measured as interleaved pairs in a single sitting — see §7 for the per-change
+attribution, which is where those percentages come from. The same two on Linux, also
+interleaved: the git-miss tick 22.7 → 3.0 ms, and the post-message tick 57.4 → 1.6 ms, where
+removing the poll interval matters more than anywhere because the children are fast enough
+that the *wait* dominated them.
+
+**"Cold" is no longer the common case, and that is the point.** The transcript scan used to
+run on every new message, because the skip held only while `(mtime, size)` were unchanged.
+It now resumes from a stored offset, so the ordinary post-message tick is the 25.0 / 1.5 ms
+row rather than the 116 / 60 ms one. A full read still happens: at session start, after a
+rewrite, and once every 64 resumes or 4 MB of growth, which is the ceiling that keeps a
+wrong offset from living forever. Transcript scan, cold, no `.git`, Windows — linear at
+**~6.8 ms/MB**:
 
 | Transcript | 0.5 MB | 1 MB | 2 MB | 4 MB | 8 MB | 16 MB | 32 MB |
 |---|---|---|---|---|---|---|---|
@@ -320,22 +405,16 @@ whole file. Transcript scan, cold, no `.git`, Windows — linear at **~6.8 ms/MB
 Linux scans the same 8 MB in 56 ms, within noise of Windows' 57 ms: the scan is CPU work
 and does not care which OS runs it, while process creation and `git` very much do. **That
 inverts which cost dominates** — `git` on Windows, the transcript on Linux — so §1's
-ordering describes Windows only.
+ordering describes Windows only, and it is why the transcript work was the half of this
+that moved Linux.
 
-**The Windows rows in the 2026-07-27 pairs below carry a `cmd.exe`.** `measure.ps1` times
-`& cmd.exe /c $CommandLine`, so every Windows binary figure there includes a shell the
-status line never spawns: measured 2026-09-21 at **+15.2 ms warm and +16.2 ms cold**
-against a bare `cmd /c rem` floor of 12.7 ms. That is most of the distance between the
-22.1 ms warm pair below and the 11.3 ms recorded above. Those pairs remain the only
-side-by-side against the scripts that will ever exist, which is why they are kept — but
-they are provenance, not a baseline.
-
-**No measurement script runs against this tree.** `measure.ps1` and `measure.sh` pair
-against the script trees deleted at `1f5acf2` and abort on a missing-file check;
-`measure-pair.ps1` asserts a version segment only one specific change introduces, so it
-refuses any other pair. Until one is written, measure the subcommand directly per §3 —
-fresh process per probe, median of ≥ 7, isolated profile and temp, warm and cold, host
-class recorded.
+**The measurement drivers now run.** `measure-pair.sh` and `measure-pair.ps1` pair two
+builds of this crate — interleaved, one fresh process per probe, isolated profile and
+temp, a real `.git` staged from `states.json`, and a parameterised proof of work. The
+script-vs-binary drivers they replaced (`measure.sh`, `measure.ps1`) are deleted: they
+paired against the script trees removed at `1f5acf2` and aborted on a missing-file check.
+The rows above were taken by hand before those drivers existed; re-taking any of them
+means re-taking all of them in one sitting, because the floor drifts (§3).
 
 ### Paired medians — script vs. binary (2026-07-27)
 
@@ -345,7 +424,7 @@ process per probe, on a single host with the runs interleaved, and recorded
 before that component's scripts are deleted — after deletion the script half can
 never be measured again.
 
-Produced by `tests/harness/measure.sh` and `measure.ps1`: 11 interleaved pairs
+Produced by the since-deleted `tests/harness/measure.sh` and `measure.ps1`: 11 interleaved pairs
 per host, payload `tests/harness/payloads/tasks-feed.json`, isolated
 `HOME`/`TEMP`, `STATUSLINE_DEBUG` cleared so neither variant is charged for a log
 append the other skips.
@@ -575,6 +654,122 @@ Reopen condition: a transcript large enough that a full parse becomes visible
 next to the ~124 ms interpreter floor the migration removes — on this hardware
 that is somewhere north of 25 MB.
 
+**Reopened and reversed on 2026-09-21** — see "The transcript scan resumes from a stored
+offset" below. Not because the 25 MB threshold was crossed, which it was not, but because
+two things this entry assumed stopped being true: the interpreter floor it measured against
+no longer exists, and the scan turned out to run on every new message rather than once per
+session. Read that entry, not this one, for what ships.
+
+### The transcript scan resumes from a stored offset — 2026-09-21
+
+Reverses "Incremental transcript parser — deleted in the Rust port" above. That entry set a
+reopen condition of "a transcript large enough that a full parse becomes visible next to
+the ~124 ms interpreter floor — north of 25 MB", and **that threshold was never crossed**:
+at 8 MB the scan is ~57 ms. The evidence changed instead, in two ways the entry could not
+have known:
+
+- **The floor it measured against no longer exists.** The ~124 ms PowerShell startup that
+  made a 57 ms scan invisible went with the scripts. Against an 11 ms warm tick the same
+  scan is the tick.
+- **It runs on every new message, not once per session.** The skip holds only while
+  `(mtime, size)` are unchanged, and every message appends. The entry priced the cost's
+  size correctly and its *frequency* not at all.
+
+On Linux the scan is the single largest per-tick cost at any size — 56 ms at 8 MB, within
+noise of Windows' 57, because it is CPU work — so this is the half of the plan that moves
+the platform where `git` is cheap.
+
+| Tick shape, 8 MB transcript | Before | After | Delta |
+|---|---|---|---|
+| **The tick after a new message** | 76.05 ms | 25.14 ms | **−50.91 ms (−66.9%)** |
+| Warm | 19.23 ms | 19.16 ms | −0.06 ms |
+| Git TTL expired | 59.85 ms | 59.61 ms | −0.24 ms |
+
+And on Linux, where the scan is the whole tick, measured the same way in a `rust:latest`
+container on WSL2 against a build with the resume gate forced off:
+
+| Tick shape, 8 MB transcript | Before | After | Delta |
+|---|---|---|---|
+| **The tick after a new message** | 57.38 ms | 1.60 ms | **−55.78 ms (−97.2%)** |
+| Warm | 1.36 ms | 1.35 ms | −0.01 ms |
+
+21 interleaved pairs on each platform, against a ±0.10 ms identical-binary control. The
+`append` tick shape was added to the drivers for this: every existing mode either changed
+nothing or cleared the token record, and clearing the record measures the full read the
+resume exists to avoid. The two ticks were being conflated.
+
+**Three tiers where there were two.** The `(mtime, size)` skip is tested first and is
+unchanged. The resume sits beneath it. Every gate that fails falls through to the full read
+— a correct-but-slower recompute — never to a wrong answer, and each carries a named reason
+into the debug log.
+
+**What the design turns on, in the order it bites:**
+
+- **Identity is size-plus-content, never inode.** The positional-read and file-index APIs
+  are platform-split in std (the Windows half is still nightly), so an inode identity would
+  force conditional code outside the four permitted areas; the log-shipping field moved away
+  from inode identity independently, for reliability.
+- **Resume only when the file *strictly* grew** — `size <= stored` falls through, not
+  `size <`. A same-size rewrite has an empty tail, so a resume would re-display stale totals
+  *and* rewrite the record with the new mtime, after which the cheap skip hits forever. That
+  is the one case in this change that would convert a self-healing divergence into a
+  permanent one.
+- **A boundary anchor as well as a head checksum.** A head checksum cannot see a rewrite
+  that preserves the first 4 KB and changes the middle, and unlike today's divergence that
+  error never self-heals, because every later tick resumes from the poisoned record. The
+  byte before the offset must be a newline; it costs one read at an offset already sought.
+- **Exactly 4096 bytes of head, always, with a 64 KB floor below which nothing resumes.** A
+  checksum over `min(4096, size)` covers a different span as a young file grows past 4 KB,
+  so a naive comparison mismatches on a pure append and rescans every tick until the file
+  passes 4 KB — a silent hit-rate bug of the class byte-diffing cannot see. Storing the
+  covered length would fix it; the floor *deletes* it, and what it gives up is avoiding a
+  full scan of a file under 4 KB, which at ~6.8 ms/MB is 0.03 ms.
+- **Keyed on the transcript path as well as the session id.** The record path is derived
+  from the id alone, so one session pointed at a new file would apply the old file's offset
+  to it — and two transcripts of one session can share an identical opening, which defeats
+  the head checksum exactly where it is needed. Stored as a **digest**, never the path: the
+  record is one pipe-separated line, every other field is numeric or boolean, and a path
+  containing a pipe would split into too many fields and make the record permanently
+  unreadable.
+- **A ceiling: a full read after 64 consecutive resumes or 4 MB of growth.** The entry gates
+  reduce the probability of a poisoned offset but cannot bound its lifetime, and the anchor
+  is probabilistic — in JSONL roughly one byte per line is a newline. Every other
+  degradation in this project self-heals on the next tick; this restores that property, at
+  about 0.9 ms per tick amortised on 8 MB. **The residual risk is stated rather than wished
+  away:** a file truncated below the offset and regrown past the stored size, with no tick
+  in between to observe the short file, is indistinguishable from an append by size alone.
+  If it also opens with the same 4 KB and carries a newline at the old offset, it resumes
+  across the gap and is wrong until the ceiling fires. That window is what the ceiling is
+  for, and `the_resume_decision_table_holds_every_gate` has a row that says so.
+- **The idle verdict is seeded from the record, not from the hardcoded default.** The
+  commonest appended chunk in an active session is a single tool-result line, which does not
+  vote. With the default, the model row flips to ready mid-tool-call — and the skip path
+  then re-displays that wrong verdict on every following tick.
+- **The checksum is hand-rolled FNV-1a, and adds no dependency.** Nothing in std is safe to
+  persist: `DefaultHasher`'s algorithm is explicitly not stable across releases, so a stored
+  value would silently change meaning on a toolchain upgrade — an unversioned format change
+  `RECORD_VERSION` cannot catch.
+- **The tail is scanned with its own length as the sampled size.** `Scan.consumed` is a
+  record boundary only when that parameter equals the bytes actually handed in; passing the
+  whole file's size would make the torn-tail gate unreachable and fold a partial line into
+  the stored totals.
+
+**How it is kept honest.** Every tier degrades to a correct render, so the suite cannot lean
+on output. `the_resume_decision_table_holds_every_gate` drives the pure decision over
+nineteen states with no filesystem at all;
+`a_split_scan_equals_a_whole_scan_at_every_boundary` asserts that a head scan plus a tail
+scan equals a whole scan at *every* record boundary of both pinned fixtures, including the
+astral-plane one, which is the single test that catches an off-by-one in either direction;
+and `each_transcript_tier_announces_itself_in_the_debug_log` runs the real binary out of
+process and asserts the skip line, the resume line, and the named fall-through — the skip
+had a behavioural pin since it was written but never an assertion on its line. Disabling
+the resume makes two of these fail.
+
+**`RECORD_VERSION` is `v5`,** and an upgrade costs one tick of divergence: new fields change
+the field list, the parser rejects any record whose count or version differs, so a `v4`
+record reads as *absent* and the next tick renders the four buckets as one large `(+N)`.
+§4 already accepts this exact divergence from the 2026-08-02 change.
+
 ### Bounded git child and drained stdout — 2026-07-28
 
 `read_from_git` stopped calling `Command::output()`. It now spawns, drains stdout on a
@@ -592,6 +787,11 @@ Two costs added, both bounded and neither on the common path:
 - **A 5 ms poll interval.** Adds up to 5 ms of latency to detecting an exit that has
   already happened. Against a ~74 ms subprocess pair on the maintainer's machine that is
   under 7% of the cost it is measuring, and it is latency in the *wait*, not extra work.
+
+The poll interval was removed on 2026-09-21; see "The git wait blocks on the pipe instead
+of polling" below. The worst-case claim below is also corrected there and under "The status
+and diff children overlap": 2.25 s is the bound per *invocation*, and the tick pays it once
+per child.
 
 `reader.join()` was replaced by a channel `recv_timeout`. Joining was unbounded in exactly
 the case the deadline exists for: killing the child closes only the child's handle on the
@@ -737,6 +937,11 @@ Reopen condition: **met and closed, 2026-09-21.** Both halves of the conjunction
 measured — the temp root negatively, twice, and `.git` positively — and §6 records the
 result. The statusline medians no longer describe a best case.
 
+The mechanism gap is closed too: `measure.sh` / `measure.ps1` are deleted, and their
+replacements stage a real `.git` from `states.json` on every run — `dirty` by default, any
+state by name. A driver that measures no git is no longer something anyone can reach for
+by accident.
+
 ### Click-to-focus capture runs on the alert path only — 2026-09-20
 
 Recorded because the feature added a state file, a second executable, a DLL import and a
@@ -811,15 +1016,16 @@ machine:
 The third one ships. What it costs, measured rather than assumed — produced by
 `tests/harness/measure-pair.ps1`, which was added for this change and is named here
 because §3 requires a paired measurement to say which tool made it. It is **not**
-`measure.sh` / `measure.ps1`: those pair a runtime script against the binary that replaced
-it, which is the migration's question, and they cannot run at all now that the script
-trees are deleted (`measure.sh:104-108`). Answering "did this commit make the binary
-slower" needs two builds of this crate, which that pair has no mode for. The new driver
-takes `tests/harness/payloads/full-with-version.json` — `full.json` plus the top-level
-`version` field, which is what gates the changelog read — and refuses to report a number
-until it has seen the after-binary actually render the version segment. Without that field
-the gate in `update::available` returns before the file is opened and the pair would time
-the same code twice; no other committed payload carries it.
+`measure.sh` / `measure.ps1`: those paired a runtime script against the binary that
+replaced it, which is the migration's question, and they could not run at all once the
+script trees were deleted; they have since been removed. Answering "did this commit make
+the binary slower" needs two builds of this crate, which that pair had no mode for. The
+driver takes `tests/harness/payloads/full-with-version.json` — `full.json` plus the
+top-level `version` field, which is what gates the changelog read — and refuses to report
+a number until it has seen the after-binary actually render the version segment. Without
+that field the gate in `update::available` returns before the file is opened and the pair
+would time the same code twice; no other committed payload carries it. That assertion is
+now `-ProofAfterOnly`, a parameter, rather than the driver's only reason to exist.
 
 15 interleaved pairs per mode, one fresh process per probe, isolated `USERPROFILE`/`TEMP`,
 a 753 KB changelog and a 568 KB transcript staged into them, maintainer machine
@@ -934,35 +1140,331 @@ the focus record needs, so the gate parses nothing that was not parsed before, a
 here touches a per-tick path. A silenced stop also skips the focus capture, since the
 capture exists for a click on a toast that is never raised.
 
-### The git-miss path costs ~9 ms more than it did at `eb56345` — 2026-09-21, open
+### The diff call rewrote the user's index — fixed 2026-09-21
 
-Found by A/B-ing the binary that produced §6's original medians against `3f5f919`. Both
-built release from the same toolchain, measured on the maintainer's machine, one fresh
-process per probe, median of 15, 8 MB transcript, sequential rather than interleaved:
+Found while measuring, not while looking for it. `git diff --shortstat HEAD` calls
+`refresh_index_quietly()`, which takes `index.lock` and rewrites `.git/index` whenever a
+tracked file's cached stat data has gone stale — a file touched, checked out, or rewritten
+with its own bytes. At a refresh every few seconds that means this tool was contending for
+a lock in a repository its user was working in, and generating filesystem events their
+watchers could see.
 
-| Row | `eb56345` | `3f5f919` | Delta |
+`--no-optional-locks` does **not** cover it. The flag gates `cmd_status` alone;
+`builtin/diff.c` never consults it. Measured directly in a scratch clone with two
+stat-dirty tracked files, index mtime before and after:
+
+| Invocation | `.git/index` |
+|---|---|
+| `--no-optional-locks diff --shortstat HEAD` | rewritten |
+| `GIT_OPTIONAL_LOCKS=0 diff --shortstat HEAD` | rewritten |
+| `-c diff.autoRefreshIndex=false diff --shortstat HEAD` | **untouched** |
+
+So the env-var spelling several projects adopted for this does not fix this path. The flag
+ships; `-c` is override-only and writes nothing to disk. Rendered insertions and deletions
+are unchanged in every state, including a genuinely dirty tree, and the cost is inside the
+noise floor: **+0.66 ms on the git-miss tick (+0.5%)**, 15 interleaved pairs, maintainer
+machine, against a `stat-dirty` state now in `states.json`.
+
+`a_refresh_does_not_write_the_users_index` asserts it, and asserts the inverse in the same
+test: it runs the invocation this replaced and requires that one *to* move the index, so a
+staging change that stopped producing a stat-dirty tree fails rather than making the first
+assertion true for the wrong reason.
+
+### The `git` wrapper is bypassed on Windows — 2026-09-21
+
+`PATH` on Windows resolves `git` to `C:\Program Files\Git\cmd\git.exe`, a 46 KB stub whose
+only job is to set `MSYSTEM` and spawn the 4.2 MB binary in `mingw64\bin`. Every call paid
+for a process and a `PATH` search that produced nothing.
+
+Resolved once per process, by walking `PATH` for a directory named `cmd` that holds a
+`git.exe` with a `mingw64\bin\git.exe` or `mingw32\bin\git.exe` beside it. The fallback to
+`git` on `PATH` is unconditional: portable, MinGit, scoop and package-manager layouts
+differ, and an absent absolute path must degrade to the previous behaviour, never to a
+missing git row.
+
+| Tick shape | Before | After | Delta |
 |---|---|---|---|
-| Warm, no `.git` | 11.4 ms | 10.9 ms | −0.5 ms |
-| Warm, real `.git` | 11.4 ms | 11.4 ms | 0 |
-| Cold, no `.git` | 67.3 ms | 66.6 ms | −0.7 ms |
-| Cold, real `.git` | 182.0 ms | 191.0 ms | **+9.0 ms (+4.9%)** |
-| Git TTL expired | 130.6 ms | 140.0 ms | **+9.4 ms (+7.2%)** |
+| Warm | 19.43 ms | 19.69 ms | +0.26 ms (noise) |
+| Git TTL expired | 123.72 ms | 96.26 ms | **−27.46 ms (−22.2%)** |
 
-The warm tick has not regressed, and neither has the transcript scan. The cost is
-**confined to the rows where `git` actually runs**, which rules out the state directory:
-that is resolved on every tick including warm ones, and the warm rows show zero delta.
-Both binaries were confirmed during the run to take their documented storage paths —
-`eb56345` wrote flat, `3f5f919` wrote the state directory — so the comparison is not
-measuring one of them falling back.
+15 interleaved pairs per mode, one fresh process per probe, isolated `USERPROFILE`/`TEMP`,
+8 MB transcript, `dirty` git state, maintainer machine (Windows 11 26200), rustc 1.97.1,
+git 2.48.1. Two children per miss at ~13 ms each, which is what the children-alone probe
+predicted (status 44.7 → 31.6 ms, diff 49.2 → 35.7 ms).
 
-The candidate is the bounded git child and drained stdout of 2026-07-28, which landed
-immediately after `eb56345` and whose cost was never recorded. **This is not bisected**, so
-only the delta is measured and the attribution is a hypothesis.
+**Accepted constraint: the bypass path assumes Git for Windows 2.25.1 or newer.** Before
+that version the real binary needed the stub's `MSYSTEM` and misbehaved without it; from
+2.25.1 it detects the absence and does that work itself. The check is presence-based rather
+than version-based on purpose — reading the version means running `git --version`, a new
+per-tick subprocess §2 forbids outright, and inferring it from install layout is still
+inferring a version from filesystem shape. Anyone on an older Git for Windows who hits this
+has a `cmd\git.exe` with a `mingw64\bin\git.exe` beside it and a git row that misbehaves;
+the fix is to upgrade git, and this entry is where that is written down.
 
-One caveat on reading the table: the two binaries do not render the same box — 2274 bytes
-against 2007 — because the model and context rows were merged since. This is a cost
-comparison across two months of feature change, not an equivalence pair, so the 9 ms is an
-upper bound on any single regression.
+### The git wait blocks on the pipe instead of polling — 2026-09-21
 
-Resolution condition: a bisect across `eb56345..3f5f919` naming the commit, then either a
-fix or an accepted cost recorded here with the justification that buys it.
+The bounded wait slept `POLL_INTERVAL` between `try_wait` calls, so every invocation paid
+up to 5 ms of pure latency noticing an exit that had already happened — twice per uncached
+tick. The 2026-07-28 entry above priced that at "under 7% of the cost it is measuring" and
+left it.
+
+The wait is now on the drain channel, which the helper thread signals when the pipe reaches
+EOF — the child closing stdout, which for a healthy `git` is its own exit. The poll interval
+survives as the wait's **upper bound** and must: a descendant that inherited the pipe holds
+EOF back indefinitely, which is the case `join()` was replaced for, and a wait with no bound
+would hand two seconds to every tick in a repository with `core.fsmonitor` enabled. After
+EOF a short backoff from 100 µs covers the microseconds between the pipe closing and the
+process object being signalled.
+
+| Run | Before | After | Delta |
+|---|---|---|---|
+| Git TTL expired, 15 pairs | 97.25 ms | 89.40 ms | **−7.85 ms (−8.1%)** |
+| Git TTL expired, 21 pairs | 96.40 ms | 90.03 ms | **−6.37 ms (−6.6%)** |
+| Warm, 15 pairs | 19.48 ms | 19.39 ms | −0.09 ms |
+
+**The plan expected this to be unmeasurable and it is not, because the noise floor was
+wrong.** A sub-5 ms claim on the git-miss path was held to be unattributable — a figure
+inherited from a by-hand probe. Measured directly, by running the same binary against a
+copy of itself through the paired driver, 21 interleaved pairs: **+0.35 ms (0.4%)**. The
+driver's interleaving is tight enough that a 6 ms delta on this path is a finding, not
+noise. Anyone claiming a small delta should run that identical-binary control in the same
+sitting rather than quoting either number.
+
+Two observables carry it in the suite, because a median never could have been the whole
+case: `Wait::eof_to_reap` measures from the instant the pipe reached EOF, so it prices the
+latency itself rather than whatever the wait is built from, and
+`a_fast_child_is_reaped_without_waiting_for_a_poll_tick` takes the worst of five — one
+sample of a 5 ms poll lands under the threshold two times in five. Regressing the wait back
+to sleeping makes it fail at 4.47 ms.
+
+### The status and diff children overlap — 2026-09-21
+
+Both `git` children now go up before either is drained, and are collected against one
+shared absolute deadline. They are independent reads of the same repository, and git's own
+`lockfile.h` states the contract this relies on: lockfiles block only writers, readers never
+block, and the loser of an `O_CREAT|O_EXCL` race returns `-1` silently rather than creating
+a file. Both commands pass flags `0`.
+
+| Tick shape | Before | After | Delta |
+|---|---|---|---|
+| Git TTL expired, `dirty`, 21 pairs | 89.75 ms | 61.14 ms | **−28.62 ms (−31.9%)** |
+| Git TTL expired, `clean`, 15 pairs | 88.65 ms | 60.36 ms | **−28.29 ms (−31.9%)** |
+| Warm, 21 pairs | 19.53 ms | 19.46 ms | −0.07 ms |
+
+`rev-parse` stays sequential and must. Whether it is needed is known only once status has
+parsed, so hoisting it would make three children the common case — a strict increase on
+every tick.
+
+**The accepted §2 exception.** In two states the tick goes from one child to two, because
+the gate that used to skip the diff is a function of *drained* status output and overlapping
+the pair is precisely what removes the chance to consult it:
+
+- **unborn HEAD with a staged index** — the branch resolves empty, so the diff used to be
+  skipped. It now runs, fails (`fatal: ambiguous argument 'HEAD'`), and its result is
+  discarded by the same gate as before. The row is unchanged: no git segment.
+- **a status that fails or times out** — the second child is spawned into whatever is
+  stalling the first, and is bounded by the same deadline.
+
+This is the R9 exception the plan reserved, taken deliberately and on measurement rather
+than on assumption. What decided it: across 85 sessions and 19.8 h of active time, the
+working tree is **dirty 95.9% of the time**, so the skip-the-diff-on-a-clean-tree
+alternative would have fired on 4.1% of misses for ~1.8 ms expected saving, against ~39 ms
+for overlapping. `the_git_child_count_is_pinned_per_repo_state` asserts the real count —
+counted, not described — for eight states including both exceptions, so nobody widens this
+by accident.
+
+**Correcting the 2026-07-28 entry's worst case.** It recorded `GIT_TIMEOUT + DRAIN_GRACE` =
+2.25 s per invocation and called that "still under the 5 s cache TTL". Per invocation it is;
+per *tick* it never was. Two bounded children in sequence are 4.5 s, inside the TTL, but the
+three-child detached-HEAD path is 6.75 s and overruns it. Overlapping status and diff brings
+that path to 4.5 s while `rev-parse` stays sequential, so the tick's worst case is now
+inside the TTL in every state rather than in most of them. That is a correctness improvement
+the median does not show, and it is not the two-child overrun it would be easy to claim —
+that one never existed.
+
+### Link-time optimisation, and a delay-load that measures as zero — 2026-09-21
+
+Two changes to fixed process cost, in different files and by different mechanisms, so they
+are measured separately. One paid, one did not, and both numbers are recorded because the
+second is the more useful one to a future reader.
+
+**LTO and one codegen unit: kept.** The release profile set `opt-level` and
+`panic = "unwind"` and no link-time optimisation. `lto = true` with `codegen-units = 1`
+(the default sixteen leaves `lto` working only across their boundaries), 21 interleaved
+pairs per mode, maintainer machine, against a ±0.13 ms identical-binary control in the same
+sitting:
+
+| Tick shape | Before | After | Delta |
+|---|---|---|---|
+| Warm | 19.59 ms | 19.37 ms | −0.22 ms (−1.1%) |
+| Git TTL expired | 60.84 ms | 60.42 ms | −0.42 ms (−0.7%) |
+| Cold — new message and a git miss | 115.35 ms | 113.05 ms | **−2.31 ms (−2.0%)** |
+
+Small but outside the floor, and largest where the transcript scan is — which is where a
+whole-crate view has the most to fold. The binary also shrinks 1,170,944 → 1,062,912 bytes,
+9% off every download. Release builds go from ~4 s to ~17 s; that is a maintainer's cost,
+not a user's. `panic = "unwind"` is untouched and load-bearing: the third silent-degradation
+layer is a no-op without it. The release binary was re-checked by hand against the entry
+contract — empty and malformed input on every subcommand, plus an unknown one — all exit 0
+with zero bytes on stderr, because `cargo test` exercises the dev profile and would not have
+caught a release-only regression.
+
+**Delay-loading `winmm.dll`: measures as zero, kept for its failure direction.** `PlaySoundW`
+is a genuine import called only when an alert fires, so on the face of it this is the same
+trade `user32.dll` already takes. It is not. Isolated with LTO on both sides, 21 pairs:
+**−0.01 ms warm**, against a ±0.13 ms control. The ~1.8 ms this entry's neighbour records
+for delay-loading belongs to `user32` alone — a far heavier DLL with a dependency graph
+behind it — and must not be read as a per-DLL figure.
+
+It ships anyway, but as a failure-direction change rather than a performance one: a missing
+or broken `winmm` now fails at the first `PlaySoundW`, where the silent-degradation contract
+turns it into one absent chime, instead of failing the whole process at load and taking the
+status line down with it. Nobody should later claim milliseconds for it.
+
+**`gdi32` is deliberately not delay-loaded.** `Win32_Graphics_Gdi` is in the feature list
+only because `WNDCLASSW` carries a brush handle the crate sets to null. No gdi32 entry point
+is called anywhere, so there is no import entry to defer and the linker would ignore the
+directive. Confirmed against the binary's import table: `gdi32.dll` is not among its
+dependents at all.
+
+### Caching the process owner — no change, 2026-09-21
+
+`trusted_owners()` rebuilds its list on every call, and on Windows that means opening the
+process token, reading `TokenUser`, and building the Administrators SID. A warm tick
+performs several guarded reads and one or two writes, three processes resolve the state
+directory per tick, and the directory's own name has already computed the same answer — so
+caching a successful resolution for the process lifetime looked like a free floor win.
+
+**It is worth about 0.02 ms per tick, and was rejected on that.** Measured directly rather
+than inferred, maintainer machine, 2000 iterations:
+
+| Call | Cost |
+|---|---|
+| `current_owner()`, uncached — opens the token every time | 1.53 µs |
+| `trusted_owners()`, served from a `OnceLock` | 158 ns |
+
+A saving of ~1.4 µs per guarded operation, against a tick that makes perhaps ten of them.
+The hypothesis was that this was milliseconds of syscall; it is microseconds.
+
+**What made it look like more than that, and the methodological lesson.** The paired driver
+first reported the cached build at −0.38 ms warm and **+3.4 ms on the cold tick**, against a
+±0.02 ms identical-binary control — a reproducible regression three times larger than the
+change could possibly cause in either direction. Rebuilding both halves with `lto` off
+shrank it to +0.92 ms. It was code layout: **an identical-binary control measures the
+machine, not the method.** Two builds that differ by any code at all differ in layout too,
+and under whole-crate LTO that is worth a few milliseconds on the cold path, which is where
+the 8 MB transcript scan lives. A sub-millisecond delta between two *different* binaries is
+not attributable to the diff between them without a mechanism measurement beside it.
+
+So the honest floor for a claim on this project is not one number. The identical-binary
+control (±0.02 to ±0.35 ms) bounds *run-to-run* noise; attributing anything under about
+1 ms to a specific change additionally needs the mechanism priced, as it is above.
+
+The cache is not kept. It is fifteen lines and a `OnceLock` whose only subtle requirement —
+never cache a failure, because `None` means "I could not ask" and caching it disarms the
+owner check for the rest of the process — is a fail-direction hazard this project has
+already paid nine days for once. That is not a trade worth making for 0.02 ms.
+
+Reopen condition: a guarded operation count per tick an order of magnitude higher than
+today's, or a platform where the token lookup is not a cheap local call.
+
+### The agent transcript is scanned backwards, and keyed on size too — 2026-09-21
+
+Two changes to the subagent fallback tier, which reads one `agent-*.jsonl` per agent and
+keeps only its **last** assistant entry.
+
+**Reverse scan.** It reached that last entry by `serde_json`-parsing every line of the file
+in order and overwriting the result each time — a whole-file parse to throw all but one
+line away. It now scans from the end and returns at the first assistant entry it finds,
+which in the ordinary case parses one line. Unparseable lines are still skipped rather than
+ending the scan, so a torn tail — routine in a file being appended to — still falls back to
+the entry before it, from either direction.
+
+| Tick shape, 4 MB agent transcript | Before | After | Delta |
+|---|---|---|---|
+| Re-read (the shape an agent at work produces every tick) | 105.57 ms | 71.05 ms | **−34.52 ms (−32.7%)** |
+| Skip (the agent's file unchanged) | 19.23 ms | 19.08 ms | −0.15 ms |
+
+And on Linux, same 4 MB agent transcript, against a build scanning forwards:
+
+| Tick shape | Before | After | Delta |
+|---|---|---|---|
+| Re-read | 35.96 ms | 12.64 ms | **−23.32 ms (−64.9%)** |
+| Skip | 1.40 ms | 1.37 ms | −0.03 ms |
+
+15 to 21 interleaved pairs per platform, against a +0.10 ms identical-binary control.
+`the_agent_reverse_scan_agrees_with_a_forward_one` pins the equivalence against a forward
+reference implementation over eleven shapes — empty, no assistant entry, no trailing
+newline, a torn final line, a torn line in the middle, trailing blanks, invalid UTF-8 — plus
+the pinned fixture input, because "the last assistant entry" and "the first one from the
+end" are the same thing only while the skipping rules stay symmetric.
+
+**Size joined the staleness key.** It was mtime alone, which is strictly weaker than the
+main transcript's `(mtime, size)` and exposed to the documented Windows behaviour where a
+writer's mtime does not move until its handle closes: an agent appending through an open
+handle was read once and then never again. `AgentState` gains a ninth field; an
+eight-field record written by an older binary is rejected whole by the same strictness that
+already rejects a torn one, at the cost of one re-scan.
+
+**A measurement trap this unit walked into first, and the driver now prevents.** The pair
+driver shared one `TEMP` between the two variants. With a record format that differs
+between them — which is exactly what a field addition or a `RECORD_VERSION` bump creates —
+each build rejects the other's records, so **every probe measures a miss**, on both sides.
+The first run of this unit read −41.94 ms on the *warm* tick, a path where nothing should
+have moved at all, because both variants were re-reading 4 MB on every probe instead of
+skipping. `measure-pair.*` now give each variant its own state root and set it on the child
+process rather than on the driver's own environment; the home root stays shared, because
+what lives there is input rather than record. Any unit that changes a stored format must be
+measured this way or the number is fiction — U8 changes `RECORD_VERSION` and would have hit
+exactly this.
+
+The drivers also learned `--agent-bytes` / `-AgentBytes`, which stages an agent transcript
+beside the session's. Nothing could measure this tier before.
+
+### The git-miss path costs ~9 ms more than it did at `eb56345` — resolved 2026-09-21
+
+**Resolution: bisected to `d9e61f4`, and fixed.** The commit is "Bound the git child and
+repair the migration failure paths" — the 2026-07-28 change recorded above, which was the
+entry's own hypothesis and is now measured rather than suspected. The mechanism is the 5 ms
+poll interval that change introduced: two children per uncached tick, each detected on
+average half an interval after it had already exited.
+
+Originally found by A/B-ing the binary that produced §6's original medians against
+`3f5f919`, sequentially, median of 15 — recorded then as +9.0 ms cold and +9.4 ms on the
+git-TTL-expired row, with the caveat that the two binaries do not render the same box and
+the figure is an upper bound across two months of feature change.
+
+Re-confirmed interleaved, 21 pairs, and then bisected over the seven commits in
+`eb56345..HEAD` that touch `src/git.rs` — the search is over those, not the fifty-eight in
+the range. Each step is an interleaved pair of adjacent builds, 15 runs, git-TTL-expired,
+`dirty` state, maintainer machine:
+
+| Step | Delta |
+|---|---|
+| `eb56345` → `1031fff` | +0.74 ms |
+| `1031fff` → **`d9e61f4`** | **+5.44 ms (+4.6%)** |
+| `d9e61f4` → `2f666f1` | +0.42 ms |
+| `2f666f1` → `b53eaba` | −4.93 ms |
+| `b53eaba` → `79a2eb3` | −0.37 ms |
+| `79a2eb3` → `16eaf11` | +0.52 ms |
+| `16eaf11` → `1b7e4e9` | +1.77 ms |
+| `1b7e4e9` → `304d2ab` | +1.48 ms |
+| `eb56345` → `304d2ab`, end to end | +6.68 ms (+5.7%) |
+
+`d9e61f4` re-measured on its own at 21 pairs: **+4.71 ms**, against a +0.78 ms
+identical-binary control in the same sitting. The remaining steps are inside that control,
+and their signs do not accumulate — which is what the "several small ones, none individually
+actionable" outcome would have looked like, and is not what this is.
+
+The arithmetic agrees with the mechanism: two children, each costing on average half of a
+5 ms poll, is ~5 ms. Nothing else in that commit touches the common path.
+
+**The bounded child stays; the poll does not.** The change was made for correctness —
+`output()` blocks unbounded on the render path, and a repo on a stalled mount accumulated
+one blocked process per tick — so the fix could not be a revert. Removing the poll interval
+in favour of blocking on the drain channel recovers it: measured at −6.37 to −7.85 ms, which
+is the regression and a little more. See "The git wait blocks on the pipe instead of
+polling" above.
+
+End to end, `eb56345` against the current tree on the git-TTL-expired row, 21 interleaved
+pairs: **116.46 ms → 60.35 ms, −56.11 ms (−48.2%)**.

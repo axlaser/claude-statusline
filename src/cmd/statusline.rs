@@ -128,26 +128,39 @@ fn git_status(
     crate::git::status(clock, &roots.temp, &cwd, session_id)
 }
 
-/// This tick's totals, and the record that carries the per-bucket deltas.
-/// Totals come from the scan and only deltas from the record, which is what
-/// let the scripts' head checksum go away: they cached the totals, so a
-/// same-size rewrite was invisible.
+/// The transcript tier: skip, resume, or read it whole.
+///
+/// Three outcomes where there used to be two. The `(mtime, size)` skip is
+/// tested first and is unchanged. Beneath it sits a resume that scans only the
+/// appended bytes; beneath that, the full read every failed gate falls through
+/// to. `transcript::decide` owns the state table and is pure, so the gates are
+/// testable without a filesystem; this function owns the I/O and the
+/// arithmetic that combines a tail with the stored totals.
 fn transcript_state(
     clock: &dyn Clock,
     roots: &Roots,
     payload: &Payload,
     session_id: &str,
 ) -> (Option<Scan>, Option<TokenRecord>) {
-    let path = payload.transcript_path();
-    if path.is_empty() {
+    let raw_path = payload.transcript_path();
+    if raw_path.is_empty() {
         return (None, None);
     }
-    let path = Path::new(path);
-    let Ok(meta) = std::fs::metadata(path) else {
+    let path = Path::new(raw_path);
+
+    // Opened once, and the size taken from the handle: stating the path and
+    // then opening it invites the two to disagree, and the size is half the
+    // freshness key. mtime still comes from the injected clock, which is what
+    // lets a fixture reach both sides of a boundary without sleeping.
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return (None, None);
+    };
+    let Ok(meta) = file.metadata() else {
         return (None, None);
     };
     let size = meta.len();
     let mtime = clock.mtime_unix(path).unwrap_or(0);
+    let path_digest = transcript::fnv1a(raw_path.as_bytes());
 
     let record_path = transcript::record_path(&roots.temp, session_id);
     let previous = record_path
@@ -156,21 +169,15 @@ fn transcript_state(
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|t| TokenRecord::parse(&t));
 
-    // An unchanged transcript is not read at all: everything the tokens and
-    // model rows render is already in the record. This is the port's one
-    // computation cache, kept on measured grounds: an unconditional rescan cost
-    // ~50 ms on an 8 MB transcript, invisible next to PowerShell's ~124 ms
-    // interpreter floor but four times bash's entire tick, and a static
-    // transcript is most ticks.
-    //
-    // The cost is missing a same-size rewrite. Accepted deliberately:
-    // transcripts are append-only JSONL, and the mtime must match too. The
-    // scripts' version of this bug cached totals behind a stale-able key with
-    // no second signal; `(mtime, size)` is that second signal.
-    if let Some(record) = previous
-        .clone()
-        .filter(|p| p.mtime == mtime && p.size == size)
-    {
+    let decision = transcript::decide(previous.as_ref(), path_digest, mtime, size, || {
+        probe_head_and_anchor(&mut file, previous.as_ref()?.offset)
+    });
+
+    // The skip. Everything the tokens and model rows render is already in the
+    // record, so the file is not read at all -- the unconditional rescan was
+    // ~50 ms on 8 MB and made the port 4x slower than the script on Linux.
+    if decision == transcript::Decision::Skip {
+        let record = previous.expect("Skip is only reachable with a record");
         crate::debug::log(|| "transcript: unchanged, scan skipped".to_string());
         let scan = Scan {
             messages: record.messages,
@@ -179,27 +186,84 @@ fn transcript_state(
             cache_read_tokens: record.cache_read_tokens,
             output_tokens: record.output_tokens,
             idle: record.idle,
-            // Not stored: `consumed` is the scan's own torn-tail bound and
-            // nothing downstream reads it.
-            consumed: 0,
+            // Not re-derived: `consumed` is the scan's own torn-tail bound and
+            // the record carries the offset it produced.
+            consumed: record.offset,
         };
         return (Some(scan), Some(record));
     }
 
-    // A failed read must not become an empty scan: `fold` would record zero
-    // totals under this tick's (mtime, size) and the skip above would serve
-    // them until the transcript changes again. Degrade this tick instead.
-    let Ok(bytes) = std::fs::read(path) else {
+    let from = match decision {
+        transcript::Decision::Resume { from } => from,
+        transcript::Decision::Full(reason) => {
+            crate::debug::log(move || format!("transcript: full read ({})", reason.as_str()));
+            0
+        }
+        transcript::Decision::Skip => unreachable!("handled above"),
+    };
+
+    // A failed read must not become an empty scan: that would render every
+    // bucket as a large negative delta and store it.
+    let Some(bytes) = read_from(&mut file, from) else {
         crate::debug::log(|| "transcript: read failed, stored record left intact".to_string());
         return (None, None);
     };
-    let scan = transcript::scan(&bytes, Some(size), true);
-    let (record, needs_write) = TokenRecord::fold(previous.as_ref(), &scan, mtime, size);
+
+    let (scan, resume) = if from == 0 {
+        let scan = transcript::scan(&bytes, Some(size), true);
+        let resume = transcript::Resume {
+            offset: scan.consumed,
+            head: head_checksum(&bytes),
+            path_digest,
+            resumes: 0,
+            grown: 0,
+        };
+        (scan, resume)
+    } else {
+        // The tail is scanned with **its own length** as the sampled size.
+        // `Scan.consumed` is a record boundary only when that parameter is the
+        // number of bytes actually handed in; passing the whole file's size
+        // would make the torn-tail gate unreachable and fold a partial line
+        // into the stored totals.
+        let previous = previous.as_ref().expect("Resume implies a record");
+        let tail = transcript::scan(&bytes, Some(bytes.len() as u64), previous.idle);
+        let tail_bytes = bytes.len() as u64;
+        crate::debug::log(move || {
+            format!("transcript: resumed from {from}, {tail_bytes} tail bytes")
+        });
+        let scan = Scan {
+            messages: previous.messages.saturating_add(tail.messages),
+            input_tokens: previous.input_tokens.saturating_add(tail.input_tokens),
+            cache_write_tokens: previous
+                .cache_write_tokens
+                .saturating_add(tail.cache_write_tokens),
+            cache_read_tokens: previous
+                .cache_read_tokens
+                .saturating_add(tail.cache_read_tokens),
+            output_tokens: previous.output_tokens.saturating_add(tail.output_tokens),
+            // Seeded from the record, not from the hardcoded default: the
+            // commonest appended chunk in an active session is a single
+            // tool-result line, which does not vote. With the default the model
+            // row flips to ready mid-tool-call, and the skip path then
+            // re-displays that wrong verdict.
+            idle: tail.idle,
+            // The tail's own consumed count is never used as an absolute.
+            consumed: from.saturating_add(tail.consumed),
+        };
+        let resume = transcript::Resume {
+            offset: scan.consumed,
+            head: previous.head,
+            path_digest,
+            resumes: previous.resumes.saturating_add(1),
+            grown: previous.grown.saturating_add(tail_bytes),
+        };
+        (scan, resume)
+    };
+
+    let (record, needs_write) = TokenRecord::fold(previous.as_ref(), &scan, mtime, size, &resume);
 
     if needs_write {
         if let Some(p) = record_path.as_deref() {
-            // A record that never lands means every later tick re-scans the
-            // whole transcript, and nothing else can report it.
             let outcome =
                 crate::state::write_guarded_under(&roots.temp, p, record.to_line().as_bytes());
             if outcome != crate::state::WriteOutcome::Written {
@@ -211,6 +275,61 @@ fn transcript_state(
         }
     }
     (Some(scan), Some(record))
+}
+
+/// FNV-1a over exactly `HEAD_SPAN` bytes, zero-padded when the file is shorter.
+///
+/// Padding rather than hashing a shorter span: a checksum whose coverage grows
+/// with the file mismatches on a pure append. Nothing under the resume floor is
+/// ever compared, so the padding is only ever stored, never matched against.
+fn head_checksum(bytes: &[u8]) -> u64 {
+    let mut head = [0u8; transcript::HEAD_SPAN];
+    let n = bytes.len().min(transcript::HEAD_SPAN);
+    head[..n].copy_from_slice(&bytes[..n]);
+    transcript::fnv1a(&head)
+}
+
+/// The two content checks a resume needs, read from an already-open handle.
+///
+/// `None` is treated as a head mismatch, which falls through to the full read:
+/// a resume that cannot verify itself must not happen.
+fn probe_head_and_anchor(file: &mut std::fs::File, offset: u64) -> Option<transcript::Probe> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut head = [0u8; transcript::HEAD_SPAN];
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_exact(&mut head).ok()?;
+
+    // The byte before the offset. A head checksum cannot see a rewrite that
+    // preserves the first 4 KB and changes the middle, and that error never
+    // self-heals. The read is one byte at an offset already being sought.
+    let anchor_is_newline = match offset.checked_sub(1) {
+        Some(at) => {
+            let mut one = [0u8; 1];
+            file.seek(SeekFrom::Start(at)).ok()?;
+            file.read_exact(&mut one).ok()?;
+            one[0] == b'\n'
+        }
+        // Offset zero is trivially a boundary, and resuming from it is a full
+        // read by another name.
+        None => true,
+    };
+
+    Some(transcript::Probe {
+        head: transcript::fnv1a(&head),
+        anchor_is_newline,
+    })
+}
+
+/// Everything from `from` to the end of the file.
+fn read_from(file: &mut std::fs::File, from: u64) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(from)).ok()?;
+    let mut bytes = Vec::new();
+    // A read that fails partway degrades to no-scan-no-write, never to a
+    // partial tail folded into the record.
+    file.read_to_end(&mut bytes).ok()?;
+    Some(bytes)
 }
 
 /// Merges this session's model→window pair into the learned map and returns

@@ -310,15 +310,24 @@ fn agent_state_path(temp: &Path, session_id: &str, agent_base: &str) -> Option<P
 }
 
 /// The per-agent record:
-/// `mtime|stop_reason|input|cache_write|cache_read|model|display|done`.
+/// `mtime|stop_reason|input|cache_write|cache_read|model|display|done|size`.
 ///
-/// Field order is the scripts' verbatim: a different layout would read back as
-/// a wrong token count rather than a miss. The location moved under
+/// Field order is the scripts' verbatim, with `size` appended: a different
+/// layout would read back as a wrong token count rather than a miss, and
+/// appending keeps every existing field where it was. The location moved under
 /// `<temp>/claude-statusline-<owner>/`, so old flat files go unread after a
-/// mid-session upgrade at the cost of one re-scan (`docs/performance.md` §4).
+/// mid-session upgrade at the cost of one re-scan (`docs/performance.md` §4);
+/// a record written before `size` existed has eight fields and is rejected
+/// whole by the same strictness, at the same cost.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct AgentState {
     mtime: i64,
+    /// Paired with `mtime` as the staleness key. mtime alone is strictly
+    /// weaker than the main transcript's `(mtime, size)` and is exposed to the
+    /// documented Windows behaviour where a writer's mtime does not move until
+    /// its handle closes — an agent appending through an open handle would be
+    /// read once and then never again.
+    size: u64,
     stop_reason: String,
     input_tokens: u64,
     cache_write_tokens: u64,
@@ -331,14 +340,16 @@ struct AgentState {
 impl AgentState {
     fn parse(raw: &str) -> Option<Self> {
         let fields: Vec<&str> = raw.trim_end_matches(['\r', '\n']).split('|').collect();
-        // The scripts wrote exactly eight; a shorter record is torn or foreign,
-        // and guessing would render a confident wrong number.
-        if fields.len() != 8 {
+        // Exactly nine; a shorter record is torn, foreign, or written before
+        // `size` joined the key, and guessing would render a confident wrong
+        // number. The field count is the format version.
+        if fields.len() != 9 {
             return None;
         }
         let at = |i: usize| fields[i];
         Some(Self {
             mtime: at(0).parse().ok()?,
+            size: at(8).parse().ok()?,
             stop_reason: at(1).to_string(),
             input_tokens: at(2).parse().unwrap_or(0),
             cache_write_tokens: at(3).parse().unwrap_or(0),
@@ -351,7 +362,7 @@ impl AgentState {
 
     fn to_line(&self) -> String {
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.mtime,
             scrub_field(&self.stop_reason),
             self.input_tokens,
@@ -359,7 +370,8 @@ impl AgentState {
             self.cache_read_tokens,
             scrub_field(&self.model),
             scrub_field(&self.display),
-            self.done_at.map(|d| d.to_string()).unwrap_or_default()
+            self.done_at.map(|d| d.to_string()).unwrap_or_default(),
+            self.size
         )
     }
 
@@ -630,9 +642,18 @@ impl AgentReading {
 /// Reads the last assistant entry of an agent transcript. Unparseable lines
 /// are skipped rather than ending the scan: a torn tail is routine in a file
 /// being appended to, and the entry before it is still the best reading.
+///
+/// Scanned **backwards**, returning at the first assistant entry it finds.
+/// Only the last one is ever kept, so a forward pass JSON-parsed every line of
+/// the file in order to throw all but one away; from the end it parses one in
+/// the ordinary case. Byte-oriented throughout, like the main transcript's
+/// scan -- a reverse boundary is a byte offset, and any decoding step would
+/// break the arithmetic.
 pub fn read_agent(bytes: &[u8]) -> AgentReading {
-    let mut out = AgentReading::default();
-    for line in bytes.split(|b| *b == b'\n') {
+    let out = AgentReading::default();
+    // `rsplit` yields the trailing empty slice of a newline-terminated file
+    // first; it fails to parse and is skipped like any other torn line.
+    for line in bytes.rsplit(|b| *b == b'\n') {
         let Ok(text) = std::str::from_utf8(line) else {
             continue;
         };
@@ -650,7 +671,7 @@ pub fn read_agent(bytes: &[u8]) -> AgentReading {
                 .and_then(Value::as_u64)
                 .unwrap_or(0)
         };
-        out = AgentReading {
+        return AgentReading {
             stop_reason: message
                 .and_then(|m| m.get("stop_reason"))
                 .and_then(Value::as_str)
@@ -716,6 +737,9 @@ pub fn rows_from_transcripts(
         if now - mtime > FALLBACK_MAX_AGE_SECS {
             continue;
         }
+        // The size half of the key comes from the real filesystem, as the main
+        // transcript's does; only mtime goes through the injected clock.
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
         let base = name.trim_end_matches(".jsonl");
         let state_path = agent_state_path(temp, session_id, base);
@@ -732,7 +756,7 @@ pub fn rows_from_transcripts(
         // `sa_cache_dirty`: a fresh read, or a stamp that moved.
         let mut dirty = false;
         let mut record = match previous {
-            Some(prev) if prev.mtime == mtime => prev,
+            Some(prev) if prev.mtime == mtime && prev.size == size => prev,
             prev => {
                 let Ok(bytes) = std::fs::read(&path) else {
                     continue;
@@ -742,6 +766,7 @@ pub fn rows_from_transcripts(
                 dirty = true;
                 AgentState {
                     mtime,
+                    size,
                     stop_reason: reading.stop_reason,
                     input_tokens: reading.input_tokens,
                     cache_write_tokens: reading.cache_write_tokens,

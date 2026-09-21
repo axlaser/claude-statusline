@@ -10,10 +10,27 @@ use std::path::{Path, PathBuf};
 use crate::debug;
 use crate::session::sanitize_session_id;
 
-/// The tools whose use can change git state. Kept verbatim from the scripts:
-/// this list also appears as the hook's `matcher` in `settings.json`, so the
-/// two have to agree or the hook fires for tools this ignores.
-pub const INVALIDATING_TOOLS: [&str; 5] = ["Edit", "Write", "MultiEdit", "Bash", "NotebookEdit"];
+/// The tools whose use can change git state.
+///
+/// This list also appears as the hook's `matcher` in `settings.json`, so the
+/// two have to agree or the hook fires for tools this ignores -- asserted by
+/// `the_invalidating_tools_and_the_settings_matcher_agree`, because nothing
+/// derives one from the other.
+///
+/// **`Bash` is deliberately absent**, though the scripts had it. It was half
+/// of every tool call in a real session and three quarters of the entries
+/// here, so every `ls` and every `grep` deleted the git cache and made the next
+/// tick pay a full miss. Dropping it is safe because the cache is keyed on
+/// `.git/index` mtime: a shell command that touches the index -- `git commit`,
+/// `git add` -- is still observed on the very next tick, through the key rather
+/// than through the hook. What changes is that a command altering only
+/// untracked or worktree state is seen within the 5s TTL instead of
+/// immediately, which is an accepted divergence recorded in
+/// `docs/performance.md` §4. The alternatives were worse: deletion already
+/// coalesces, so marking the cache stale saves nothing, and reading the
+/// payload's command to tell `git commit` from `ls` adds parsing to a path
+/// that runs after every tool call and replaces one guess with another.
+pub const INVALIDATING_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
 /// The two caches a file-modifying tool invalidates.
 ///

@@ -97,6 +97,19 @@
       ]
     },
     {
+      "name": "stat-dirty",
+      "why": "Tracked files rewritten with their own bytes: the index cached stat data no longer matches, but the content does. This is the state that makes `git diff HEAD` refresh and rewrite `.git/index` -- taking `index.lock` in the user repository on every cache miss -- which `--no-optional-locks` does not prevent, because it gates only `cmd_status`. Two files, because one is easy to pass by luck.",
+      "steps": [
+        ["git", "init", "-b", "main"],
+        ["write", "README.md", "fixture repo\n"],
+        ["write", "second.txt", "another tracked file\n"],
+        ["git", "add", "-A"],
+        ["git", "commit", "-m", "initial"],
+        ["write", "README.md", "fixture repo\n"],
+        ["write", "second.txt", "another tracked file\n"]
+      ]
+    },
+    {
       "name": "stash-present",
       "why": "porcelain v2 emits a `# stash` line only when the count is non-zero.",
       "steps": [

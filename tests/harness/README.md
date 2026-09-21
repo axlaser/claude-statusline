@@ -13,9 +13,8 @@ fixture that everything downstream then treats as truth.
 ```
 capture.sh      macOS and Linux driver (bash 4+, jq, git)
 capture.ps1     Windows driver (PowerShell 5.1+, git) — its functional twin
-measure.sh      macOS and Linux paired measurement (bash 5+, jq, git)
-measure.ps1     Windows paired measurement — its functional twin
-measure-pair.ps1  Windows binary-vs-binary measurement (two builds of this crate)
+measure-pair.sh   macOS and Linux paired measurement (bash 5+, jq, git)
+measure-pair.ps1  Windows paired measurement — its functional twin
 cases.json      the case table: what to capture, with what inputs
 states.json     the docs/performance.md §4 git-state matrix, as data
 payloads/       pinned stdin payloads
@@ -28,24 +27,13 @@ Both drivers read the same `cases.json` and `states.json`. A case is defined
 once and captured on all three platforms — the duplication this migration exists
 to delete does not get to reappear in the harness.
 
-`measure.sh` / `measure.ps1` pair a **runtime script against the binary that
-replaced it**, which is what the migration had to prove. They cannot answer
-"did this commit make the binary slower", and they cannot run at all now that
-the script trees are deleted. `measure-pair.ps1` is the tool for that second
-question: **two builds of this crate**, interleaved on one host, under the same
-docs/performance.md §3 rules. It takes the payload
-`payloads/full-with-version.json` — `full.json` plus the top-level `version`
-field, which is what gates the changelog read — and refuses to report a number
-until it has seen the after-binary actually render the version segment. Without
-that field the read never happens and the pair would time the same code twice.
-
-```powershell
-.\tests\harness\measure-pair.ps1 -Before <old>\claude-statusline.exe -After .\target\release\claude-statusline.exe
-```
-
-There is no `measure-pair.sh` yet: the one change that needed it was measured on
-Windows. Port it when a hot-path change needs a Unix pair, rather than carrying
-an untested twin.
+`measure.sh` / `measure.ps1` used to pair a **runtime script against the binary
+that replaced it**, which is what the migration had to prove. They are deleted:
+the script trees went at `1f5acf2`, both drivers aborted on a missing-file
+check, and `.github/workflows/measure.yml` invoked one of them and so could not
+run either. The question anyone has now is "did this commit make the binary
+slower", and `measure-pair.*` is the tool for it: **two builds of this crate**,
+interleaved on one host, under the docs/performance.md §3 rules.
 
 ## Running it
 
@@ -174,39 +162,81 @@ file, correctly showed the row.
 When adding an input, capture or copy the real producer's output rather than
 hand-writing something equivalent-looking.
 
-## Paired measurement (R38)
+## Paired measurement
 
-`measure.sh` and `measure.ps1` produce the end-to-end fresh-process medians R38
-requires before a component's scripts are deleted — one number for the script,
-one for the binary, taken on the same host with the runs interleaved.
+`measure-pair.sh` and `measure-pair.ps1` produce the end-to-end fresh-process
+medians docs/performance.md §3 requires before any hot-path change is believed —
+one median for each of two builds of this crate, taken on the same host with the
+runs interleaved.
 
 ```bash
-tests/harness/measure.sh --component subagent --runs 11 --json out.json
+tests/harness/measure-pair.sh --before <old>/claude-statusline --after target/release/claude-statusline
 ```
 
 ```powershell
-.\tests\harness\measure.ps1 -Component subagent -Runs 11 -Json out.json
+.\tests\harness\measure-pair.ps1 -Before <old>\claude-statusline.exe -After .\target\release\claude-statusline.exe
 ```
+
+Three tick shapes, measured separately because they cost differently and are
+caused differently. `warm` clears nothing: the git cache is fresh and the token
+record matches, so the tick renders from stored state. `git-miss` clears only
+the git caches, which is the shape any pause longer than the 5 s TTL produces
+and the row §6 records at 132 ms on Windows. `cold` clears every tick cache: a
+new message *and* a git miss. Pick with `--mode` / `-Mode`.
+
+A **real `.git` is staged** from `states.json` — `dirty` by default, any state
+by name. No driver did this before, and without it a change to `src/git.rs`
+measures nothing at all. `{REPO}` in the payload resolves to that work tree, not
+to the scratch root, which is the same mapping the Rust fixture replay uses.
+
+The **proof-of-work assertion is a parameter**. Both variants must always render
+the box and the model row; `--proof` adds a pattern both must render, and
+`--proof-after-only` adds one the after variant must render and the before
+variant must not. That last form is how the version-segment pair was proved —
+`--payload payloads/full-with-version.json --proof-after-only 'v2[.]1[.]270'` —
+without the driver *being* that one check, which is what made it refuse every
+other pair.
+
+The binary is **spawned directly**. The drivers used to time `cmd.exe /c "<exe>
+< payload"`, which charged every Windows figure for a shell the status line
+never spawns: measured at +15.2 ms warm and +16.2 ms cold.
 
 `docs/performance.md` §3 governs the method and both drivers implement it
 literally: one fresh process per probe, a median of at least seven runs, an
-isolated `HOME`/`USERPROFILE` and `TMPDIR`/`TEMP`, and `STATUSLINE_DEBUG`
-cleared so one variant is not charged for a log append the other skips.
+isolated `HOME`/`USERPROFILE` and `TMPDIR`/`TEMP` restored afterwards, the
+scratch root removed, and `STATUSLINE_DEBUG` cleared so one variant is not
+charged for a log append the other skips.
 
 Interleaving is the part that is easy to skip and expensive to get wrong. A
 machine that gets busier halfway through a run would charge the whole drift to
 whichever variant was measured second, and the result would look exactly like a
-finding.
+finding. It is also not hypothetical here: this host's bare process-creation
+floor was measured at ~9.6 ms and, hours later the same day, at ~18–20 ms, with
+`hostname.exe` alone costing 20.5 ms. **Absolute rows are only comparable within
+one sitting; deltas survive.**
+
+**Learn the noise floor, do not quote one.** Run the before binary against a copy
+of itself, same run count, in the same sitting. On 2026-09-21 that control came
+back at +0.35 ms on the git-miss path over 21 interleaved pairs, which retired a
+long-standing "anything under 5 ms here is noise" rule of thumb inherited from a
+by-hand probe — it had been costing real findings.
 
 Both drivers **prove each variant does its work before timing anything**. A
-probe that silently no-opped — a missing `jq`, a changed payload contract —
-would otherwise be reported as a spectacular speed-up.
+probe that silently no-opped — a subcommand that does not exist, a payload
+contract that moved — would otherwise be reported as a spectacular speed-up.
+
+Both carry a `--self-test` / `-SelfTest` mode that exercises the guards without
+needing either binary: the scratch-path refusal, the two cold-cache layouts, the
+proof-of-work guard against a stub that renders nothing, and the environment
+restore. `harness_measure_drivers_pass_their_own_self_test` in
+`tests/equivalence.rs` runs it, because the previous drivers rotted into
+unrunnable shape and nothing noticed for two months.
 
 macOS and Linux pairs come from `.github/workflows/measure.yml`, one job per
-platform so both halves of a pair share a runner, with the runner label and
-image version recorded beside the numbers (R38, R41). Windows pairs are measured
-on the maintainer's machine, for the same reason KTD9 keeps Windows capture off
-CI.
+platform so both halves of a pair share a runner; it builds both refs from one
+checkout and records the runner label and image version beside the numbers.
+Windows pairs are measured on the maintainer's machine, for the same reason
+KTD9 keeps Windows capture off CI.
 
 ## Observables (R31)
 

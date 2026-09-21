@@ -67,9 +67,19 @@ pub fn save(path: &Path, root: &Value) -> Result<(), String> {
     })
 }
 
-/// The matcher today's PostToolUse hook registers. Kept verbatim: an install
-/// has to write the same hook entries it always did.
-pub const POST_TOOL_MATCHER: &str = "Edit|Write|MultiEdit|Bash|NotebookEdit";
+/// The matcher the PostToolUse hook registers.
+///
+/// Must stay equal to `cmd::git_refresh::INVALIDATING_TOOLS` joined by `|`, or
+/// the hook fires for tools the handler ignores -- or, worse, does not fire for
+/// one it would have acted on. Nothing derives one from the other, so
+/// `the_invalidating_tools_and_the_settings_matcher_agree` asserts it.
+///
+/// `Bash` was dropped from both on 2026-09-21; see the handler's list for why.
+/// An install made before that still carries the old matcher, which costs a
+/// hook process after every shell call that then finds nothing to do -- exactly
+/// what it did before. The saving lands either way, because it comes from the
+/// cache not being deleted rather than from the hook not running.
+pub const POST_TOOL_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
 
 /// Claude Code's refresh cadence for the status line, in seconds. Written only
 /// when the entry does not already carry one, so a user who tuned it keeps

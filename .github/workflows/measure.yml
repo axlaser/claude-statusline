@@ -1,57 +1,65 @@
 name: measure
 
-# Produces the paired script-vs-binary medians for macOS and Linux.
+# Produces interleaved before/after medians for two builds of this crate, on
+# macOS and Linux.
 #
-# Both halves of a pair have to come from a single hosted runner within
-# one job, with the runs interleaved. Two jobs, or two workflow runs, would hand
-# back numbers taken on different machines under different load and present them
-# as a comparison — which is the mistake docs/performance.md §3 exists to
-# prevent. So each platform is one job that builds the binary and measures both
-# variants itself.
+# Both halves of a pair have to come from a single hosted runner within one job,
+# with the runs interleaved. Two jobs, or two workflow runs, would hand back
+# numbers taken on different machines under different load and present them as a
+# comparison — which is the mistake docs/performance.md §3 exists to prevent. So
+# each platform is one job that builds both variants and measures them itself.
+#
+# This workflow used to invoke `measure.sh`, which paired a runtime script
+# against the binary that replaced it. Those script trees were deleted at
+# `1f5acf2`, so the driver aborted on a missing-file check and this workflow
+# could not run at all. It now drives `measure-pair.sh`, which pairs two commits
+# of the crate — the question anyone actually has once the scripts are gone.
 #
 # Windows pairs are deliberately absent, for the same reason that keeps Windows
 # capture off CI: the numbers that matter there are the maintainer's machine,
 # not a hosted image nobody runs the status line on.
 #
-# Results are uploaded, never committed by this workflow. The numbers land in
-# docs/performance.md in the same commit as the component's port and script
-# deletion, which is a decision a person makes.
+# Results are uploaded, never committed by this workflow. Which numbers reach
+# docs/performance.md is a decision a person makes.
 
 on:
-  # Pushing a `measure-<component>` tag runs a measurement; the tag is deleted
-  # afterwards. `workflow_dispatch` is only offered for workflows already on the
-  # default branch, which this one does not reach until the migration merges at
-  # full parity — so during the migration the tag is the only way to ask CI for
-  # a measurement from the feature branch.
-  #
   # `measure-*` cannot collide with the release workflow, which triggers only on
   # `v<major>.<minor>.<patch>[-suffix]` and `verify-*`, nor with `capture-*`.
+  # A tag-triggered run measures that tag's commit against its first parent.
   push:
     tags:
       - "measure-*"
 
   workflow_dispatch:
     inputs:
-      component:
-        description: "Component to measure"
+      before:
+        description: "The baseline ref (default: the head commit's first parent)"
         required: false
-        type: choice
-        default: subagent
-        options: [subagent, statusline]
+        type: string
+      after:
+        description: "The ref under test (default: the head commit)"
+        required: false
+        type: string
       runs:
-        description: "Interleaved pairs per platform (>= 7)"
+        description: "Interleaved pairs per mode (>= 7)"
         required: false
         type: string
-        default: "11"
+        default: "15"
+      modes:
+        description: "Tick shapes to measure, comma-separated: warm, git-miss, cold"
+        required: false
+        type: string
+        default: "warm,git-miss,cold"
+      git_state:
+        description: "A state from tests/harness/states.json"
+        required: false
+        type: string
+        default: dirty
       transcript_bytes:
-        description: "statusline only: generated transcript size in bytes (default 8388608)"
+        description: "Generated transcript size in bytes"
         required: false
         type: string
-      cold_cache:
-        description: "Clear every per-tick cache before each probe, so both variants do full work"
-        required: false
-        type: boolean
-        default: false
+        default: "8388608"
 
 permissions:
   contents: read
@@ -62,7 +70,7 @@ defaults:
 
 jobs:
   measure:
-    name: measure on ${{ matrix.platform }}
+    name: measure (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -74,115 +82,107 @@ jobs:
             runner: macos-15
 
     steps:
-      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Check out the full history
+        # Pinned by sha: a paired measurement that silently ran a different
+        # action version is a number nobody can reproduce.
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          # Both variants are built from this checkout, so the whole history has
+          # to be here — a shallow clone cannot reach the baseline ref.
+          fetch-depth: 0
 
-      # macOS ships bash 3.2 as /bin/bash and always will. The driver needs
-      # bash 5 for EPOCHREALTIME, which is the only timestamp source that costs
-      # no fork — an external timer would add its own process-creation cost to
-      # the exact thing being measured.
-      - name: Select a bash 5+
+      - name: Resolve the pair
+        id: pair
+        env:
+          IN_BEFORE: ${{ inputs.before }}
+          IN_AFTER: ${{ inputs.after }}
+        run: |
+          set -euo pipefail
+          after="${IN_AFTER:-$(git rev-parse HEAD)}"
+          before="${IN_BEFORE:-$(git rev-parse "${after}^")}"
+          git rev-parse --verify "${before}^{commit}" >/dev/null
+          git rev-parse --verify "${after}^{commit}" >/dev/null
+          printf 'before=%s\n' "$(git rev-parse "$before")" >> "$GITHUB_OUTPUT"
+          printf 'after=%s\n' "$(git rev-parse "$after")" >> "$GITHUB_OUTPUT"
+
+      - name: Install a bash new enough for EPOCHREALTIME
         if: matrix.platform == 'macos'
-        run: |
-          brew list bash >/dev/null 2>&1 || brew install bash
-          "$(brew --prefix)/bin/bash" --version | head -1
+        run: brew install bash
 
-      - name: Check the script variant's dependencies
-        run: |
-          jq --version
-          git --version
-
-      - name: Build the binary
+      - name: Record the toolchain
         run: |
           rustc --version
           cargo --version
-          cargo build --release --locked
+          git --version
+          jq --version
 
-      # An arm64 macOS binary needs a signature to execute, and the
-      # measured artifact should be the one that ships rather than a variant of
-      # it. Signing costs nothing per tick — it is a property of the file — but
-      # measuring an unsigned binary would measure something users never run.
-      - name: Ad-hoc code sign
+      - name: Build both variants
+        env:
+          BEFORE: ${{ steps.pair.outputs.before }}
+          AFTER: ${{ steps.pair.outputs.after }}
+        run: |
+          set -euo pipefail
+          mkdir -p measured/bin
+          # A worktree rather than a checkout, so the harness scripts under test
+          # stay the ones from the head commit for both halves of the pair.
+          git worktree add --detach ../before-tree "$BEFORE"
+          ( cd ../before-tree && cargo build --release --locked )
+          cp ../before-tree/target/release/claude-statusline measured/bin/before
+          git worktree add --detach ../after-tree "$AFTER"
+          ( cd ../after-tree && cargo build --release --locked )
+          cp ../after-tree/target/release/claude-statusline measured/bin/after
+
+      - name: Ad-hoc sign both variants
         if: matrix.platform == 'macos'
         run: |
-          codesign --sign - --force --timestamp=none target/release/claude-statusline
-          codesign --verify --strict target/release/claude-statusline
+          set -euo pipefail
+          for v in before after; do
+            codesign --sign - --force --timestamp=none "measured/bin/$v"
+            codesign --verify --strict "measured/bin/$v"
+          done
 
       - name: Measure
         env:
-          IN_COMPONENT: ${{ inputs.component }}
+          MEASURE_HOST_CLASS: hosted runner
           IN_RUNS: ${{ inputs.runs }}
+          IN_MODES: ${{ inputs.modes }}
+          IN_GIT_STATE: ${{ inputs.git_state }}
           IN_TRANSCRIPT_BYTES: ${{ inputs.transcript_bytes }}
-          IN_COLD_CACHE: ${{ inputs.cold_cache }}
-          # The runner label and image version belong beside the numbers,
-          # so a runner-measured figure is never later held against a bare-metal
-          # baseline.
-          MEASURE_RUNNER: ${{ matrix.runner }}
+          BEFORE: ${{ steps.pair.outputs.before }}
+          AFTER: ${{ steps.pair.outputs.after }}
         run: |
-          component="$IN_COMPONENT"
-          cold="$IN_COLD_CACHE"
-
-          # A tag-triggered run carries no inputs, so the tag name is the
-          # request: `measure-subagent` measures that component, and an
-          # optional `@cold` suffix asks for the cache-miss state --
-          # `measure-statusline@cold`. Same shape as the capture workflow's
-          # `capture-<component>@<commit>`.
-          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
-            request="${GITHUB_REF_NAME#measure-}"
-            case "$request" in
-              *@cold) cold=true; request="${request%@cold}" ;;
-            esac
-            if [ -z "$component" ]; then
-              case "$request" in
-                subagent|statusline) component="$request" ;;
-                *) component="subagent" ;;
-              esac
-            fi
-          fi
-          [ -n "$component" ] || component=subagent
-
-          runs="${IN_RUNS:-11}"
-
-          export MEASURE_IMAGE="${ImageOS:-unknown} ${ImageVersion:-unknown}"
-          echo "measuring $component, $runs pairs, on $MEASURE_RUNNER ($MEASURE_IMAGE)"
-
-          mkdir -p measured
-          # The statusline pair has to cover the large-transcript
-          # state. The driver generates the transcript to a target size, so the
-          # number is reproducible on any runner rather than tied to the files
-          # that happen to sit on one machine.
-          extra=""
-          if [ "$component" = statusline ]; then
-            extra="--transcript-bytes ${IN_TRANSCRIPT_BYTES:-8388608}"
-          fi
-          # The warm-cache pair reads as the script's best case against the
-          # binary's only case: its output cache is keyed on a 5-second bucket
-          # and a whole run finishes inside one, so most script probes render
-          # nothing. --cold-cache is the state where both actually work.
-          if [ "$cold" = true ]; then
-            extra="$extra --cold-cache"
-          fi
-          echo "cold cache: ${cold:-false}"
-          # shellcheck disable=SC2086
-          bash tests/harness/measure.sh \
-            --component "$component" \
-            --runs "$runs" \
-            $extra \
+          set -euo pipefail
+          # The runner label and image version travel with the number: §3 makes
+          # host class part of the measurement, and a hosted-runner figure held
+          # against a bare-metal baseline is worse than no figure.
+          printf 'runner: %s\nimage: %s %s\nbefore: %s\nafter: %s\n' \
+            "${{ matrix.runner }}" "${ImageOS:-unknown}" "${ImageVersion:-unknown}" \
+            "$BEFORE" "$AFTER" | tee measured/${{ matrix.platform }}-host.txt
+          bash tests/harness/measure-pair.sh \
+            --before measured/bin/before \
+            --after measured/bin/after \
+            --runs "${IN_RUNS:-15}" \
+            --mode "${IN_MODES:-warm,git-miss,cold}" \
+            --git-state "${IN_GIT_STATE:-dirty}" \
+            --transcript-bytes "${IN_TRANSCRIPT_BYTES:-8388608}" \
             --json "measured/${{ matrix.platform }}.json"
 
-      # A green run that produced no numbers is the same failure the harness's
-      # own guards exist to prevent: it looks like evidence and is not.
       - name: Confirm something was measured
         run: |
-          file="measured/${{ matrix.platform }}.json"
-          if [ ! -s "$file" ]; then
+          set -euo pipefail
+          f="measured/${{ matrix.platform }}.json"
+          if [[ ! -s $f ]]; then
             echo "::error::the driver reported success but wrote no measurement"
             exit 1
           fi
-          cat "$file"
+          cat "$f"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - name: Upload the measurement
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: measured-${{ matrix.platform }}
-          path: measured
+          path: |
+            measured/${{ matrix.platform }}.json
+            measured/${{ matrix.platform }}-host.txt
           if-no-files-found: error
           retention-days: 14

@@ -73,3 +73,8 @@ windows-sys = { version = "0.59", features = [
 [profile.release]
 panic = "unwind"
 opt-level = 3
+# Every tick is a fresh process, so anything the linker can fold or drop is
+# paid back on each of them. One codegen unit is what lets `lto` see the whole
+# crate; with the default sixteen it only works across their boundaries.
+lto = true
+codegen-units = 1
