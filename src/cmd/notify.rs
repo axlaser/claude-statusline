@@ -363,6 +363,31 @@ fn strip_cwd(platform: Platform, detail: &str, cwd: &Path) -> String {
     }
 }
 
+/// Whether this event must stay silent because the session is not actually
+/// finished. Only `stop` is gated: its "Finished working" text is a claim
+/// about the whole turn, and a turn that ends with a subagent still running is
+/// resumed the moment that agent hands back — so one request alerts twice and
+/// the first one is false. Claude Code's `Stop` payload carries
+/// `background_tasks` for exactly this, documented as distinguishing "session
+/// is done" from "session is paused waiting for background work to wake it",
+/// and empty when nothing is in flight.
+///
+/// Absent, null or unparseable reads as nothing running and stays audible: a
+/// missing field must not silence the alert, because a lost notification is
+/// the failure the user cannot see. `session_crons` is deliberately not read —
+/// a scheduled wake-up is a later turn, not unfinished work in this one.
+pub fn silenced_by_background_work(event: &str, stdin: &str) -> bool {
+    if event != "stop" {
+        return false;
+    }
+    serde_json::from_str::<Value>(stdin)
+        .ok()
+        .as_ref()
+        .and_then(|payload| payload.get("background_tasks"))
+        .and_then(Value::as_array)
+        .is_some_and(|tasks| !tasks.is_empty())
+}
+
 /// Decides everything this invocation will do, without doing any of it.
 ///
 /// Order per platform is not cosmetic: the bash scripts background the sound
@@ -381,7 +406,7 @@ pub fn plan(
     env: &Env,
     key: Option<&Key>,
 ) -> Vec<Action> {
-    if event.is_empty() {
+    if event.is_empty() || silenced_by_background_work(event, stdin) {
         return Vec::new();
     }
     let flags = cfg.event(event);

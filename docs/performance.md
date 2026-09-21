@@ -827,3 +827,33 @@ A remote URL is also somewhere credentials genuinely live: CI checkouts write
 `https://x-access-token:<token>@host/...` into `.git/config`. Any URL carrying userinfo is
 refused outright rather than stripped — stripping would silently produce a working link
 from a file the user may not know leaks.
+
+### A stop alert is gated on `background_tasks` — 2026-09-21
+
+Recorded because it changes when a notification fires, and "the alert stopped firing" is
+the one failure the silent-degradation contract guarantees the user cannot see.
+
+**The defect.** `Stop` fires whenever the assistant's turn ends, including a turn that ends
+while a dispatched subagent is still running. Claude Code resumes the session the moment
+that agent hands back, so one user request produced two "Finished working" alerts, and the
+first one was false — it announced the end of work that was still in flight. Subagent
+completion itself was never the trigger: Claude Code emits `SubagentStop` for that, built
+on the same branch as `Stop` (`g ? {…SubagentStop, agent_id:g} : {…Stop}`), and this repo
+registers no `SubagentStop` hook.
+
+**The gate.** `silenced_by_background_work` returns no actions for a `stop` whose payload
+carries a non-empty `background_tasks`. The field is Claude Code's own register of in-flight
+work, documented as distinguishing "session is done" from "session is paused waiting for
+background work to wake it", and empty when nothing is in flight — so this reads a reported
+fact rather than inferring one. The result is exactly one alert per request, at the point
+the user can act on it.
+
+**The fail direction is audible.** Absent, null, wrong-typed, or unparseable all mean
+nothing is known to be running, and all stay audible. Only a non-empty array silences.
+`session_crons` is deliberately not read: a scheduled wake-up is a later turn, not
+unfinished work in this one.
+
+**No new cost, and one avoided.** The stop hook already read its payload for the session id
+the focus record needs, so the gate parses nothing that was not parsed before, and nothing
+here touches a per-tick path. A silenced stop also skips the focus capture, since the
+capture exists for a click on a toast that is never raised.

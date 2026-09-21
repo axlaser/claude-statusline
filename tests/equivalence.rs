@@ -2513,6 +2513,78 @@ fn a_missing_helper_degrades_rather_than_dropping_the_notification() {
     );
 }
 
+/// A stop that fires while a subagent is still running is not the end of the
+/// turn: Claude Code resumes the session the moment that agent hands back, so
+/// alerting here announces "Finished working" twice for one request and the
+/// first one is false. `background_tasks` is the `Stop` payload's own register
+/// of in-flight work — "empty array when nothing is in flight" — and only a
+/// non-empty one silences the alert. Every other shape stays audible: a field
+/// that is absent, null, the wrong type, or wrapped in a payload that does not
+/// parse says nothing about running work, and a lost notification is the
+/// failure the user cannot see.
+#[test]
+fn a_stop_stays_silent_only_while_background_work_is_in_flight() {
+    let cfg = NotifyConfig::default();
+    let env = full_env();
+    let plan_with = |stdin: &str| {
+        as_records(&notify::plan(
+            Platform::Linux,
+            "stop",
+            "",
+            stdin,
+            &cfg,
+            &env,
+            None,
+        ))
+    };
+
+    // The shape every audible case must reproduce exactly, so this asserts the
+    // alert is untouched rather than merely non-empty.
+    let audible = plan_with("");
+    assert!(
+        !audible.is_empty(),
+        "a stop with no payload is the ordinary alert"
+    );
+
+    assert!(
+        plan_with(r#"{"background_tasks":[{"id":"a"}]}"#).is_empty(),
+        "a stop with work still in flight should raise nothing at all"
+    );
+    assert!(
+        plan_with(r#"{"background_tasks":[{"id":"a"},{"id":"b"}]}"#).is_empty(),
+        "two in-flight tasks silence the alert the same way one does"
+    );
+
+    for stdin in [
+        r#"{"background_tasks":[]}"#,
+        r#"{"background_tasks":null}"#,
+        r#"{"background_tasks":"running"}"#,
+        r#"{"session_crons":[{"id":"c"}]}"#,
+        r#"{}"#,
+        "not json at all",
+    ] {
+        assert_eq!(
+            plan_with(stdin),
+            audible,
+            "this payload reports no in-flight work, so the alert must survive it: {stdin}"
+        );
+    }
+
+    // Only `stop` claims the turn is over, so only `stop` is gated. A
+    // permission prompt is waiting on the user no matter what else runs.
+    assert!(
+        !notify::silenced_by_background_work("permission", r#"{"background_tasks":[{"id":"a"}]}"#),
+        "a permission prompt still needs answering while an agent runs"
+    );
+    assert!(
+        !notify::silenced_by_background_work(
+            "context_high",
+            r#"{"background_tasks":[{"id":"a"}]}"#
+        ),
+        "a context alert is about this session, not about background work"
+    );
+}
+
 /// The icon is added only when it is actually on disk, because both helpers
 /// treat a missing icon path as an error rather than ignoring it.
 #[test]

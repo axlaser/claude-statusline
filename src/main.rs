@@ -297,7 +297,12 @@ fn dispatch(sub: &str, rest: &[&str], os_rest: &[std::ffi::OsString]) {
             // a hook captures its own. Only a toast gets one either way.
             let key = match rest.get(2) {
                 Some(arg) => focus::Key::parse(arg),
-                None if cfg.event(event).visual => {
+                // A silenced stop raises no toast, so it captures no focus
+                // record either: the capture exists for a click that can
+                // never happen here.
+                None if cfg.event(event).visual
+                    && !cmd::notify::silenced_by_background_work(event, &payload) =>
+                {
                     focus::session_from_payload(&payload).and_then(|session| {
                         focus::capture(&session::state_dir(), &session, debug::is_enabled())
                     })

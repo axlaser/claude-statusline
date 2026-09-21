@@ -21,7 +21,7 @@ docs/performance.md  standing performance rules: cost model, measurement methodo
 One binary, `claude-statusline`, dispatching on an argv token rather than `argv[0]`:
 
 - `statusline` (the default with no subcommand) -- reads the payload on stdin, renders the box
-- `notify <event>` -- sound and toast delivery, triggered by hooks on permission requests, task completion, and compaction
+- `notify <event>` -- sound and toast delivery, triggered by hooks on permission requests, task completion, and compaction. A `stop` whose payload reports a non-empty `background_tasks` raises nothing: the turn ends but the session is only paused until a running subagent hands back, so alerting there fires twice per request and the first one is false. Every other shape of that field stays audible (see `docs/performance.md` §7)
 - `git-refresh` -- cache invalidation hook registered as PostToolUse, clears stale git status after file-modifying tools
 - `subagent` -- subagentStatusLine handler, tees Claude Code's per-task feed to a session state file for the status line to read; prints nothing so the default agent panel stays intact
 - `self-check` -- renders a compiled-in fixture and compares it to the compiled-in expectation; the installer's gate against a binary that launches but renders wrongly
