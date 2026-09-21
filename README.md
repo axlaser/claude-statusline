@@ -576,12 +576,16 @@ curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/insta
 From a clone of `dev`, the same thing is `bash install/install.sh --dev` or
 `.\install\install.ps1 --dev`.
 
-Each build is named `dev-<date>-<commit>` and ships with the same
-`checksums.txt` and Sigstore attestations a release does, so every gate the
-installer runs is unchanged; only the resolution differs. `--dev` outranks
+There is one dev-channel release, tagged `dev-channel`, and every push replaces
+its assets and notes in place, so the Releases page carries a single entry for it
+rather than one per push. Its title names the commit it was built from. It ships
+with the same `checksums.txt` and Sigstore attestations a release does, so every
+gate the installer runs is unchanged; only the resolution differs. The tag itself
+is an anchor for the release and does not follow the branch — the commit a build
+came from is in the release notes and proven by its attestation. `--dev` outranks
 `--pre` when both are given, and neither the plain install command nor `--pre`
-ever resolves to a dev build. Only the three newest builds are kept, and a
-commit whose message carries `[skip release]` publishes none.
+ever resolves to the dev channel. A commit whose message carries `[skip release]`
+publishes nothing.
 
 To leave the channel, re-run the install command without `--dev`.
 

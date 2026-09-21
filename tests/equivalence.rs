@@ -1283,36 +1283,35 @@ fn anything_but_a_release_tag_publishes_as_a_prerelease() {
     );
 }
 
-/// A push to `dev` publishes the dev channel: one prerelease per push, named
-/// `dev-<date>-<sha>` and created at the pushed commit, with the three newest
-/// kept. The names are immutable on purpose — one moving tag makes every
-/// clone's next `git fetch` fail with "would clobber existing tag" — so
-/// pruning is what keeps the tag list from growing by one per push, and its
-/// `--cleanup-tag` is what makes pruning remove anything a clone would fetch.
-/// Without `--target`, gh would create the tag at the default branch's head,
-/// which is `master`, and the channel would silently ship the wrong commit.
+/// A push to `dev` publishes the dev channel: one prerelease, tagged
+/// `dev-channel`, whose assets and notes are replaced in place on every push.
+/// One release rather than one per push, so the Releases page never fills
+/// with builds; one tag that is never moved, because a moved tag makes every
+/// clone's next `git fetch` fail with "would clobber existing tag". Without
+/// `--target` on the first run, gh would create that tag at the default
+/// branch's head, which is `master`.
 #[test]
-fn a_push_to_dev_publishes_a_pruned_dev_channel_release() {
+fn a_push_to_dev_replaces_the_one_dev_channel_release_in_place() {
     let wf = read_repo_file(RELEASE_WORKFLOW);
     assert!(
         wf.contains("branches:\n      - dev\n"),
         "the workflow no longer runs on a push to dev"
     );
     assert!(
-        wf.contains("tag=dev-$(date -u +%Y%m%d)-${GITHUB_SHA::7}"),
-        "the dev channel's release is not named after the day and the commit"
+        wf.contains("tag=dev-channel"),
+        "the dev channel is no longer one fixed release"
+    );
+    assert!(
+        wf.contains(r#"gh release upload "$TAG" --repo "$REPO" --clobber"#),
+        "an existing dev-channel release is not replaced in place, so pushes fail or pile up"
+    );
+    assert!(
+        wf.contains(r#"gh release edit "$TAG""#),
+        "the dev-channel title and notes are not updated, so the release names a stale commit"
     );
     assert!(
         wf.contains(r#"--target "$GITHUB_SHA""#),
         "the dev tag would be created at the default branch's head, not the pushed commit"
-    );
-    assert!(
-        wf.contains("startswith(\"dev-\")") && wf.contains(".[3:]"),
-        "the dev channel is no longer pruned to its three newest builds"
-    );
-    assert!(
-        wf.contains("--cleanup-tag"),
-        "pruned dev releases leave their tags behind for every clone to fetch"
     );
     assert!(
         wf.contains("[skip release]"),
@@ -3202,11 +3201,11 @@ fn release_resolution_defaults_to_stable_and_opts_in_to_prereleases() {
         failures.check(rel, body.contains("--dev"), || {
             "offers no way to opt into the dev channel".to_string()
         });
-        failures.check(rel, body.contains("releases/tag/dev-"), || {
-            "resolves the dev channel by something other than the dev- tag prefix".to_string()
+        failures.check(rel, body.contains("dev-channel"), || {
+            "does not pin the dev channel's fixed tag".to_string()
         });
         failures.check(rel, body.contains("releases/tag/v[0-9]"), || {
-            "--pre takes the newest entry of any shape, so a dev build would win".to_string()
+            "--pre takes the newest entry of any shape, so the dev channel could win".to_string()
         });
 
         // The API would need a token for anything useful and burns a rate limit

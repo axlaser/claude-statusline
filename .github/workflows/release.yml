@@ -6,11 +6,14 @@ name: release
 #
 #   - a tagged push is a release: stable for exactly vX.Y.Z, a prerelease for
 #     any other tag shape;
-#   - a push to `dev` is the dev channel: a prerelease named `dev-<date>-<sha>`
-#     for that commit, which the installers reach through `--dev` and nothing
-#     else resolves. Only the three newest are kept. The names are immutable on
-#     purpose -- one moving tag would make every clone's next `git fetch` fail
-#     with "would clobber existing tag" -- and a head commit whose message
+#   - a push to `dev` is the dev channel: one prerelease, tagged `dev-channel`,
+#     whose assets and notes are replaced in place on every push. The installers
+#     reach it through `--dev` and nothing else resolves it. One release rather
+#     than one per push, so the Releases page never fills with builds; one tag
+#     that is created on the first run and never moved, because a moving tag
+#     makes every clone's next `git fetch` fail with "would clobber existing
+#     tag". So the tag does not say which commit a build came from -- the notes
+#     name it and the attestation proves it. A head commit whose message
 #     carries `[skip release]` publishes nothing.
 #
 # Artifact packaging was left open. Decision: publish raw binaries, not archives.
@@ -29,8 +32,9 @@ name: release
 
 on:
   push:
-    # The dev channel. The `dev-*` tags this publishes never re-trigger it:
-    # they are created with the workflow token, whose events start no runs.
+    # The dev channel. The `dev-channel` tag its first run creates never
+    # re-triggers it: it is created with the workflow token, whose events start
+    # no runs, and it matches no pattern below.
     branches:
       - dev
     tags:
@@ -50,7 +54,7 @@ permissions:
 # A tag's run is never cancelled. A dev-channel run is superseded by the next
 # push to the branch, so the one in flight stops and its minutes are spared;
 # the window where a cancellation could interrupt publishing is one step long,
-# and the next run replaces the result anyway.
+# and the next run replaces every asset anyway.
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: ${{ github.ref_type == 'branch' }}
@@ -82,23 +86,30 @@ jobs:
     if: github.ref_type == 'tag' || !contains(github.event.head_commit.message, '[skip release]')
     outputs:
       tag: ${{ steps.name.outputs.tag }}
+      title: ${{ steps.name.outputs.title }}
       dev: ${{ steps.name.outputs.dev }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       # Named once, here, and read by every later job. A tag names itself. A
-      # push to `dev` names a dev-channel release after the day and the commit:
-      # immutable, so it never clobbers a tag a clone already fetched, and
-      # sortable, so a release listing reads in order.
+      # push to `dev` names the one dev-channel release, whose tag the first
+      # run creates and no later run moves; the title carries the commit and
+      # the day, so the release listing says what the assets currently are.
       - name: Name the release
         id: name
         run: |
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
-            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-            echo "dev=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "tag=${GITHUB_REF_NAME}"
+              echo "title=${GITHUB_REF_NAME}"
+              echo "dev=false"
+            } >> "$GITHUB_OUTPUT"
           else
-            echo "tag=dev-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-            echo "dev=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "tag=dev-channel"
+              echo "title=dev-channel: dev @ ${GITHUB_SHA::7} ($(date -u +%Y-%m-%d))"
+              echo "dev=true"
+            } >> "$GITHUB_OUTPUT"
           fi
           cat "$GITHUB_OUTPUT"
 
@@ -139,7 +150,7 @@ jobs:
             {
               printf 'Dev channel: the dev branch at %s, built %s.\n\n' \
                 "${GITHUB_SHA::7}" "$(date -u +%Y-%m-%d)"
-              printf 'This is not a release. It tracks the integration branch, may be broken on any given day, and is replaced by the next push. Install it with --dev from the installer on the dev branch:\n\n'
+              printf 'This is not a release. It tracks the integration branch, may be broken on any given day, and is replaced by the next push. The dev-channel tag anchors this release and does not point at the commit above; the attestation on each asset does. Install it with --dev from the installer on the dev branch:\n\n'
               printf '    curl -fsSL https://raw.githubusercontent.com/%s/dev/install/install.sh | bash -s -- --dev\n\n' \
                 "$GITHUB_REPOSITORY"
               printf 'Verify before use:\n\n    sha256sum --check --ignore-missing checksums.txt\n    gh attestation verify claude-statusline-<target> --repo %s\n' \
@@ -496,52 +507,46 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.tag.outputs.tag }}
+          TITLE: ${{ needs.version.outputs.title }}
           DEV: ${{ needs.version.outputs.dev }}
           REPO: ${{ github.repository }}
         run: |
-          flags=()
-          if [ "${{ steps.tag.outputs.prerelease }}" = "true" ]; then
-            flags+=(--prerelease)
-          fi
-          if [ "$DEV" = "true" ]; then
-            # The dev tag does not exist yet, so gh creates it, and --target is
-            # what points that at the pushed commit rather than the default
-            # branch's head. A re-run of the same commit on the same day replaces
-            # its own release. A tagged release is never replaced: a re-run there
-            # still fails on the release that exists, as it always has.
-            flags+=(--target "$GITHUB_SHA")
-            if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
-              gh release delete "$TAG" --repo "$REPO" --cleanup-tag --yes
-            fi
-          fi
           # --repo is required, not decorative: this job downloads artifacts and
           # never checks out the repository, so gh has no git remote to infer
           # from and fails with "not a git repository". Adding a checkout just to
           # give it that context would widen the surface of the one job holding
           # the signing and release permissions.
-          gh release create "$TAG" \
-            --repo "$REPO" \
-            --title "$TAG" \
-            --notes-file notes/notes.md \
-            "${flags[@]}" \
-            dist/claude-statusline-* \
-            dist/checksums.txt
-
-      # Three dev-channel releases stay. The newest is the channel; the two
-      # behind it cover an install that resolved the feed moments before a push
-      # replaced it. Their tags go with them, so a clone holds at most the few it
-      # fetched while they were live, and the atom feed the installers read
-      # keeps room for the tagged releases `--pre` looks for.
-      - name: Prune the dev channel
-        if: needs.version.outputs.dev == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-        run: |
-          gh release list --repo "$REPO" --limit 100 --json tagName,createdAt \
-              --jq '[.[] | select(.tagName | startswith("dev-"))] | sort_by(.createdAt) | reverse | .[3:] | .[].tagName' \
-            | while read -r old; do
-                [ -n "$old" ] || continue
-                echo "pruning $old"
-                gh release delete "$old" --repo "$REPO" --cleanup-tag --yes
-              done
+          if [ "$DEV" = "true" ] && gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            # The one dev-channel release exists: replace its assets and notes
+            # in place. The tag stays where the first run put it. An install
+            # that straddles the replacement sees a checksum mismatch and
+            # refuses, which is the fail-closed direction; re-running it works.
+            gh release upload "$TAG" --repo "$REPO" --clobber \
+              dist/claude-statusline-* \
+              dist/checksums.txt
+            gh release edit "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file notes/notes.md \
+              --prerelease
+          else
+            flags=()
+            if [ "${{ steps.tag.outputs.prerelease }}" = "true" ]; then
+              flags+=(--prerelease)
+            fi
+            if [ "$DEV" = "true" ]; then
+              # First run of the channel: the tag does not exist yet, so gh
+              # creates it, and --target is what points that at the pushed
+              # commit rather than the default branch's head.
+              flags+=(--target "$GITHUB_SHA")
+            fi
+            # A tagged release is never replaced: a re-run of a tag's workflow
+            # still fails on the release that exists, as it always has.
+            gh release create "$TAG" \
+              --repo "$REPO" \
+              --title "$TITLE" \
+              --notes-file notes/notes.md \
+              "${flags[@]}" \
+              dist/claude-statusline-* \
+              dist/checksums.txt
+          fi

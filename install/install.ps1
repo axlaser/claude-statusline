@@ -165,25 +165,14 @@ if ($pinnedVersion) {
     $tag = $pinnedVersion
     Ok "Pinned to $tag"
 } elseif ($devChannel) {
-    # The dev channel: the newest `dev-*` release in the same atom feed the
-    # prerelease channel reads. The release workflow publishes one from every
-    # push to `dev` and keeps the three newest, so the first match is the
-    # branch head. It outranks --pre when both are given, because a user who
-    # asked for the branch head wants exactly that.
-    $tag = $null
-    try {
-        $atom = (Invoke-WebRequest -Uri "https://github.com/$repoSlug/releases.atom" `
-            -UseBasicParsing -ErrorAction Stop).Content
-        if ($atom -match 'releases/tag/dev-[^"<]+') { $tag = $Matches[0] -replace '^releases/tag/', '' }
-    } catch {}
-    if (-not $tag) {
-        Err "Could not resolve a dev-channel release"
-        Info "None may be published yet. Try --pre, set CLAUDE_STATUSLINE_VERSION=<tag>"
-        Info "to pin a version, or check your connection."
-        Info "Your existing installation was left untouched."
-        return
-    }
-    Warn "Installing $tag (dev channel: the dev branch head, which may be unstable)"
+    # The dev channel is one release, tagged dev-channel, whose assets the
+    # release workflow replaces on every push to dev. There is nothing to
+    # resolve: the tag is fixed, so the download URL is known before any
+    # request is made, and a channel that has never been published fails at
+    # the download rather than here. It outranks --pre when both are given,
+    # because a user who asked for the branch head wants exactly that.
+    $tag = 'dev-channel'
+    Warn "Installing the dev channel (the dev branch head, which may be unstable)"
 } elseif ($allowPrerelease) {
     # The releases atom feed lists every release newest-first, prereleases
     # included, over plain unauthenticated HTTPS. That is the whole reason to
