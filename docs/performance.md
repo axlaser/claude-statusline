@@ -783,3 +783,47 @@ newest a week ago. That under-reports — the row stays quiet about an update ra
 inventing one — which is the direction to fail in. It can also lead the registry by
 minutes, because the heading lands on `main` when the release is cut. The segment's claim
 is "a newer version exists", not "an update will install right now".
+
+### The repo link reads `.git/config`, not `git config --get` — 2026-09-21
+
+The path row became a clickable link to the repository's origin, which needs
+`remote.origin.url`. The obvious way to get it is `git config --get remote.origin.url`,
+and that is the one thing §2's first hard rule forbids: a second subprocess on a per-tick
+path. `git` is the only subprocess, and it is already spent on status.
+
+`.git/config` is read directly instead, through `state::read_trusted_prefix` with a 64 KB
+bound. Nothing new had to be discovered to find it: `status()` already refuses to render a
+git row unless `cwd/.git/index` is a regular file, so `cwd/.git/config` is established to
+exist by the same test. The linked-worktree and submodule cases where `.git` is a file
+render no git row today and therefore no link either — the same limitation, not a new one.
+
+The value rides in the existing git cache record as a ninth field, so it is re-read only
+when that cache misses. The field count is the format version: an eight-field record from
+an older build fails `parse_cache_record` and is refetched, so no migration exists to get
+wrong. It is re-normalised on the way *out* of the cache as well as in, because a cache
+record is untrusted text and this one ends up in a terminal's link handler.
+
+**Measured**, fresh-process probes on the maintainer's Windows machine (Windows 11,
+release build), 21 ticks each, medians:
+
+| path | baseline | with the remote read |
+| --- | --- | --- |
+| git cache hit | 71 ms | 71 ms (untouched by construction) |
+| git cache miss (forced, new session id per tick) | 180 ms | 168 ms |
+
+The miss-path medians overlap heavily and the "after" column is the *faster* of the two,
+which is noise rather than a speedup: that path is dominated by the ~110 ms git subprocess
+and a ~1 KB file read does not clear its noise floor. The cache-hit path is unchanged
+without needing a measurement to say so — `read_remote` is reachable only from
+`read_from_git`, which a hit never calls.
+
+**Rendered output is not byte-identical, deliberately.** This is a feature, not a
+refactor: a repository with a browsable origin now emits OSC 8 around the path. The
+invariant held instead is that it costs *zero columns* —
+`a_repo_remote_makes_the_path_a_link_without_costing_columns` asserts the visible text is
+unchanged and every row width still agrees.
+
+A remote URL is also somewhere credentials genuinely live: CI checkouts write
+`https://x-access-token:<token>@host/...` into `.git/config`. Any URL carrying userinfo is
+refused outright rather than stripped — stripping would silently produce a working link
+from a file the user may not know leaks.

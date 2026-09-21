@@ -43,6 +43,10 @@ pub struct GitStatus {
     pub ahead: u64,
     pub behind: u64,
     pub stash: u64,
+    /// The browsable `https://` form of `remote.origin.url`, or empty. Empty is
+    /// the ordinary case: no origin, a non-HTTP remote, or a URL carrying
+    /// credentials -- see [`normalize_remote`].
+    pub remote: String,
 }
 
 /// One `--porcelain=v2 --branch --show-stash` reading, before the branch traps.
@@ -197,7 +201,9 @@ pub fn cache_path(temp: &Path, session_id: &str) -> Option<PathBuf> {
 /// Parses a cache record into the index mtime it was taken at and its reading.
 pub fn parse_cache_record(raw: &str) -> Option<(i64, GitStatus)> {
     let fields: Vec<&str> = raw.trim_end_matches(['\r', '\n']).split(SEP).collect();
-    if fields.len() != 8 {
+    // A record from a build before the remote field simply fails to parse and
+    // is refetched: the field count is the format version.
+    if fields.len() != 9 {
         return None;
     }
     let mtime = fields[0].parse().ok()?;
@@ -211,6 +217,9 @@ pub fn parse_cache_record(raw: &str) -> Option<(i64, GitStatus)> {
             ahead: digits(fields[5]),
             behind: digits(fields[6]),
             stash: digits(fields[7]),
+            // Re-normalised on the way out: a planted record is untrusted text
+            // and must not reach a link handler unchecked.
+            remote: normalize_remote(fields[8]).unwrap_or_default(),
         },
     ))
 }
@@ -219,9 +228,109 @@ pub fn parse_cache_record(raw: &str) -> Option<(i64, GitStatus)> {
 /// a planted value costs a zero rather than reaching arithmetic.
 pub fn cache_record(index_mtime: i64, s: &GitStatus) -> String {
     format!(
-        "{}{SEP}{}{SEP}{}{SEP}{}{SEP}{}{SEP}{}{SEP}{}{SEP}{}",
-        index_mtime, s.branch, s.insertions, s.deletions, s.untracked, s.ahead, s.behind, s.stash
+        "{}{SEP}{}{SEP}{}{SEP}{}{SEP}{}{SEP}{}{SEP}{}{SEP}{}{SEP}{}",
+        index_mtime,
+        s.branch,
+        s.insertions,
+        s.deletions,
+        s.untracked,
+        s.ahead,
+        s.behind,
+        s.stash,
+        s.remote
     )
+}
+
+/// `.git/config` is read no further than this. It is an ini file a few hundred
+/// bytes long in practice; the bound is what keeps a planted one from being
+/// read whole.
+const CONFIG_PREFIX: u64 = 64 * 1024;
+
+/// `remote.origin.url` out of `.git/config` text. Pure over the file contents.
+///
+/// Only `origin` -- a repo with several remotes has no single right answer, and
+/// guessing one is worse than rendering no link. Section headers are matched on
+/// the exact `[remote "origin"]` spelling git writes; the subsection name is
+/// case-sensitive in git, so this is not a case-insensitive compare.
+pub fn parse_origin_url(config: &str) -> Option<&str> {
+    let mut in_origin = false;
+    for line in config.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_origin = line.starts_with("[remote \"origin\"]");
+            continue;
+        }
+        if !in_origin {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("url") {
+            return Some(value.trim());
+        }
+    }
+    None
+}
+
+/// The browsable `https://` form of a remote URL, or `None` when there is not
+/// one worth linking.
+///
+/// Three refusals matter more than the conversions:
+///
+/// - **Credentials.** `https://x-access-token:ghp_...@host/owner/repo` is a
+///   valid remote and a real token. Handing it to a terminal's link handler
+///   would put it in a browser's history and address bar, so a URL carrying
+///   userinfo is refused outright rather than stripped -- stripping would
+///   silently produce a working link from a file the user may not know leaks.
+/// - **Scheme.** Only `http`/`https` and the `git@host:path` SSH shorthand
+///   convert. `file://`, `git://` and anything unrecognised render no link.
+/// - **Control characters.** `hyperlink` guards these too, but refusing here
+///   keeps a mangled value out of the cache record as well.
+pub fn normalize_remote(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.chars().any(char::is_control) || raw.contains(SEP) {
+        return None;
+    }
+
+    // `git@github.com:owner/repo.git` -> `github.com/owner/repo`
+    let rest = if let Some(tail) = raw.strip_prefix("git@") {
+        let (host, path) = tail.split_once(':')?;
+        format!("{host}/{}", path.trim_start_matches('/'))
+    } else {
+        raw.strip_prefix("https://")
+            .or_else(|| raw.strip_prefix("http://"))
+            .or_else(|| raw.strip_prefix("ssh://"))?
+            .to_string()
+    };
+
+    // Userinfo survives every branch above, so the check goes here once.
+    let authority = rest.split('/').next().unwrap_or_default();
+    if authority.contains('@') || authority.is_empty() || !rest.contains('/') {
+        return None;
+    }
+
+    let trimmed = rest.trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    Some(format!("https://{trimmed}"))
+}
+
+/// `remote.origin.url` for the repository at `cwd`, already normalised.
+///
+/// A file read, deliberately not `git config --get`: a second subprocess on the
+/// per-tick path is the one thing `docs/performance.md` forbids outright, and
+/// `status` has already established that `cwd/.git` is a real directory.
+fn read_remote(cwd: &Path) -> String {
+    let path = cwd.join(".git").join("config");
+    let Some(bytes) = state::read_trusted_prefix(&path, CONFIG_PREFIX) else {
+        return String::new();
+    };
+    let Ok(text) = String::from_utf8(bytes) else {
+        return String::new();
+    };
+    parse_origin_url(&text)
+        .and_then(normalize_remote)
+        .unwrap_or_default()
 }
 
 /// The directory the git row describes: the payload's, or this process's own.
@@ -292,7 +401,13 @@ fn read_fresh_cache(clock: &dyn Clock, path: &Path, index_mtime: i64) -> Option<
 }
 
 fn read_from_git(cwd: &Path) -> GitStatus {
-    let mut out = GitStatus::default();
+    // The remote is read regardless of what the subprocess returns: it is a
+    // property of the repository, not of the working tree, so it survives a git
+    // old enough to fail `--show-stash`.
+    let mut out = GitStatus {
+        remote: read_remote(cwd),
+        ..GitStatus::default()
+    };
 
     // `--show-stash` needs git >= 2.15; on older git the whole call fails and
     // the row renders empty through the same path as "no repository".

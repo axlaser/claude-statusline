@@ -5359,6 +5359,163 @@ fn shortstat_counts_are_optional_and_independent() {
     failures.assert_empty("shortstat parsing");
 }
 
+/// The link has no script ancestor, so there is nothing to capture it against:
+/// `capture.sh` drives the deleted scripts, and they never emitted OSC 8. The
+/// expectation is a literal here, which is what a resolved divergence
+/// prescribes -- see `the_projection_resolves_every_tasks_feed_state`.
+///
+/// The width assertion is the load-bearing half. A hyperlink that costs columns
+/// would pad every other row to match and skew the whole box, and reading the
+/// output alone cannot see that.
+#[test]
+fn a_repo_remote_makes_the_path_a_link_without_costing_columns() {
+    let payload = Payload::parse(
+        r#"{"session_id":"linked","workspace":{"current_dir":"/var/repo/work"},
+            "model":{"display_name":"Opus 5","id":"claude-opus-5"},
+            "context_window":{"context_window_size":200000,"used_percentage":42.4}}"#,
+    )
+    .expect("the payload should parse");
+
+    let git = GitStatus {
+        branch: "dev".into(),
+        remote: "https://github.com/o/r".into(),
+        ..GitStatus::default()
+    };
+    let inputs = render::Inputs {
+        payload: &payload,
+        home: None,
+        git: Some(&git),
+        scan: None,
+        record: None,
+        subagents: &[],
+        now: 1_767_225_600,
+        newer_version: None,
+    };
+    let out = render::render(&inputs);
+
+    assert!(
+        // `format_cwd` shortens a path outside home to `.../parent/leaf`, so
+        // the label is the shortened form, not the raw cwd.
+        out.contains("\u{1b}]8;;https://github.com/o/r\u{7}.../repo/work\u{1b}]8;;\u{7}"),
+        "the path should be wrapped in a hyperlink: {out:?}"
+    );
+    let plain = strip_ansi(&out);
+    assert!(
+        plain.contains(".../repo/work"),
+        "the label must still be visible: {plain:?}"
+    );
+    assert!(
+        !plain.contains("github.com"),
+        "the URI must not be visible text: {plain:?}"
+    );
+    let widths: Vec<usize> = out.lines().map(render::visible_width).collect();
+    assert!(
+        widths.iter().all(|w| *w == widths[0]),
+        "the link skewed the box: widths {widths:?}\n{out}"
+    );
+
+    // The same render with no remote differs only by the escapes.
+    let bare = GitStatus {
+        remote: String::new(),
+        ..git.clone()
+    };
+    let unlinked = render::render(&render::Inputs {
+        git: Some(&bare),
+        ..inputs
+    });
+    assert_eq!(
+        strip_ansi(&unlinked),
+        plain,
+        "linking must not change a single visible column"
+    );
+}
+
+/// The remote becomes a URL the terminal will hand to a browser, so the
+/// refusals are the point of this table, not the conversions. A remote URL is
+/// a place credentials genuinely live -- CI checkouts write
+/// `https://x-access-token:<token>@host/...` into `.git/config` -- and a link
+/// would put that token in an address bar and a history file.
+#[test]
+fn a_remote_url_becomes_a_browsable_link_or_nothing() {
+    let cases: [(&str, Option<&str>, &str); 13] = [
+        (
+            "https://github.com/o/r.git",
+            Some("https://github.com/o/r"),
+            "the .git suffix goes",
+        ),
+        (
+            "https://github.com/o/r",
+            Some("https://github.com/o/r"),
+            "already browsable",
+        ),
+        (
+            "git@github.com:o/r.git",
+            Some("https://github.com/o/r"),
+            "SSH shorthand converts",
+        ),
+        (
+            "ssh://git@github.com/o/r.git",
+            None,
+            "ssh:// carries userinfo, so it is refused with the rest",
+        ),
+        (
+            "http://internal.example/o/r",
+            Some("https://internal.example/o/r"),
+            "http is upgraded, not refused",
+        ),
+        (
+            "https://x-access-token:ghp_secret@github.com/o/r.git",
+            None,
+            "a token in the URL must never reach a link handler",
+        ),
+        (
+            "https://user@github.com/o/r",
+            None,
+            "userinfo alone is enough to refuse",
+        ),
+        ("file:///srv/repos/r.git", None, "file:// is not browsable"),
+        ("git://github.com/o/r.git", None, "git:// is not browsable"),
+        ("", None, "no remote configured"),
+        (
+            "https://github.com/o/r\u{1b}[2J",
+            None,
+            "a control character is refused before it reaches the row",
+        ),
+        (
+            "https://github.com/o/r\u{1f}x",
+            None,
+            "the cache separator would forge a field",
+        ),
+        ("https://github.com", None, "an authority with no path"),
+    ];
+    let mut failures = Failures::default();
+    for (raw, want, why) in cases {
+        let got = git::normalize_remote(raw);
+        failures.check(why, got.as_deref() == want, || {
+            format!("[{raw:?}] want {want:?}, got {got:?}")
+        });
+    }
+    failures.assert_empty("remote normalisation");
+}
+
+/// Only `origin`, and only from its own section: a `url` under `[remote
+/// "upstream"]` or `[branch "main"]` must not be mistaken for it.
+#[test]
+fn the_origin_url_is_read_from_its_own_section() {
+    let config = "[core]\n\trepositoryformatversion = 0\n\
+                  [remote \"upstream\"]\n\turl = https://github.com/other/repo.git\n\
+                  [remote \"origin\"]\n\turl = https://github.com/o/r.git\n\
+                  \tfetch = +refs/heads/*:refs/remotes/origin/*\n\
+                  [branch \"main\"]\n\tremote = origin\n";
+    assert_eq!(
+        git::parse_origin_url(config),
+        Some("https://github.com/o/r.git")
+    );
+
+    let no_origin = "[remote \"upstream\"]\n\turl = https://github.com/other/repo.git\n";
+    assert_eq!(git::parse_origin_url(no_origin), None);
+}
+
 /// The record shares its name and shape with the scripts' on purpose:
 /// `git-refresh` deletes exactly `statusline-git-<id>.txt`, so a binary caching
 /// anywhere else would keep a stale git row alive through every edit.
@@ -5372,6 +5529,7 @@ fn the_git_cache_record_round_trips_and_fails_safe() {
         ahead: 2,
         behind: 1,
         stash: 5,
+        remote: "https://github.com/axlaser/claude-statusline".into(),
     };
     let line = git::cache_record(1_700_000_000, &status);
     assert_eq!(
@@ -6229,16 +6387,34 @@ fn feed_freshness_is_measured_through_the_injected_clock() {
 // Render, thresholds, notification spawn
 // ---------------------------------------------------------------------------
 
-/// Drops SGR escapes so an assertion can talk about what the user sees.
-/// Deliberately not `render::visible_width`'s stripper: a test that shared the
-/// implementation under test would agree with it even when both were wrong.
+/// Drops SGR escapes and OSC 8 hyperlinks so an assertion can talk about what
+/// the user sees. Deliberately not `render::visible_width`'s stripper: a test
+/// that shared the implementation under test would agree with it even when both
+/// were wrong.
+///
+/// The OSC arm is not optional once a row carries a link. Scanning to the next
+/// `m` would cut a hyperlink in the middle of its URI -- `CHANGELOG.md` and
+/// `main` both contain one -- and leave the tail in the "visible" text.
 fn strip_ansi(s: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
     while let Some(start) = rest.find('\u{1b}') {
         out.push_str(&rest[..start]);
-        match rest[start..].find('m') {
-            Some(end) => rest = &rest[start + end + 1..],
+        let after = &rest[start + 1..];
+        if after.starts_with(']') {
+            // OSC: runs to BEL or ESC \, whichever comes first.
+            let bel = after.find('\u{7}');
+            let st = after.find("\u{1b}\\");
+            rest = match (bel, st) {
+                (Some(b), Some(t)) if t < b => &after[t + 2..],
+                (Some(b), _) => &after[b + 1..],
+                (None, Some(t)) => &after[t + 2..],
+                (None, None) => "",
+            };
+            continue;
+        }
+        match after.find('m') {
+            Some(end) => rest = &after[end + 1..],
             None => {
                 rest = "";
                 break;
@@ -6255,9 +6431,24 @@ fn strip_ansi(s: &str) -> String {
 /// the bash captures recorded before the harness pinned a UTF-8 locale.
 #[test]
 fn visible_width_counts_columns_not_bytes_or_escapes() {
-    let cases: [(&str, usize, &str); 7] = [
+    let cases: [(&str, usize, &str); 10] = [
         ("plain", 5, "ASCII is its own length"),
         ("\u{1b}[31mred\u{1b}[0m", 3, "SGR escapes occupy no columns"),
+        (
+            "\u{1b}]8;;https://example.com/a-m-m\u{7}v1\u{1b}]8;;\u{7}",
+            2,
+            "an OSC 8 hyperlink costs only its label, URI 'm's and all",
+        ),
+        (
+            "\u{1b}]8;;https://example.com\u{1b}\\v1\u{1b}]8;;\u{1b}\\",
+            2,
+            "ESC-backslash terminates an OSC just as BEL does",
+        ),
+        (
+            "\u{1b}[33m\u{1b}]8;;https://example.com\u{7}v1 ↑v2\u{1b}]8;;\u{7}\u{1b}[0m",
+            6,
+            "a link nested in SGR is still only its label",
+        ),
         (
             "\u{1b}[38;5;242m░\u{1b}[0m",
             1,
@@ -6282,6 +6473,10 @@ fn an_unterminated_escape_does_not_eat_the_rest_of_the_row() {
     // A branch name is an untrusted field. A stripper that swallowed everything
     // after a stray ESC[ would under-count the row and over-pad the box.
     assert_eq!(render::visible_width("a\u{1b}[31b"), 6);
+    // The same for OSC, which matters more: it has no length bound, so a
+    // stripper that scanned to end-of-string would count the row as empty.
+    // 'a' + the bare ESC + "]8;;" + the 19-character URI, each one column.
+    assert_eq!(render::visible_width("a\u{1b}]8;;https://example.com"), 25);
 }
 
 #[test]
@@ -6572,10 +6767,15 @@ fn a_hostile_changelog_heading_yields_only_its_dotted_digits() {
 
 /// The sink's half of the same guard, and the box-width invariant behind it.
 ///
-/// `strip_sgr` only consumes `ESC [ ... m`, so an escape of any other shape
-/// would be counted as visible columns and the padding would desynchronise.
-/// Asserting the width invariant is what makes this a test of the box rather
-/// than of the scrub alone.
+/// `strip_escapes` consumes only the two shapes this tool emits, so an escape
+/// of any other shape would be counted as visible columns and the padding would
+/// desynchronise. Asserting the width invariant is what makes this a test of the
+/// box rather than of the scrub alone.
+///
+/// This payload carries a `version` and a newer one, so the row it renders also
+/// carries a real OSC 8 hyperlink. The width assertion therefore pins both
+/// halves at once: the scrub still rejects a payload-derived escape, and a
+/// renderer-emitted one still costs nothing.
 #[test]
 fn a_hostile_newer_version_cannot_escape_the_row_or_skew_the_box() {
     let payload = Payload::parse(

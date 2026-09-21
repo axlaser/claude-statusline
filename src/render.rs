@@ -4,10 +4,11 @@
 //! touches the filesystem or the clock, which lets the case table drive the
 //! whole render without a process.
 //!
-//! SGR escapes occupy no columns, and the box is padded to a row's *visible*
-//! width, so every width question goes through [`visible_width`], never
-//! `str::len`. The scripts mis-padded every row by counting a 3-byte bar cell
-//! as three columns; `chars()` keeps that from reappearing here.
+//! SGR escapes and OSC 8 hyperlinks occupy no columns, and the box is padded
+//! to a row's *visible* width, so every width question goes through
+//! [`visible_width`], never `str::len`. The scripts mis-padded every row by
+//! counting a 3-byte bar cell as three columns; `chars()` keeps that from
+//! reappearing here.
 
 use crate::git::GitStatus;
 use crate::payload::{sanitize_display, Payload};
@@ -28,6 +29,18 @@ pub const BLUE: &str = "\x1b[34m";
 pub const WHITE: &str = "\x1b[37m";
 pub const GRAY: &str = "\x1b[90m";
 pub const BAR_EMPTY: &str = "\x1b[38;5;242m";
+
+// The one non-SGR form this tool emits. OSC 8 opens with the URI and closes
+// with an empty one; BEL terminates both, which is the spelling Claude Code's
+// own status line documentation uses. `ESC \` would be equivalent to a
+// terminal, but only one of the two needs a fixture.
+const OSC8: &str = "\x1b]8;;";
+const BEL: &str = "\x07";
+
+/// Where the version segment points. The running version is compared against
+/// this file's first heading already (see `update.rs`); the link is the rest of
+/// that answer -- what actually changed.
+const CHANGELOG_URL: &str = "https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md";
 
 /// Shown instead of the box when stdin is empty or not a JSON object.
 pub const BAD_JSON: &str = "\x1b[31m[statusline: bad JSON]\x1b[0m";
@@ -59,7 +72,7 @@ fn row_sep() -> String {
 /// a more correct table would disagree with the captured fixtures, so
 /// widening it is a behaviour change, not a tidy-up.
 pub fn visible_width(s: &str) -> usize {
-    let stripped = strip_sgr(s);
+    let stripped = strip_escapes(s);
     if stripped.is_ascii() {
         return stripped.len();
     }
@@ -83,39 +96,85 @@ fn char_width(c: char) -> usize {
     }
 }
 
-/// Removes `ESC [ <digits and semicolons> m`, the only escape form this tool
-/// emits. An unterminated sequence is left alone rather than eating the row.
-fn strip_sgr(s: &str) -> String {
+/// Removes the two escape forms this tool emits: `ESC [ <digits and
+/// semicolons> m` (SGR) and `ESC ] ... <ST>` (OSC, which here is only the
+/// hyperlink pair), where `<ST>` is BEL or `ESC \`. Both contribute zero
+/// columns, so both must go before a width is counted.
+///
+/// An unterminated sequence is left alone rather than eating the row. That
+/// matters more for OSC than for SGR: OSC has no length bound, so a truncated
+/// one would otherwise swallow everything after it.
+fn strip_escapes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
-        if c != '\x1b' || chars.peek() != Some(&'[') {
+        if c != '\x1b' {
             out.push(c);
             continue;
         }
-        let mut lookahead = chars.clone();
-        lookahead.next(); // the '['
-        let mut consumed = 1;
-        let mut terminated = false;
-        for c in lookahead.by_ref() {
-            consumed += 1;
-            if c == 'm' {
-                terminated = true;
-                break;
+        let consumed = match chars.peek() {
+            Some('[') => sgr_len(&chars),
+            Some(']') => osc_len(&chars),
+            _ => None,
+        };
+        match consumed {
+            Some(n) => {
+                for _ in 0..n {
+                    chars.next();
+                }
             }
-            if !c.is_ascii_digit() && c != ';' {
-                break;
-            }
-        }
-        if terminated {
-            for _ in 0..consumed {
-                chars.next();
-            }
-        } else {
-            out.push(c);
+            None => out.push(c),
         }
     }
     out
+}
+
+/// Characters after the `ESC` that a terminated SGR sequence occupies.
+fn sgr_len(chars: &std::iter::Peekable<std::str::Chars>) -> Option<usize> {
+    let mut lookahead = chars.clone();
+    lookahead.next(); // the '['
+    let mut consumed = 1;
+    for c in lookahead {
+        consumed += 1;
+        if c == 'm' {
+            return Some(consumed);
+        }
+        if !c.is_ascii_digit() && c != ';' {
+            return None;
+        }
+    }
+    None
+}
+
+/// The same for an OSC sequence, which ends at BEL or `ESC \` and admits any
+/// byte before it.
+fn osc_len(chars: &std::iter::Peekable<std::str::Chars>) -> Option<usize> {
+    let mut lookahead = chars.clone();
+    lookahead.next(); // the ']'
+    let mut consumed = 1;
+    while let Some(c) = lookahead.next() {
+        consumed += 1;
+        if c == '\x07' {
+            return Some(consumed);
+        }
+        if c == '\x1b' && lookahead.peek() == Some(&'\\') {
+            return Some(consumed + 1);
+        }
+    }
+    None
+}
+
+/// Wraps `text` in an OSC 8 hyperlink.
+///
+/// Refuses a URI carrying a control character and returns the text unlinked:
+/// a stray BEL or `ESC` would close the sequence early and spill the rest of
+/// the URI into the row as visible text, which is the one way this can skew
+/// the box.
+fn hyperlink(uri: &str, text: &str) -> String {
+    if uri.chars().any(char::is_control) {
+        return text.to_string();
+    }
+    format!("{OSC8}{uri}{BEL}{text}{OSC8}{BEL}")
 }
 
 fn repeat(c: char, n: usize) -> String {
@@ -200,9 +259,17 @@ fn version_segment(sep: &str, version: &str, newer: Option<&str>) -> String {
     if version.is_empty() {
         return String::new();
     }
+    // Linked in both states, but it earns the click only in the yellow one:
+    // "what changed" is the question a newer version raises.
     match newer {
-        Some(latest) => format!("{sep}{YELLOW}v{version} ↑{latest}{RESET}"),
-        None => format!("{sep}{GRAY}v{version}{RESET}"),
+        Some(latest) => format!(
+            "{sep}{YELLOW}{}{RESET}",
+            hyperlink(CHANGELOG_URL, &format!("v{version} ↑{latest}"))
+        ),
+        None => format!(
+            "{sep}{GRAY}{}{RESET}",
+            hyperlink(CHANGELOG_URL, &format!("v{version}"))
+        ),
     }
 }
 
@@ -679,7 +746,15 @@ pub fn render(inputs: &Inputs) -> String {
     // --- path -------------------------------------------------------------
     let cwd = format_cwd(p.cwd(), inputs.home);
     let git_part = inputs.git.map(format_git).unwrap_or_default();
-    let mut path_row = format!("{CYAN}{cwd}{RESET}");
+    // The path carries the repo link rather than the branch: a branch name is
+    // user text that would need percent-encoding to survive a URL, and the
+    // repository root needs none.
+    let repo = inputs.git.map(|g| g.remote.as_str()).unwrap_or_default();
+    let mut path_row = if repo.is_empty() {
+        format!("{CYAN}{cwd}{RESET}")
+    } else {
+        format!("{CYAN}{}{RESET}", hyperlink(repo, &cwd))
+    };
     let path_label = if git_part.is_empty() {
         "project"
     } else {
