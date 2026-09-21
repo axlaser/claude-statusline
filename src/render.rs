@@ -248,7 +248,11 @@ fn effort_segment(sep: &str, effort: &str) -> String {
     format!("{sep}{}{effort} effort{RESET}", effort_color(effort))
 }
 
-/// `v2.1.278`, and whether there is anything to do about it.
+/// `CC v2.1.278`, and whether there is anything to do about it.
+///
+/// Labelled, because the row it ends already names a model and a status and an
+/// effort level, and a bare `v2.1.278` beside those reads as belonging to any
+/// of them. `CC` says whose version it is: Claude Code's, not the model's.
 ///
 /// Grey when the running version is the newest one on disk: a number the user
 /// cannot act on is a label, not an alert, and the row already carries three
@@ -272,9 +276,9 @@ fn version_segment(sep: &str, version: &str, newer: bool) -> String {
     // Linked in both states, but it earns the click only in the yellow one:
     // "what changed" is the question a newer version raises.
     let (colour, text) = if newer {
-        (YELLOW, format!("v{version} ↑"))
+        (YELLOW, format!("CC v{version} ↑"))
     } else {
-        (GRAY, format!("v{version}"))
+        (GRAY, format!("CC v{version}"))
     };
     format!("{sep}{colour}{}{RESET}", hyperlink(CHANGELOG_URL, &text))
 }

@@ -8574,13 +8574,13 @@ fn the_model_row_opens_on_the_bar_and_closes_on_the_version() {
         "the merged row carries the context reading before the name: {current:?}"
     );
     assert!(
-        current.ends_with("· v2.1.278"),
+        current.ends_with("· CC v2.1.278"),
         "an up-to-date session shows the version alone: {current:?}"
     );
 
     let stale = model_row_of(model, true);
     assert!(
-        stale.ends_with("· v2.1.278 ↑"),
+        stale.ends_with("· CC v2.1.278 ↑"),
         "a newer version is flagged, not named: the arrow says there is one and          the link says what changed, without spending columns on a number the          user cannot act on in place: {stale:?}"
     );
     assert!(
@@ -8595,7 +8595,7 @@ fn the_model_row_opens_on_the_bar_and_closes_on_the_version() {
         true,
     );
     assert!(
-        absent.ends_with("ready") && !absent.contains('v'),
+        absent.ends_with("ready") && !absent.contains("CC") && !absent.contains('v'),
         "no version in the payload means no segment: {absent:?}"
     );
 }
@@ -8801,7 +8801,7 @@ fn the_version_segment_resolves_its_changelog_through_the_real_roots() {
 
     let rendered = strip_ansi(&cmd_statusline::run(&clock, &roots, payload));
     assert!(
-        rendered.contains("v2.1.278 \u{2191}"),
+        rendered.contains("CC v2.1.278 \u{2191}"),
         "the real changelog join must reach the staged cache: {rendered}"
     );
     // The name rule rides the same row and reaches the box only through this
@@ -8821,7 +8821,7 @@ fn the_version_segment_resolves_its_changelog_through_the_real_roots() {
     // spends the same character on commits ahead of upstream, and a payload
     // that grew a repo would make a looser check pass for the wrong reason.
     assert!(
-        quiet.contains("v2.1.278") && !quiet.contains("v2.1.278 \u{2191}"),
+        quiet.contains("CC v2.1.278") && !quiet.contains("CC v2.1.278 \u{2191}"),
         "an up-to-date session shows the version alone: {quiet}"
     );
 }
