@@ -23,10 +23,15 @@ which half of the old model survives.
    line 1 executed, and the entire caching architecture existed to dodge it. The binary
    pays process creation and nothing else, which is why the whole warm tick now costs less
    than the floor used to. Startup is no longer the thing to optimise.
-2. **What remains is real work.** In rough order: subprocess `git` (~74 ms for the pair on
-   the maintainer's Windows machine, bounded by the 5s TTL), reading and scanning the
-   transcript (linear in its size), and the syscalls around the six state files. None of
-   these are startup artefacts; each is doing something.
+2. **What remains is real work.** In rough order on Windows: subprocess `git` (**~121 ms
+   for the pair as a tick actually pays it**, on the maintainer's machine, bounded by the
+   5s TTL), reading and scanning the transcript (linear in its size, ~6.8 ms/MB), and the
+   syscalls around the six state files. None of these are startup artefacts; each is doing
+   something. The ~74 ms this line quoted until 2026-09-21 was the raw `git` pair timed on
+   its own; the tick pays roughly 30 ms more to spawn and drain two children, and the
+   repository has grown since that figure was taken. **The order inverts on Linux**, where
+   process creation and `git` are an order of magnitude cheaper but the transcript scan
+   costs the same — see §6.
 3. **Work scales with session length only in the transcript**, and that scan is skipped
    entirely when `(mtime, size)` are unchanged. The stored record carries the message count
    and idle flag precisely so an unchanged transcript needs no read at all. This is the
@@ -94,10 +99,16 @@ process per tick, so measurements must too.
   caches more; the script's output cache was keyed on a 5-second bucket, so a whole run
   finished inside one and most of its probes rendered nothing at all. `measure.sh` and
   `measure.ps1` take `--cold-cache` / `-ColdCache` for this.
-- **Paired measurements go through `tests/harness/measure.sh` / `measure.ps1`**, which
-  implement every rule above and refuse to report a number until each variant has been
-  proven to do its work. A probe that silently no-opped reads as a spectacular speed-up:
-  that guard is what caught a measurement of an unimplemented subcommand.
+- **Guard every probe with a proof of work.** A probe that silently no-opped reads as a
+  spectacular speed-up: that guard is what caught a measurement of an unimplemented
+  subcommand, and on 2026-09-21 it caught a `cmd.exe` quoting bug that made a 188 ms tick
+  read as 14.6 ms. Assert the box rendered (`┏` and the model name), or that the handler
+  wrote its file, before believing any median.
+- **`tests/harness/measure.sh` / `measure.ps1` implement every rule above but no longer
+  run** — they pair against the script trees deleted at `1f5acf2`, and `measure-pair.ps1`
+  only accepts a pair that straddles the version-segment change. Until a replacement
+  exists, measure the subcommand directly and carry the rules above by hand. See the note
+  at the end of §6.
 - **Bash on Git Bash: process counts are portable, milliseconds are not** (emulated fork is
   ~20–50× a real one). This applied to the scripts; it still applies to anything measured
   through an MSYS shell.
@@ -238,7 +249,12 @@ observed fresh/stale outcome, not only the rendered bytes — see
 
 - [ ] Subprocess delta stated. `git` is the only one that should appear.
 - [ ] End-to-end before/after medians measured per §3 (fresh process, ≥ 7 runs), warm
-  **and** cold, with the host class recorded.
+  **and** cold, with the host class recorded. No harness script does this for you any more
+  — see the note at the end of §6 — so measure the subcommand directly, and guard the
+  probe: a run that silently no-ops reads as a spectacular speed-up.
+- [ ] If the change can touch the git block, a row measured **with a real `.git`**. A
+  scratch working directory with none never spawns `git`, and that is 121 ms of a Windows
+  tick going unmeasured (§7).
 - [ ] `cargo test` green, including the case table — byte-identical rendered output.
 - [ ] If the change touches a guarded read, the tasks-feed freshness window, or the
   done-linger stamp: the observed fresh/stale outcome asserted, not just the bytes (§4).
@@ -271,15 +287,55 @@ numbers are MSYS shape-only and were never a milliseconds claim).
 | bash forks, six-row subagent render | 39 |
 | Interpreter floor (`powershell.exe -NoProfile`, empty script) | ~124 ms |
 
-### Current — the binary
+### Current — the binary (2026-09-21, `3f5f919`)
 
-The pairs below are the live reference. Read the **Binary** column as the baseline a change
-must not regress; the Script column is what it replaced, kept because a delta with only one
-side is not evidence.
+**These are the live reference.** Read them, not the 2026-07-27 pairs below, as the
+baseline a change must not regress. Release build, rustc 1.97.1, git 2.48.1. Median of 15
+fresh processes per probe, isolated `HOME`/`TEMP`, `STATUSLINE_DEBUG` cleared, 8 MB
+generated transcript, proof-of-work guard on every row.
 
-The two costs a hot-path change is most likely to move, both *maintainer machine* class:
-subprocess `git` at ~73.9 ms for the status+diff pair (§7), and a full transcript parse at
-46.9 ms against 8.4 MB (§7) — which an unchanged transcript now skips entirely.
+| Tick shape | Windows 11 26200 (*maintainer machine*) | `rust:latest` container on WSL2, same box (*not bare metal, not a runner*) |
+|---|---|---|
+| Floor — malformed or empty input | 9.6 ms | ~1.1 ms |
+| Warm — nothing changed since the last tick | 11.3 ms | 1.4 ms |
+| Git TTL expired — the tick after a >5s pause | 132 ms | 22.7 ms |
+| Cold — a new message *and* a git miss | 187 ms | 79.3 ms |
+| `subagent` | 11.2 ms | 1.3 ms |
+| `git-refresh` | 9.6 ms | 1.1 ms |
+| `self-check` | 9.6 ms | 1.2 ms |
+
+Attribution on Windows from the same run: process plus the five entry layers 9.7 ms,
+render and state I/O ~1.6 ms, transcript scan 57 ms at 8 MB, and the `git` pair 121 ms as
+the tick pays it — 92.3 ms for the two children timed alone, ~30 ms more for the parent to
+spawn and drain them.
+
+**Cold is not a once-per-session cost.** The scan is skipped only while `(mtime, size)` are
+unchanged, and every new message appends to the transcript, so the next tick rescans the
+whole file. Transcript scan, cold, no `.git`, Windows — linear at **~6.8 ms/MB**:
+
+| Transcript | 0.5 MB | 1 MB | 2 MB | 4 MB | 8 MB | 16 MB | 32 MB |
+|---|---|---|---|---|---|---|---|
+| Scan | 5.1 ms | 9.1 ms | 16.3 ms | 30.2 ms | 56.9 ms | 110.9 ms | 219.1 ms |
+
+Linux scans the same 8 MB in 56 ms, within noise of Windows' 57 ms: the scan is CPU work
+and does not care which OS runs it, while process creation and `git` very much do. **That
+inverts which cost dominates** — `git` on Windows, the transcript on Linux — so §1's
+ordering describes Windows only.
+
+**The Windows rows in the 2026-07-27 pairs below carry a `cmd.exe`.** `measure.ps1` times
+`& cmd.exe /c $CommandLine`, so every Windows binary figure there includes a shell the
+status line never spawns: measured 2026-09-21 at **+15.2 ms warm and +16.2 ms cold**
+against a bare `cmd /c rem` floor of 12.7 ms. That is most of the distance between the
+22.1 ms warm pair below and the 11.3 ms recorded above. Those pairs remain the only
+side-by-side against the scripts that will ever exist, which is why they are kept — but
+they are provenance, not a baseline.
+
+**No measurement script runs against this tree.** `measure.ps1` and `measure.sh` pair
+against the script trees deleted at `1f5acf2` and abort on a missing-file check;
+`measure-pair.ps1` asserts a version segment only one specific change introduces, so it
+refuses any other pair. Until one is written, measure the subcommand directly per §3 —
+fresh process per probe, median of ≥ 7, isolated profile and temp, warm and cold, host
+class recorded.
 
 ### Paired medians — script vs. binary (2026-07-27)
 
@@ -451,6 +507,12 @@ paired medians:
 | `status --porcelain=v2 --branch --show-stash` | 36.5 ms |
 | `diff --shortstat HEAD` | 37.4 ms |
 | pair | 73.9 ms |
+
+**Re-measured 2026-09-21, same machine, same argv:** 45.2 ms and 47.1 ms, pair 92.3 ms —
+the repository has grown. More importantly these are the children timed *alone*; a tick
+that spawns and drains both pays **~121 ms**, and that is the figure §1 and §6 now carry.
+The decision below is unaffected — it was never made on cost — but do not reuse 73.9 ms as
+a budget.
 
 **Process-count delta: none for the git block itself** — 2 subprocesses per
 miss, 3 on detached HEAD, 0 on a cache hit, exactly as §6 records for the
@@ -644,11 +706,25 @@ Flat across three orders of magnitude, inside run-to-run noise. The scan does no
 any plausible temp-root size, so the alternative this entry rejected — a persisted set of
 seen ids — stays rejected, now on measurement rather than on absence of it.
 
-**The `.git` half is still open, and this entry stays open with it.** The reopen condition
-is a conjunction: a §6 row measured with a populated temp root *and a real `.git`*. Only the
-first was measured. The §6 statusline medians still never spawn `git`, so a `git.rs`
-regression still passes the §5 before/after-medians gate untouched, and that is the warning
-this entry exists to carry. Do not read the table above as retiring it.
+**The `.git` half is now measured — 2026-09-21 — and it closes this entry.** Maintainer
+machine, fresh process per probe, median of 15, 8 MB transcript, against this repository's
+real `.git`:
+
+| Tick | Median |
+|---|---|
+| Warm, git cache hit | 11.3 ms |
+| Git TTL expired, transcript unchanged | 132.4 ms |
+| Cold, both expired | 187.1 ms |
+
+The warning this entry existed to carry was correct, and the cost is large: **`git` is
+121 ms of that 132 ms tick**, three orders of magnitude above the noise floor the temp-root
+sweep found nothing in, and the §6 statusline pairs never saw a millisecond of it. §6 now
+carries rows taken with a real `.git`, and §5 requires one from any change that can reach
+the git block, so the gate no longer runs blind.
+
+Measured in the same run with the state directory populated to 440 entries, both figures
+were unchanged — 11.3 ms warm, 132.0 ms TTL-expired — which re-confirms the temp-root half
+a second time, against the current binary rather than the 2026-08-02 one.
 
 The scan itself is **kept**, deliberately. The scripts did the same thing with a shell glob
 (`eb56345:linux/statusline.sh:1239`), and it is what finds task files orphaned by a session
@@ -657,9 +733,9 @@ beside the feed would make the cost proportional to live tasks, but it changes r
 semantics, and no measurement yet shows the scan mattering. What is wrong today is the
 claim, not the code.
 
-Reopen condition: a §6 row measured with a populated temp root and a real `.git`, showing
-either cost above the noise floor. Until such a row exists, the statusline medians describe
-a best case, and this entry is the reason.
+Reopen condition: **met and closed, 2026-09-21.** Both halves of the conjunction have been
+measured — the temp root negatively, twice, and `.git` positively — and §6 records the
+result. The statusline medians no longer describe a best case.
 
 ### Click-to-focus capture runs on the alert path only — 2026-09-20
 
@@ -857,3 +933,36 @@ unfinished work in this one.
 the focus record needs, so the gate parses nothing that was not parsed before, and nothing
 here touches a per-tick path. A silenced stop also skips the focus capture, since the
 capture exists for a click on a toast that is never raised.
+
+### The git-miss path costs ~9 ms more than it did at `eb56345` — 2026-09-21, open
+
+Found by A/B-ing the binary that produced §6's original medians against `3f5f919`. Both
+built release from the same toolchain, measured on the maintainer's machine, one fresh
+process per probe, median of 15, 8 MB transcript, sequential rather than interleaved:
+
+| Row | `eb56345` | `3f5f919` | Delta |
+|---|---|---|---|
+| Warm, no `.git` | 11.4 ms | 10.9 ms | −0.5 ms |
+| Warm, real `.git` | 11.4 ms | 11.4 ms | 0 |
+| Cold, no `.git` | 67.3 ms | 66.6 ms | −0.7 ms |
+| Cold, real `.git` | 182.0 ms | 191.0 ms | **+9.0 ms (+4.9%)** |
+| Git TTL expired | 130.6 ms | 140.0 ms | **+9.4 ms (+7.2%)** |
+
+The warm tick has not regressed, and neither has the transcript scan. The cost is
+**confined to the rows where `git` actually runs**, which rules out the state directory:
+that is resolved on every tick including warm ones, and the warm rows show zero delta.
+Both binaries were confirmed during the run to take their documented storage paths —
+`eb56345` wrote flat, `3f5f919` wrote the state directory — so the comparison is not
+measuring one of them falling back.
+
+The candidate is the bounded git child and drained stdout of 2026-07-28, which landed
+immediately after `eb56345` and whose cost was never recorded. **This is not bisected**, so
+only the delta is measured and the attribution is a hypothesis.
+
+One caveat on reading the table: the two binaries do not render the same box — 2274 bytes
+against 2007 — because the model and context rows were merged since. This is a cost
+comparison across two months of feature change, not an equivalence pair, so the 9 ms is an
+upper bound on any single regression.
+
+Resolution condition: a bisect across `eb56345..3f5f919` naming the commit, then either a
+fix or an accepted cost recorded here with the justification that buys it.
