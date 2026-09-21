@@ -1,7 +1,6 @@
 //! Two of the areas platform-conditional code is confined to: file-ownership
 //! checks and process-entry stream handling. Notification delivery is the third
-//! and lives in the `notify` submodule, with its click side — capture,
-//! transport and URI registration — in `focus`.
+//! and lives in `notify`, with its click side in `focus`.
 //!
 //! Keep new `#[cfg]` code here rather than scattering it —
 //! `platform_conditional_code_stays_in_its_areas` asserts the file list.
@@ -11,32 +10,26 @@ use std::path::Path;
 pub mod focus;
 pub mod notify;
 
-/// What a candidate state directory is.
-///
-/// Returned by both `dir_verdict` (which only looks) and `create_private_dir`
-/// (which creates first). After a creation attempt, `Absent` means the mkdir
-/// failed for a mundane reason — permissions, a full disk — and is the caller's
-/// signal for `WriteOutcome::Failed`, where `Hostile` is its signal for
-/// `SkippedHostile`. `state::write_guarded` draws exactly that line, and a bool
-/// return would collapse it.
+/// What a candidate state directory is, from `dir_verdict` (looks only) or
+/// `create_private_dir` (creates first). After a creation attempt, `Absent`
+/// means the mkdir failed for a mundane reason and maps to
+/// `WriteOutcome::Failed`, where `Hostile` maps to `SkippedHostile`;
+/// `state::write_guarded` draws that line, and a bool would collapse it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirVerdict {
     /// Nothing is there. Safe to create.
     Absent,
-    /// A real directory, owned by a trusted principal, with no group or other
-    /// permission bits on Unix.
+    /// A real directory, trusted owner, no group or other bits on Unix.
     Private,
     /// A symlink, a reparse point, a non-directory, a foreign owner, or — on
     /// Unix — a mode that lets anyone else in. Never adopted.
     Hostile,
 }
 
-/// Looks at `path` without creating anything.
-///
-/// **Creates nothing, on any path through it.** The status line resolves its
-/// state directory before the payload is parsed, and
-/// `degraded_input_renders_the_notice_and_touches_no_state` asserts that a tick
-/// which could not be understood leaves the temp directory completely empty.
+/// Looks at `path` without creating anything, on any path through it: the
+/// state directory is resolved before the payload is parsed, and
+/// `degraded_input_renders_the_notice_and_touches_no_state` asserts that a
+/// tick which could not be understood leaves the temp directory empty.
 ///
 /// Fail directions match `state::is_hostile` deliberately, so the two guards
 /// cannot disagree about the same question one level apart:
@@ -45,43 +38,35 @@ pub enum DirVerdict {
 /// - not a directory → `Hostile`
 /// - owner resolvable and foreign → `Hostile`
 /// - owner **not** resolvable → falls through to the symlink check, so a real
-///   directory reads `Private`. Failing closed here would cost the state
-///   directory on every machine where the ownership lookup is unavailable; see
-///   `state::owner_check_passes` for why that inversion is the one this project
-///   already paid nine days for.
+///   directory reads `Private`. Failing closed would cost the state directory
+///   wherever the ownership lookup is unavailable; see
+///   `state::owner_check_passes` for why that inversion already cost nine days.
 pub fn dir_verdict(path: &Path) -> DirVerdict {
     match std::fs::symlink_metadata(path) {
-        // Something is there; the handle decides what. Opening refuses to
-        // follow links, so a symlink and a plain file both fail to open and
-        // read as hostile without a second stat to race against.
+        // Something is there; the handle decides. The open refuses to follow
+        // links, so a symlink or plain file reads hostile with no stat to race.
         Ok(_) => imp::verify_through_handle(path),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => DirVerdict::Absent,
-        // Unreadable for some other reason. Refusing is the conservative answer
-        // and costs only the flat-root fallback, which is today's behaviour.
+        // Unreadable otherwise: refusing costs only the flat-root fallback.
         Err(_) => DirVerdict::Hostile,
     }
 }
 
 /// Creates `path` privately if it is absent, then verifies it through an open
-/// handle.
+/// handle. Tolerates `AlreadyExists`, because two of this binary's three
+/// per-tick processes can race here; `Absent` on return means the creation
+/// failed for a mundane reason.
 ///
-/// Tolerates `AlreadyExists`, because two of this binary's three per-tick
-/// processes can race here. `Absent` on return means the creation failed for a
-/// mundane reason.
-///
-/// The verification deliberately does **not** re-stat the path: `lstat`-then-use
-/// -by-path is the shape that produced CVE-2025-71176 in pytest, where a
-/// symlink swapped in after the check passed the owner test. The handle is
-/// opened refusing to follow links, and every question is then asked of the
-/// handle.
+/// The verification deliberately does **not** re-stat the path:
+/// `lstat`-then-use-by-path is the shape that produced CVE-2025-71176 in
+/// pytest, a symlink swapped in after the check. The handle is opened refusing
+/// to follow links, and every question is then asked of it.
 pub fn create_private_dir(path: &Path) -> DirVerdict {
-    // The ancestors first, unguarded and best-effort. `mkdir_private` creates
-    // exactly one level, so a temp root that does not exist would otherwise make
-    // every state write fail for the life of the session — silently, because a
-    // failed write only means the next tick recomputes. `write_guarded` used
-    // `create_dir_all` before the state directory existed, and these ancestors
-    // are the OS temp root, which this binary did not own then and does not own
-    // now. Building them the ordinary way restores that behaviour without
+    // The ancestors first, unguarded and best-effort: `mkdir_private` creates
+    // exactly one level, so a missing temp root would otherwise fail every
+    // state write for the life of the session, silently. The ancestors are the
+    // OS temp root, which this binary never owned, so building them the
+    // ordinary way restores the pre-state-directory behaviour without
     // weakening the one level that is ours.
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -99,10 +84,9 @@ mod imp {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
-    /// Layer 1 of silent degradation. Nothing below the panic hook can be trusted
-    /// to stay quiet
-    /// — a stack overflow or allocation failure writes straight to fd 2 from
-    /// the runtime — so the descriptor is redirected before anything runs.
+    /// Layer 1 of silent degradation. A stack overflow or allocation failure
+    /// writes straight to fd 2 from the runtime, below the panic hook, so the
+    /// descriptor is redirected before anything runs.
     pub fn redirect_stderr_to_null() {
         unsafe {
             let path = b"/dev/null\0";
@@ -120,22 +104,20 @@ mod imp {
         Some(unsafe { libc::geteuid() } as u64)
     }
 
-    /// Uses `symlink_metadata` so a symlink reports its own ownership rather
-    /// than its target's.
+    /// The current user alone; Unix has no counterpart to Administrators.
     pub fn trusted_owners() -> Vec<u64> {
         current_owner().into_iter().collect()
     }
 
+    /// `symlink_metadata`, so a symlink reports its own owner, not its target's.
     pub fn file_owner(path: &Path) -> Option<u64> {
         std::fs::symlink_metadata(path).ok().map(|m| m.uid() as u64)
     }
 
-    /// Creates the directory at `0700` in a single `mkdir(2)`.
-    ///
-    /// `DirBuilderExt::mode` passes the mode straight to the syscall. A
-    /// `create_dir` followed by `set_permissions` would leave the directory at
-    /// the process umask for the width of that gap, and on a shared `/tmp` that
-    /// is long enough for any local user to enter it and plant.
+    /// Creates the directory at `0700` in a single `mkdir(2)`. A `create_dir`
+    /// followed by `set_permissions` would leave it at the process umask for
+    /// the width of that gap, and on a shared `/tmp` that is long enough for
+    /// any local user to enter it and plant.
     pub fn mkdir_private(path: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new().mode(0o700).create(path)
@@ -144,10 +126,9 @@ mod imp {
     pub fn verify_through_handle(path: &Path) -> super::DirVerdict {
         use std::os::unix::fs::OpenOptionsExt;
 
-        // `O_NOFOLLOW` refuses a symlink at the final component and
-        // `O_DIRECTORY` refuses anything that is not a directory, so both
-        // answers come from the open itself. Asking by path and then opening is
-        // the ordering that produced CVE-2025-71176.
+        // `O_NOFOLLOW` and `O_DIRECTORY` make the open itself refuse a symlink
+        // and a non-directory; asking by path and then opening is the ordering
+        // that produced CVE-2025-71176.
         let Ok(file) = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
@@ -158,9 +139,8 @@ mod imp {
         let Ok(md) = file.metadata() else {
             return super::DirVerdict::Hostile;
         };
-        // Any group or other bit is a way in for someone else, which is the one
-        // property the directory is verified for. This is also what lets the
-        // design stop at one level of depth: nobody else can traverse it, so
+        // Any group or other bit is a way in for someone else. It is also what
+        // lets the design stop at one level: nobody else can traverse it, so
         // there is nothing for `openat2` and `RESOLVE_BENEATH` to defend.
         if md.mode() & 0o077 != 0 {
             return super::DirVerdict::Hostile;
@@ -206,8 +186,7 @@ mod imp {
             .collect()
     }
 
-    /// Layer 1, Windows form: swap the process's standard error handle for
-    /// one on `NUL`.
+    /// Layer 1, Windows form: swap the standard error handle for one on `NUL`.
     pub fn redirect_stderr_to_null() {
         unsafe {
             let name: Vec<u16> = "NUL\0".encode_utf16().collect();
@@ -226,8 +205,7 @@ mod imp {
         }
     }
 
-    /// Hashes a SID's bytes into a comparable id. Only equality matters here,
-    /// so a stable digest is enough and avoids carrying raw pointers around.
+    /// Hashes a SID's bytes into a comparable id; only equality matters here.
     unsafe fn sid_id(sid: PSID) -> Option<u64> {
         if sid.is_null() {
             return None;
@@ -276,14 +254,11 @@ mod imp {
     }
 
     /// The Administrators group, which owns everything an elevated process
-    /// creates.
-    ///
-    /// A standard user cannot produce a file owned by this group, so accepting
-    /// it does not widen the set of principals the guard defends against — an
+    /// creates. A standard user cannot produce a file owned by it, so accepting
+    /// it does not widen the set of principals the guard defends against: an
     /// administrator already owns the binary, `settings.json`, and the ability
     /// to take ownership of anything else. `install.ps1` has accepted admin
-    /// ownership of the install directory since it was written; this is the
-    /// runtime catching up to it.
+    /// ownership of the install directory since it was written.
     fn administrators() -> Option<u64> {
         unsafe {
             let mut size: u32 = 0;
@@ -317,24 +292,21 @@ mod imp {
         out
     }
 
-    /// Creates the directory, inheriting the parent's ACL.
-    ///
-    /// There is no Windows counterpart to the Unix `0700` argument: a
-    /// restrictive DACL would have to be built and applied, and `%TEMP%` is
-    /// per-user already. `verify_through_handle` therefore makes no permission
-    /// claim on this platform — see the `DirVerdict` docs and the accepted
-    /// divergence in `docs/performance.md` §4.
+    /// Creates the directory, inheriting the parent's ACL. There is no Windows
+    /// counterpart to `0700` — a restrictive DACL would have to be built, and
+    /// `%TEMP%` is per-user already — so `verify_through_handle` makes no
+    /// permission claim on this platform; see the `DirVerdict` docs and the
+    /// accepted divergence in `docs/performance.md` §4.
     pub fn mkdir_private(path: &Path) -> std::io::Result<()> {
         std::fs::create_dir(path)
     }
 
-    /// The owner of an already-open handle.
-    ///
-    /// `SE_KERNEL_OBJECT`, not `SE_FILE_OBJECT`: the point is to ask about the
-    /// object the handle is pinned to. `file_owner` below takes a path and so
-    /// re-walks the name, which is safe for the per-file guard that stats the
-    /// same path immediately, and is not safe here — a swap landing between the
-    /// reparse-point check and the owner call would answer for the new target.
+    /// The owner of an already-open handle. `SE_KERNEL_OBJECT`, not
+    /// `SE_FILE_OBJECT`: the question is about the object the handle is pinned
+    /// to. `file_owner` below re-walks the name by path, which is safe for the
+    /// per-file guard that stats the same path immediately and not here, where
+    /// a swap between the reparse-point check and the owner call would answer
+    /// for the new target.
     unsafe fn handle_owner(handle: HANDLE) -> Option<u64> {
         let mut owner: PSID = std::ptr::null_mut();
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -361,10 +333,9 @@ mod imp {
     pub fn verify_through_handle(path: &Path) -> super::DirVerdict {
         unsafe {
             let w = wide(path);
-            // `FILE_FLAG_BACKUP_SEMANTICS` is what allows opening a directory at
-            // all. `FILE_FLAG_OPEN_REPARSE_POINT` opens the reparse point itself
-            // rather than its target, so a planted junction is inspectable
-            // instead of silently followed.
+            // `FILE_FLAG_BACKUP_SEMANTICS` allows opening a directory at all;
+            // `FILE_FLAG_OPEN_REPARSE_POINT` opens a planted junction itself
+            // rather than silently following it.
             let handle = CreateFileW(
                 w.as_ptr(),
                 FILE_GENERIC_READ,
@@ -383,10 +354,9 @@ mod imp {
                 CloseHandle(handle);
                 return super::DirVerdict::Hostile;
             }
-            // A junction, not a symlink, is the realistic squat vector in
-            // `%TEMP%`, and `symlink_metadata` does not report one as a symlink.
-            // Rejecting every reparse point covers both, and it runs before the
-            // owner is asked for so the answer cannot describe a target.
+            // A junction, the realistic squat in `%TEMP%`, is no symlink to
+            // `symlink_metadata`; rejecting every reparse point covers both,
+            // before the owner is asked so the answer cannot describe a target.
             if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
                 || info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
             {
@@ -450,8 +420,7 @@ pub fn trusted_owners() -> Vec<u64> {
     imp::trusted_owners()
 }
 
-/// The owner id of `path` itself (not its symlink target), or `None` when it
-/// cannot be determined.
+/// The owner id of `path` itself (not its symlink target), or `None`.
 pub fn file_owner(path: &Path) -> Option<u64> {
     imp::file_owner(path)
 }

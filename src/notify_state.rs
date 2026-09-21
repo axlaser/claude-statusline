@@ -1,14 +1,11 @@
 //! Edge-triggered alerts and the per-session notification latch.
 //!
-//! The status line fires two alerts: context usage crossing its threshold, and
-//! a rate-limit window crossing its own. Both are *edge* triggered — the point
-//! is one notification per crossing, not one per refresh — and the edge lives
-//! in a state file, because each refresh is a fresh process with no memory of
-//! the last one.
-//!
-//! The decision is a pure function ([`decide`]) so the whole latch matrix is
-//! reachable from the case table without a clock, a filesystem, or a spawned
-//! child.
+//! The status line fires two alerts, context usage and a rate-limit window
+//! crossing their thresholds. Both are edge triggered — one notification per
+//! crossing, not per refresh — and the edge lives in a state file because each
+//! refresh is a fresh process. The decision is a pure function ([`decide`]) so
+//! the latch matrix is reachable from the case table without a clock, a
+//! filesystem, or a spawned child.
 
 use std::path::{Path, PathBuf};
 
@@ -19,9 +16,8 @@ use crate::session::sanitize_session_id;
 pub struct Latch {
     pub context_high: bool,
     pub rate_limit: bool,
-    /// The `resets_at` the rate alert last fired against. When the window
-    /// rolls over, this changes and the latch clears — otherwise one busy
-    /// window would suppress the alert forever.
+    /// The `resets_at` the rate alert last fired against; a rollover clears
+    /// the latch, else one busy window would suppress the alert forever.
     pub rate_resets_at: String,
 }
 
@@ -29,11 +25,9 @@ pub struct Latch {
 pub enum LatchState {
     /// Absent (never notified) or read cleanly.
     Usable(Latch),
-    /// Present but untrusted, unreadable, or unparseable.
-    ///
-    /// Fail closed: notify nothing and write nothing this refresh. A torn read
-    /// leaves the fields blank, which reads as "never notified" and would
-    /// re-fire the alert on every refresh for as long as the collision lasts.
+    /// Present but untrusted, unreadable, or unparseable. Fail closed: notify
+    /// nothing and write nothing this refresh, because a torn read left blank
+    /// would read as "never notified" and re-fire the alert on every refresh.
     Unusable,
 }
 
@@ -59,11 +53,9 @@ pub fn latch_path(temp_dir: &Path, session_id: &str) -> Option<PathBuf> {
     Some(temp_dir.join(format!("statusline-notify-{safe}.json")))
 }
 
-/// Reads the latch through the state guard.
-///
-/// Absent is [`LatchState::Usable`] with everything false — the common first
-/// refresh of a session. Anything else that cannot produce three good fields is
-/// [`LatchState::Unusable`].
+/// Reads the latch through the state guard. Absent is [`LatchState::Usable`]
+/// with everything false (a session's first refresh); anything else that
+/// cannot produce three good fields is [`LatchState::Unusable`].
 pub fn read_latch(path: &Path) -> LatchState {
     if std::fs::symlink_metadata(path).is_err() {
         return LatchState::Usable(Latch::default());
@@ -103,11 +95,10 @@ pub fn latch_json(latch: &Latch) -> String {
         r#"{{"notified_context_high":{},"notified_rate_limit":{},"last_rate_resets_at":{}}}"#,
         latch.context_high,
         latch.rate_limit,
-        // serde owns the whole escape. The scripts' backslash-and-quote pair
-        // left control bytes raw, so one such byte in a payload `resets_at`
-        // wrote a latch `read_latch` could never parse again — Unusable, and
-        // the rewrite that would repair the file is gated on usable, so the
-        // session's notifications stayed dead until the file was deleted.
+        // serde owns the escape. The scripts' backslash-and-quote pair left
+        // control bytes raw; one in a payload `resets_at` then wrote a latch
+        // `read_latch` could never parse, and since the repairing rewrite is
+        // gated on usable, the session's notifications stayed dead.
         serde_json::to_string(&latch.rate_resets_at).unwrap_or_else(|_| "\"\"".to_string())
     )
 }
@@ -140,8 +131,8 @@ pub fn decide(
         latch.context_high = true;
         changed = true;
     } else if ctx_pct < ctx_threshold && latch.context_high {
-        // Re-arm. Dropping below the threshold is what makes the *next*
-        // crossing fire again; without this the alert is once per session.
+        // Re-arm, so the next crossing fires again; without this the alert is
+        // once per session.
         latch.context_high = false;
         changed = true;
     }
@@ -168,12 +159,9 @@ pub fn decide(
 }
 
 /// The child's argv: `notify <event> <value>`, plus the click key as a fourth
-/// value when the tick captured one.
-///
-/// The child cannot capture for itself — it has no console, and its parent
-/// has exited by the time it runs — so the key travels in argv. The token is
-/// visible there to same-user processes, which are inside the boundary
-/// already (KTD1).
+/// value when the tick captured one. The child cannot capture for itself (no
+/// console, parent gone), so the key travels in argv, visible to same-user
+/// processes, which are inside the boundary already.
 pub fn spawn_args(alert: &Alert, key: Option<&Key>) -> Vec<String> {
     let mut args = vec![
         "notify".to_string(),
@@ -186,12 +174,10 @@ pub fn spawn_args(alert: &Alert, key: Option<&Key>) -> Vec<String> {
     args
 }
 
-/// Re-executes this binary as `claude-statusline notify <event> <value>
-/// [<key>]`, detached and never waited on.
-///
-/// The render path must not deliver inline: a notification that blocks is a
-/// status line that stops refreshing. This mirrors the scripts' `&` and
-/// `Start-Process -WindowStyle Hidden`.
+/// Re-executes this binary as `notify <event> <value> [<key>]`, detached and
+/// never waited on. The render path must not deliver inline: a notification
+/// that blocks is a status line that stops refreshing. This mirrors
+/// the scripts' `&` and `Start-Process -WindowStyle Hidden`.
 pub fn spawn(alert: &Alert, key: Option<&Key>) {
     let Ok(exe) = std::env::current_exe() else {
         crate::debug::log(|| "notify spawn: cannot resolve current_exe".to_string());
@@ -200,18 +186,16 @@ pub fn spawn(alert: &Alert, key: Option<&Key>) {
     let mut command = std::process::Command::new(exe);
     command
         .args(spawn_args(alert, key))
-        // The child must not inherit this tick's pipes. A null stdin returns
-        // end-of-file at once to the hook-payload read every event now makes,
-        // and an inherited stdout would keep the parent's pipe open past exit
-        // and stall whoever is reading it.
+        // The child must not inherit this tick's pipes: a null stdin ends the
+        // hook-payload read at once, and an inherited stdout would hold the
+        // parent's pipe open past exit and stall its reader.
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
 
-    // Notification delivery is one of the three places platform-specific code
-    // is allowed to live. Without this a console window
-    // flashes on every crossing when the parent has no console to inherit; the
-    // scripts never hit it because PowerShell was already the console.
+    // Without this a console window flashes on every crossing when the parent
+    // has no console to inherit; the scripts never hit it because PowerShell
+    // was already the console.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -220,8 +204,7 @@ pub fn spawn(alert: &Alert, key: Option<&Key>) {
     }
 
     match command.spawn() {
-        // Deliberately not waited on. The child is reaped by init on Unix once
-        // this process exits, which happens within milliseconds.
+        // Not waited on: init reaps the child on Unix once this process exits.
         Ok(_) => crate::debug::log(|| format!("notify: {} fired at {}%", alert.event, alert.value)),
         Err(e) => crate::debug::log(move || format!("notify spawn failed: {e}")),
     }

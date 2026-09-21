@@ -1,22 +1,17 @@
 //! The platform half of click-to-focus: capture primitives, probes and
 //! executors for the click path, and the URI registration on Windows.
 //!
-//! Notification delivery is one of the four areas platform-conditional code is
-//! confined to, and this file is that area's click side: how a process learns
-//! which terminal it is in, how a click is observed, and how a window is
-//! raised. Every decision stays in `focus` and `cmd::focus`, which are
-//! cfg-free; this file only observes and acts.
-//!
-//! The `imp` modules provide the same surface per platform. A function a
+//! This is the click side of the notification-delivery area that
+//! platform-conditional code is confined to. Every decision stays in `focus`
+//! and `cmd::focus`, which are cfg-free; this file only observes and acts.
+//! The `imp` modules provide the same surface per platform: a function a
 //! platform cannot answer returns `None`, and capture stores nothing for it,
 //! so a missing primitive costs one identity field rather than the record.
 
 use crate::focus::{self, Anchor, Observation, ProcessInfo, TOKEN_BYTES};
 
 /// Everything capture needs from the machine, gathered once per alert.
-///
-/// `session` is the sanitised session id, which names the window property
-/// the Windows capture sets (KTD9).
+/// `session` names the window property the Windows capture sets.
 pub fn observe(session: &str) -> Observation {
     let chain = imp::ancestor_chain();
     let claude_pid = std::env::var("CLAUDE_PID")
@@ -59,7 +54,7 @@ pub fn boot_id() -> Option<String> {
 }
 
 /// Random bytes for a token, straight from the OS. `None` on any failure:
-/// there is no fallback source (KTD13).
+/// there is no fallback source.
 pub fn random_bytes() -> Option<[u8; TOKEN_BYTES]> {
     imp::random_bytes()
 }
@@ -79,9 +74,8 @@ pub fn protocol_command_at(key: &str) -> Option<String> {
     imp::registered_protocol_command(key)
 }
 
-/// Writes the four values of a per-user URI handler under `key`: the default
-/// value, `URL Protocol`, `DefaultIcon`, and `shell\open\command`, all as
-/// plain strings and in place. `Err` names the step that failed.
+/// Writes the four values of a per-user URI handler under `key`, as plain
+/// strings and in place. `Err` names the step that failed.
 pub fn protocol_register_at(key: &str, helper: &std::path::Path) -> Result<(), String> {
     imp::protocol_register(key, helper)
 }
@@ -112,8 +106,7 @@ fn walk(self_pid: u64, lookup: impl Fn(u64) -> Option<ProcessInfo>) -> Vec<Proce
 fn urandom() -> Option<[u8; TOKEN_BYTES]> {
     use std::io::Read;
     let mut buf = [0u8; TOKEN_BYTES];
-    // A full read, never a short one: a token built from fewer than 24 fresh
-    // bytes would be a weaker nonce than the record claims.
+    // Never a short read: fewer than 24 fresh bytes would be a weaker nonce.
     std::fs::File::open("/dev/urandom")
         .and_then(|mut f| f.read_exact(&mut buf))
         .ok()
@@ -128,10 +121,9 @@ mod imp {
         super::urandom()
     }
 
-    /// `/proc/<pid>/stat`: the name sits in parentheses and may itself
-    /// contain spaces or parentheses, so the fields are split after the last
-    /// closing one. `ppid` is field 4 and the start time field 22, both
-    /// counted from 1 with the name as field 2.
+    /// `/proc/<pid>/stat`: the name sits in parentheses and may contain spaces
+    /// or parentheses, so fields are split after the last closing one. `ppid`
+    /// is field 4 and the start time field 22, counted from 1, name as 2.
     fn stat(pid: u64) -> Option<ProcessInfo> {
         let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         let open = text.find('(')?;
@@ -345,8 +337,7 @@ mod imp {
         WM_HOTKEY, WM_TIMER, WNDCLASSW, WS_POPUP,
     };
 
-    /// The source Rust's own standard library draws from. A zero return is a
-    /// failure and yields no token.
+    /// Rust's own standard library source; a zero return yields no token.
     pub fn random_bytes() -> Option<[u8; TOKEN_BYTES]> {
         let mut buf = [0u8; TOKEN_BYTES];
         let ok = unsafe { ProcessPrng(buf.as_mut_ptr(), buf.len()) };
@@ -408,10 +399,9 @@ mod imp {
         out
     }
 
-    /// The chain from the snapshot, with each entry's creation time. A parent
-    /// pid that was recycled before the snapshot would point at an unrelated
-    /// process; the creation-time comparison below catches the case where the
-    /// "parent" started after the child.
+    /// The chain from the snapshot with each entry's creation time. A parent
+    /// pid recycled before the snapshot would point at an unrelated process;
+    /// the creation-time comparison catches a "parent" younger than its child.
     pub fn ancestor_chain() -> Vec<ProcessInfo> {
         let procs = snapshot();
         let chain = walk(u64::from(std::process::id()), |pid| {
@@ -502,19 +492,15 @@ mod imp {
             .collect()
     }
 
-    /// KTD6 candidate A, without attaching to anything: the terminal window
-    /// behind the console an ancestor is attached to.
-    ///
-    /// Claude Code spawns its children headless, so this process's own
-    /// console has no window. The console windows of its ancestors are still
-    /// enumerable, though: under a ConPTY host the `PseudoConsoleWindow` is
-    /// attributed to the shell that owns the pty, and its root owner under
-    /// Windows Terminal is the real hosting window; under the classic console
-    /// the `ConsoleWindowClass` window belongs to a conhost whose parent is
-    /// the console application. Both facts were measured in U1. Walking the
-    /// chain nearest-first and asking `EnumWindows` costs no `FreeConsole`,
-    /// which matters: a process that frees its console while another thread
-    /// spawns children hands those children fresh consoles of their own.
+    /// The console-root candidate, without attaching to anything: the terminal
+    /// window behind the console an ancestor is attached to. This process's own
+    /// console has no window, but under a ConPTY host the `PseudoConsoleWindow`
+    /// is attributed to the shell owning the pty and its root owner is the real
+    /// hosting window; under the classic console the `ConsoleWindowClass`
+    /// window belongs to a conhost whose parent is the console application
+    /// (both measured). Enumerating costs no `FreeConsole`, which
+    /// matters: a process that frees its console while another thread spawns
+    /// children hands those children fresh consoles of their own.
     fn chain_console_window(
         chain: &[ProcessInfo],
         procs: &std::collections::HashMap<u64, (u64, String)>,
@@ -547,8 +533,8 @@ mod imp {
         None
     }
 
-    /// KTD6 candidate B: the first ancestor above this process that owns a
-    /// visible top-level window, chosen through the pure selection rule.
+    /// The parent-chain candidate: the first ancestor above this process that
+    /// owns a visible top-level window, chosen through the pure selection rule.
     fn ancestor_window(
         chain: &[ProcessInfo],
         all: &[HWND],
@@ -566,9 +552,8 @@ mod imp {
         None
     }
 
-    /// Captures the terminal window: candidate A, then B, then the class
-    /// rule, then the creation time of the owner, then the marker property.
-    /// Any step that cannot be completed stores nothing (KTD9).
+    /// Console root, then parent chain, then class rule, the owner's creation
+    /// time and the marker. Any step that cannot be completed stores nothing.
     pub fn capture_window(
         chain: &[ProcessInfo],
         anchor_pid: u64,
@@ -609,11 +594,8 @@ mod imp {
         })
     }
 
-    /// Every particular must still match: the handle is a window, its class
-    /// and owner are the recorded ones, the owner was created when the record
-    /// says, and the capture-time marker is still on it. A handle recycled
-    /// inside a surviving terminal keeps the first three, so the marker is
-    /// what proves it is the captured window (KTD9).
+    /// Gathers the click-time facts for `window_still_verifies`: the
+    /// marker is what tells the captured window from a recycled handle.
     pub fn window_verifies(window: &WindowIdentity, session: &str) -> bool {
         let hwnd = window.handle as usize as HWND;
         if unsafe { IsWindow(hwnd) } == 0 {
@@ -630,9 +612,8 @@ mod imp {
         crate::focus::window_still_verifies(window, Some(&facts))
     }
 
-    /// The window the hotkey handler raises. One helper, one click, one
-    /// target; the handler runs on this thread, so a static is the simplest
-    /// honest channel.
+    /// The window the hotkey handler raises. One helper, one click, one target,
+    /// and the handler runs on this thread; a static is the simplest channel.
     static TARGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// Chromium's ForegroundHelper hotkey id, kept so a coexisting helper and
@@ -643,9 +624,8 @@ mod imp {
     const HOTKEY_TIMER_ID: usize = 1;
     const HOTKEY_TIMEOUT_MS: u32 = 2_000;
 
-    /// `SetForegroundWindow` always reports success under a debugger, so
-    /// verification means nothing there and the first attempt is taken as the
-    /// answer (KTD7).
+    /// `SetForegroundWindow` always reports success under a debugger, so the
+    /// first attempt is taken as the answer there.
     fn is_foreground(hwnd: HWND) -> bool {
         unsafe { IsDebuggerPresent() != 0 || GetForegroundWindow() == hwnd }
     }
@@ -657,13 +637,11 @@ mod imp {
         lparam: LPARAM,
     ) -> LRESULT {
         match msg {
-            // Only our id: any other hotkey delivered here is not ours to act
-            // on, and the loop keeps waiting for the one that is.
+            // Only our id; any other hotkey delivered here is not ours.
             WM_HOTKEY if wparam as i32 == HOTKEY_ID => {
                 let target = TARGET.load(std::sync::atomic::Ordering::Relaxed) as HWND;
                 if !target.is_null() {
-                    // Inside the handler the process holds the foreground
-                    // right the keystroke earned it.
+                    // The handler holds the foreground right the key earned.
                     SetForegroundWindow(target);
                 }
                 PostQuitMessage(0);
@@ -677,9 +655,8 @@ mod imp {
         }
     }
 
-    /// The hotkey recipe, on a hidden popup window that exists only for the
-    /// duration of one wait. Every exit path unregisters, kills the timer and
-    /// destroys the window; the timer is what bounds the wait.
+    /// The hotkey recipe on a hidden popup that lives for one wait, bounded by
+    /// the timer; every exit unregisters, kills it and destroys the window.
     fn hotkey_foreground(target: HWND) -> bool {
         let class_name = wide("ClaudeStatuslineForeground");
         unsafe {
@@ -696,8 +673,7 @@ mod imp {
                 lpszMenuName: std::ptr::null(),
                 lpszClassName: class_name.as_ptr(),
             };
-            // A second registration of the same class in one process fails
-            // harmlessly; one raise per process is all that happens.
+            // A second registration of the same class fails harmlessly.
             RegisterClassW(&class);
             let hwnd = CreateWindowExW(
                 0,
@@ -771,10 +747,9 @@ mod imp {
         is_foreground(target)
     }
 
-    /// KTD7 in full: restore, raise, verify; the hotkey recipe on refusal;
-    /// the taskbar flash when Windows still says no. `SwitchToThisWindow` is
-    /// never used, and an elevated terminal refusing under UIPI ends at the
-    /// flash like any other refusal.
+    /// Every step: restore, raise, verify; the hotkey recipe on refusal; the
+    /// taskbar flash when Windows still says no. `SwitchToThisWindow` is never
+    /// used; an elevated terminal refusing under UIPI ends at the flash too.
     pub fn raise_window(handle: u64) -> bool {
         let hwnd = handle as usize as HWND;
         unsafe {
@@ -801,12 +776,10 @@ mod imp {
         false
     }
 
-    /// Reads `<key>\shell\open\command`'s default value from HKCU.
-    ///
-    /// A registry read on the notify path, once per visual alert, never per
-    /// tick. `RegGetValueW` with `RRF_RT_REG_SZ` refuses any other value type
-    /// and returns a terminated string, so an expandable or binary value
-    /// planted there reads as unregistered rather than as a command.
+    /// Reads `<key>\shell\open\command`'s default value from HKCU, once per
+    /// visual alert and never per tick. `RRF_RT_REG_SZ` refuses any other value
+    /// type, so an expandable or binary value planted there reads as
+    /// unregistered rather than as a command.
     pub fn registered_protocol_command(key: &str) -> Option<String> {
         let path = wide(&format!("{key}\\shell\\open\\command"));
         let mut len: u32 = 0;
@@ -889,9 +862,8 @@ mod imp {
         }
     }
 
-    /// The four values, each written in place (KTD5). The icon is the
-    /// helper's own, index 0, which is the binary's resource icon or the
-    /// generic executable glyph.
+    /// The four values, each written in place. The icon is the helper's
+    /// own, index 0: its resource icon or the generic executable glyph.
     pub fn protocol_register(key: &str, helper: &std::path::Path) -> Result<(), String> {
         let helper_text = helper.to_string_lossy().into_owned();
         let root = create_key(key)?;
@@ -992,21 +964,18 @@ use crate::cmd::focus::{DbusStyle, Probes, Step, TabFamily, TmuxClient, Tool, X1
 use crate::cmd::notify::Platform;
 use crate::focus::Record;
 
-/// How long a terminal or desktop tool may take. These are local IPC calls
-/// that answer in milliseconds; a stuck one degrades to a missed step.
+/// Local IPC answers in milliseconds; a stuck tool degrades to a missed step.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// osascript may have to wake the target application and, the first time,
 /// wait for the Automation consent prompt to be answered.
 const SCRIPT_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// How often a running tool is checked against its deadline.
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Selects the Terminal.app tab whose tty is argv's first item and fronts its
-/// window. Reads its input through `on run argv`, never by interpolation
-/// (KTD10). Returns without touching anything when Terminal is not running,
-/// so a stale record cannot launch it.
+/// window. Input arrives through `on run argv`, never by interpolation.
+/// Returns when Terminal is not running, so a stale record cannot launch it.
 pub const TERMINAL_SELECT_TAB: &str = r#"on run argv
 set target to item 1 of argv
 if application "Terminal" is not running then return
@@ -1045,9 +1014,8 @@ end tell
 end run"#;
 
 /// Ghostty: argv is the tty and the working directory, either possibly empty.
-/// The tty is exact and wins; the working directory proves neither ownership
-/// nor continuity, so it selects only when exactly one terminal matches
-/// (KTD9). `focus` is Ghostty's own command and fronts the window.
+/// The tty wins; the working directory proves neither ownership nor
+/// continuity, so it selects only when exactly one terminal matches.
 pub const GHOSTTY_SELECT: &str = r#"on run argv
 set targetTty to item 1 of argv
 set targetCwd to item 2 of argv
@@ -1071,11 +1039,9 @@ end if
 end tell
 end run"#;
 
-/// Where tools are looked for before `PATH`, in order (KTD10).
-///
-/// The click runs with the login session's environment on macOS, whose PATH
-/// has none of Homebrew, MacPorts, cargo or the app bundles; a tool that only
-/// resolves through PATH would be found from a shell and missed from a click.
+/// Where tools are looked for before `PATH`, in order. The click runs
+/// with the login session's environment on macOS, whose PATH has none of
+/// Homebrew, MacPorts, cargo or the app bundles.
 pub fn candidate_dirs(platform: Platform) -> Vec<PathBuf> {
     let home = crate::home_dir().unwrap_or_default();
     let dirs: Vec<PathBuf> = match platform {
@@ -1105,8 +1071,7 @@ pub fn candidate_dirs(platform: Platform) -> Vec<PathBuf> {
     dirs
 }
 
-/// Resolves a tool to the absolute path it will be spawned by: the candidate
-/// list first, `PATH` last.
+/// The absolute path a tool is spawned by: candidate dirs first, `PATH` last.
 pub fn resolve_tool(platform: Platform, tool: Tool) -> Option<PathBuf> {
     let name = tool.name();
     for dir in candidate_dirs(platform) {
@@ -1119,11 +1084,9 @@ pub fn resolve_tool(platform: Platform, tool: Tool) -> Option<PathBuf> {
 }
 
 /// Runs a tool by absolute path with constant verbs and record fields as
-/// separate arguments, bounded end to end, and returns its stdout on success.
-///
-/// The shape mirrors `git::run_bounded`: a drain thread so a chatty child
-/// cannot deadlock on a full pipe, a poll against the deadline, a kill when
-/// it lapses. Every failure is `None`; the caller logs the step name only.
+/// separate arguments, bounded end to end. Every failure is `None`; the caller
+/// logs the step name only. Mirrors `git::run_bounded`: a drain thread so a
+/// chatty child cannot deadlock, a poll against the deadline, a kill on lapse.
 fn run_tool(program: &Path, args: &[String], timeout: Duration) -> Option<Vec<u8>> {
     let mut command = Command::new(program);
     command
@@ -1134,10 +1097,8 @@ fn run_tool(program: &Path, args: &[String], timeout: Duration) -> Option<Vec<u8
 
     #[cfg(windows)]
     {
-        // The helper is a GUI-subsystem process with no console; a spawned
-        // console program would otherwise get a fresh window. Nothing is
-        // planned on Windows today, and this keeps that true for the tool
-        // runner itself.
+        // The helper has no console, so a spawned console program would get a
+        // fresh window. Nothing is planned on Windows today; this keeps it so.
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
@@ -1317,8 +1278,7 @@ fn anchor_alive(anchor: &crate::focus::Anchor) -> bool {
 pub fn probe(platform: Platform, record: &Record) -> Probes {
     let id = &record.identity;
     let mut probes = Probes::default();
-    // The Windows helper spawns nothing (R12): no tool is resolved, no tmux
-    // server is asked, and the planner never asks for either.
+    // The Windows helper spawns nothing: no tool resolved, no tmux asked.
     if platform != Platform::Windows {
         for tool in Tool::ALL {
             if let Some(path) = resolve_tool(platform, tool) {

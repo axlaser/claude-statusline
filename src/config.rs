@@ -1,28 +1,14 @@
-//! `~/.claude/notify-config.json`.
+//! `~/.claude/notify-config.json`: the per-event `sound` and `visual` flags
+//! `notify` delivers by, and the `context_high` / `rate_limit` thresholds the
+//! status line fires edge alerts at.
 //!
-//! Two subcommands read this file: `notify` uses the per-event `sound` and
-//! `visual` flags to decide what to deliver, and the status line uses
-//! `context_high.threshold` and `rate_limit.threshold` to decide when to fire
-//! an edge-triggered alert at all.
-//!
-//! Every failure degrades to the defaults. A missing file is the common case —
-//! the installer only writes one when the user answers its prompts — and an
-//! unparseable one must not silence notifications, because the user would have
-//! no way to tell the difference between "muted" and "broken".
+//! Every failure degrades to the defaults. A missing file is the common case,
+//! and an unparseable one must not silence notifications, because the user
+//! could not tell "muted" from "broken".
 
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
-
-/// The events both the scripts and the status line know about.
-pub const EVENTS: [&str; 6] = [
-    "permission",
-    "stop",
-    "compaction_start",
-    "compaction_done",
-    "rate_limit",
-    "context_high",
-];
 
 /// Defaults for the two edge-triggered alerts, used when the key is absent or
 /// not an integer.
@@ -51,8 +37,7 @@ pub struct NotifyConfig {
 }
 
 impl NotifyConfig {
-    /// `~/.claude/notify-config.json` for this user, if the home directory
-    /// resolves.
+    /// `~/.claude/notify-config.json` for this user, if home resolves.
     pub fn default_path() -> Option<PathBuf> {
         crate::claude_dir().map(|d| d.join("notify-config.json"))
     }
@@ -73,17 +58,14 @@ impl NotifyConfig {
         }
     }
 
-    /// The delivery flags for one event.
-    ///
-    /// A flag is off **only** when it is the JSON literal `false`. Anything
-    /// else — absent, null, a string, a number — leaves it on.
+    /// The delivery flags for one event. A flag is off **only** when it is the
+    /// JSON literal `false`; absent, null, a string or a number leave it on.
     ///
     /// This is the one place the port deliberately does not reproduce the
     /// shipped bash behaviour. Both shell scripts read the flag as
-    /// `jq -r '.[$e].sound // true'`, and jq's `//` yields its right-hand side
-    /// when the left is `false` as well as when it is null — so `false // true`
-    /// is `true`, and muting has never worked on macOS or Linux. Here the
-    /// flags gate delivery: intended behaviour wins over reproducing a bug.
+    /// `jq -r '.[$e].sound // true'`, and jq's `//` yields its right-hand
+    /// side for `false` as well as null, so muting has never worked on macOS
+    /// or Linux. Intended behaviour wins over reproducing a bug.
     pub fn event(&self, event: &str) -> EventConfig {
         let mut cfg = EventConfig::default();
         let Some(entry) = self.root.as_ref().and_then(|r| r.get(event)) else {
@@ -98,10 +80,9 @@ impl NotifyConfig {
         cfg
     }
 
-    /// The percentage at which an edge-triggered alert fires.
-    ///
-    /// Only `context_high` and `rate_limit` have one; any other event reports
-    /// its own default so a caller cannot silently get someone else's.
+    /// The percentage at which an edge-triggered alert fires. Only
+    /// `context_high` and `rate_limit` have one; any other event reports its
+    /// own default so a caller cannot silently get someone else's.
     pub fn threshold(&self, event: &str) -> i64 {
         let fallback = match event {
             "context_high" => DEFAULT_CONTEXT_HIGH_THRESHOLD,

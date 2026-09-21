@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# One shim body, installed under every name the harness needs to intercept
-# (KTD10). Keeping it as a single file is deliberate: five near-identical stubs
+# One shim body, installed under every name the harness needs to intercept.
+# Keeping it as a single file is deliberate: five near-identical stubs
 # is exactly the duplication this migration exists to delete, and a shim that
 # drifts from its siblings silently changes what a fixture means.
 #

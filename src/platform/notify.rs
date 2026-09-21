@@ -1,10 +1,7 @@
 //! Executing what `cmd::notify` planned, and probing the machine it planned
-//! against.
-//!
-//! Everything here is impure. The decisions all live in `cmd::notify::plan`;
-//! this file only carries them out and reports the environment the planner
-//! reads. Keeping the split sharp is what lets the case table assert
-//! what this component invokes without spawning a single process.
+//! against. Everything here is impure; every decision lives in
+//! `cmd::notify::plan`, which is what lets the case table assert what this
+//! component invokes without spawning a process.
 
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -14,11 +11,9 @@ use std::process::{Command, Stdio};
 use crate::cmd::notify::{Action, Env, Platform, LINUX_CLICK_ACTION};
 use crate::debug;
 
-/// Probes this machine for the facts the planner needs.
-///
-/// Only the specific helpers and assets the planner can ask about are resolved,
-/// rather than everything on `PATH`: this runs on a notification, and walking
-/// `PATH` for its own sake would be work with no output.
+/// Probes this machine for the facts the planner needs: only the helpers and
+/// assets the planner can ask about, since walking `PATH` on a notification
+/// would be work with no output.
 pub fn probe_env() -> Env {
     let home = crate::home_dir().unwrap_or_default();
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -59,8 +54,8 @@ pub fn probe_env() -> Env {
         programs,
         files,
         binary,
-        // The bundle identifier the launching app hands every child; empty
-        // outside macOS and under an app that does not set it.
+        // Handed to every child by the launching app on macOS; empty under an
+        // app that does not set it.
         bundle_id: std::env::var("__CFBundleIdentifier")
             .ok()
             .filter(|v| !v.is_empty()),
@@ -125,11 +120,10 @@ pub(crate) fn which(program: &str) -> Option<PathBuf> {
 /// Carries out one planned action, swallowing every failure, and returns the
 /// click key when the action waited for a click and got one.
 ///
-/// A notification helper that is missing, broken, or refuses to start is not an
-/// error the user should see — the scripts redirect all of it to `/dev/null`
-/// today, and the silent-degradation contract requires the same here. The
-/// returned key goes back to the caller (`main.rs`), which runs the focus
-/// handler; this module never calls up into focus orchestration (KTD3).
+/// A missing or broken helper is not an error the user should see —
+/// the scripts redirect all of it to `/dev/null`, and silent degradation
+/// requires the same. The key goes back to `main.rs`, which runs the focus
+/// handler; this module never calls up into focus orchestration.
 pub fn execute(action: &Action) -> Option<String> {
     match action {
         Action::Spawn {
@@ -173,10 +167,10 @@ struct ClickRun {
     timed_out: bool,
 }
 
-/// Runs notify-send with stdout piped and returns when it exits or the
-/// deadline lapses, whichever is first. The same drain-thread shape as the
-/// bounded runners elsewhere: a child that fills the pipe must not block, and
-/// a kill must not wait on a reader that never finishes.
+/// Runs notify-send with stdout piped until it exits or the deadline lapses.
+/// The drain thread is the same shape as the bounded runners elsewhere: a
+/// child that fills the pipe must not block, and a kill must not wait on a
+/// reader that never finishes.
 fn run_for_click(
     program: &str,
     args: &[String],
@@ -230,12 +224,11 @@ fn run_for_click(
             Err(_) => break None,
         }
     };
-    // A child that exited has closed its end of the pipe, so the drain
-    // finishes as soon as the thread is scheduled — but on a loaded machine
-    // that can be later than a few hundred milliseconds, and a click read
-    // as a dismissal is the one outcome that must not depend on load. A
-    // killed child gets the short budget: something it spawned may still
-    // hold the pipe, and there is nothing left to read from it anyway.
+    // An exited child has closed its end of the pipe, but on a loaded machine
+    // the drain thread can be scheduled hundreds of milliseconds later, and a
+    // click read as a dismissal must not depend on load. A killed child gets
+    // the short budget: something it spawned may still hold the pipe, and
+    // there is nothing left to read anyway.
     let drain = if timed_out {
         std::time::Duration::from_millis(250)
     } else {
@@ -250,14 +243,13 @@ fn run_for_click(
     })
 }
 
-/// Raises the toast and waits for its click (KTD3, AE2).
+/// Raises the toast and waits for its click.
 ///
-/// A first line of `default` on stdout is the click, and the key comes back.
-/// A non-zero exit within the first second with nothing on stdout is an old
-/// libnotify rejecting the action flag: the toast is re-raised once without
-/// it, the one place the executor's argv diverges from the plan, and that
-/// second run is not waited on for a click because it cannot report one. A
-/// lapsed deadline terminates notify-send and yields no click.
+/// A first stdout line of `default` is the click. A non-zero exit within the
+/// first second with nothing on stdout is an old libnotify rejecting the
+/// action flag: the toast is re-raised once without it — the one place the
+/// executor's argv diverges from the plan — and not waited on, since it cannot
+/// report a click. A lapsed deadline terminates notify-send and yields none.
 pub fn wait_for_click(
     program: &str,
     args: &[String],
@@ -321,11 +313,9 @@ fn spawn(program: &str, args: &[String], stdin: Option<&str>, background: bool) 
 
     #[cfg(windows)]
     {
-        // The third spawn site, and the one that needs this most: the toast is
-        // launched through the console-subsystem interpreter, and its parent is
-        // the detached `notify` child that `notify_state::spawn` deliberately
-        // created with no console of its own. There is nothing to inherit, so
-        // without this a window flashes on every visible notification.
+        // The toast runs through the console-subsystem interpreter, and its
+        // parent is the detached `notify` child `notify_state::spawn` created
+        // with no console. Without this a window flashes on every notification.
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
@@ -341,20 +331,17 @@ fn spawn(program: &str, args: &[String], stdin: Option<&str>, background: bool) 
     };
 
     if let Some(payload) = stdin {
-        // A write failure here is routine, not exceptional: the child may have
-        // exited already — BurntToast absent, for instance — and a broken pipe
-        // must not become a visible failure.
+        // A write failure is routine: the child may have exited already
+        // (BurntToast absent), and a broken pipe must not become visible.
         if let Some(mut pipe) = child.stdin.take() {
             let _ = pipe.write_all(payload.as_bytes());
         }
-        // Dropped explicitly: the child blocks on `ReadToEnd` until the pipe
-        // closes, so holding it open would hang the notifier.
+        // Dropped here: the child blocks on `ReadToEnd` until the pipe closes.
     }
 
     if background {
-        // Deliberately not awaited. The sound outlives this process, which is
-        // what the scripts' `&` achieves — the notification must not wait for
-        // audio to finish playing.
+        // Not awaited: the sound outlives this process, as the scripts' `&`
+        // achieves — the notification must not wait for audio to finish.
         return;
     }
     let _ = child.wait();
@@ -366,8 +353,8 @@ fn play_wav(path: &Path) {
     use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_FILENAME, SND_NODEFAULT, SND_SYNC};
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // Synchronous, matching the handler's `PlaySync()`. An async play would be
-    // cut off the instant this short-lived process exits.
+    // Synchronous, matching the handler's `PlaySync()`; an async play would be
+    // cut off when this short-lived process exits.
     unsafe {
         PlaySoundW(
             wide.as_ptr(),
@@ -387,10 +374,9 @@ fn play_wav(path: &Path) {
 fn beep() {
     use windows_sys::Win32::Media::Audio::{PlaySoundW, SND_ALIAS, SND_SYNC};
 
-    // `SystemSounds::Asterisk.Play()` in the shipped handler, reached without a
-    // CLR: the alias resolves to whatever the user has configured for that
-    // system event, which is what makes it *their* asterisk and not a wav this
-    // tool picked.
+    // `SystemSounds::Asterisk.Play()` in the shipped handler, without a CLR:
+    // the alias resolves to whatever the user configured for that system
+    // event, so it is *their* asterisk and not a wav this tool picked.
     let alias: Vec<u16> = "SystemAsterisk".encode_utf16().chain(Some(0)).collect();
     unsafe {
         PlaySoundW(alias.as_ptr(), std::ptr::null_mut(), SND_ALIAS | SND_SYNC);

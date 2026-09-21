@@ -1,10 +1,10 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Paired script-vs-binary measurement for Windows (U6, U13; R38).
+    Paired script-vs-binary measurement for Windows.
 
 .DESCRIPTION
-    Produces the end-to-end fresh-process medians R38 requires before a
+    Produces the end-to-end fresh-process medians required before a
     component's scripts are deleted, for the script and the binary, on one host,
     with their runs interleaved.
 
@@ -50,7 +50,7 @@ $RepoRoot   = (& git -C $HarnessDir rev-parse --show-toplevel).Trim() -replace '
 
 function Fail([string] $Message) { Write-Host "measure: $Message" -ForegroundColor Red; throw $Message }
 
-if ($Runs -lt 7) { Fail "R38 and docs/performance.md section 3 require at least 7 runs; got $Runs" }
+if ($Runs -lt 7) { Fail "docs/performance.md section 3 requires at least 7 runs; got $Runs" }
 
 # What each component's two variants are. The script side is invoked the way
 # Claude Code invokes it -- a fresh interpreter reading the payload on stdin --
@@ -80,7 +80,7 @@ $feedName   = switch ($Component) { 'subagent' { 'statusline-tasks-fixture-sessi
 
 $RealPowerShell = (Get-Command powershell.exe).Source
 
-# R38 requires the statusline pair to cover the large-transcript state. The
+# The statusline pair must cover the large-transcript state. The
 # transcript is GENERATED to a target size rather than pointed at a real one:
 # a machine-local session file is not reproducible on CI, on another machine,
 # or next month, and a performance number nobody else can reproduce is an

@@ -1,19 +1,16 @@
 //! `focus` — the click handler: resolve a key, plan the steps, run them.
 //!
-//! Usage: `claude-statusline focus <session>.<token>`, or the same key behind
-//! the `claude-statusline:` scheme prefix, which is how the Windows shell
-//! passes it to the helper executable. Three callers share [`run`]: the
-//! subcommand (macOS, through terminal-notifier's `-execute`), the `notify`
-//! arm on Linux once notify-send reports the click, and the helper binary on
-//! Windows.
+//! Three callers share [`run`] with `<session>.<token>` (or the key behind the
+//! `claude-statusline:` prefix, as the Windows shell passes it): the
+//! subcommand on macOS via terminal-notifier's `-execute`, the `notify` arm on
+//! Linux once notify-send reports the click, and the helper binary on Windows.
 //!
-//! Like `notify`, the unit is a pure [`plan`] over data — a [`Record`] and a
-//! [`Probes`] — and an impure executor in `platform::focus`. Every step
-//! carries typed arguments and the absolute path of the tool that runs it,
-//! never a command string, so the case table can assert exactly what a record
-//! turns into without a terminal in sight (KTD8, KTD10).
+//! Like `notify`, the unit is a pure [`plan`] over a [`Record`] and [`Probes`]
+//! plus an impure executor in `platform::focus`. Every step carries typed
+//! arguments and the tool's absolute path, never a command string, so the
+//! case table can assert what a record turns into.
 //!
-//! The order of gates is the whole security story (R12): argument count, then
+//! The order of gates is the whole security story: argument count, then
 //! UTF-8, then the byte-exact key grammar, then the trusted read of a path
 //! built from the session part alone, then the record's own grammar. Nothing
 //! is spawned before all of them pass, and nothing derived from the argument
@@ -27,8 +24,7 @@ use crate::cmd::notify::Platform;
 use crate::focus::{Key, Record, MAX_RECORD_BYTES};
 use crate::{debug, platform, session, state};
 
-/// The external tools a step may run, each resolved to an absolute path by
-/// the probe or not planned at all.
+/// The tools a step may run, each resolved to an absolute path or not planned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tool {
     Osascript,
@@ -136,13 +132,11 @@ pub enum DbusStyle {
     Busctl,
 }
 
-/// One thing the click handler does. Each variant carries typed arguments
-/// and the tool's absolute path; verbs and flags are constants in the
-/// executor (KTD10).
+/// One thing the click handler does: typed arguments and the tool's absolute
+/// path; verbs and flags are constants in the executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
-    /// Windows: raise the recorded window through the foreground recipe, with
-    /// the taskbar flash as its own fallback.
+    /// Windows: raise the recorded window through the foreground recipe.
     RaiseWindow {
         handle: u64,
     },
@@ -215,8 +209,7 @@ pub enum Step {
 }
 
 impl Step {
-    /// A short name for the log: no arguments, so no record field and never
-    /// the token.
+    /// A short name for the log: no arguments, so never the token.
     pub fn name(&self) -> &'static str {
         match self {
             Step::RaiseWindow { .. } => "raise-window",
@@ -236,28 +229,24 @@ impl Step {
     }
 }
 
-/// One move of the Windows foreground recipe (KTD7), as data so the order
-/// and the fallback can be asserted without a window.
+/// One move of the Windows foreground recipe after the first
+/// `SetForegroundWindow` was refused, as data so the order and the fallback
+/// can be asserted without a window. The restore and that first attempt run
+/// before the refusal and are not modelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForegroundStep {
-    /// `ShowWindow(SW_RESTORE)` when the window is minimised.
-    Restore,
-    /// `SetForegroundWindow`, then verify with `GetForegroundWindow`.
-    SetForeground,
     /// Register the `VK_F22` hotkey on a hidden popup window.
     RegisterHotkey,
     /// `SendInput` the key, then wait for `WM_HOTKEY` with a two-second
     /// bound and call `SetForegroundWindow` inside the handler.
     SendKeyAndAwait,
-    /// `FlashWindowEx`: the attention signal Windows always allows (R7).
+    /// `FlashWindowEx`: the attention signal Windows always allows.
     Flash,
 }
 
-/// The recipe after the first `SetForegroundWindow` was refused.
-///
-/// The key is sent only after the registration succeeded: a lingering helper
-/// or macro software owning F22 fails the registration, and then the flash is
-/// all there is. Nothing here retries.
+/// The recipe after the first `SetForegroundWindow` was refused. The key is
+/// sent only once the registration succeeded: software already owning F22
+/// fails it, and then the flash is all there is. Nothing here retries.
 pub fn foreground_recipe_after_refusal(hotkey_registered: bool) -> Vec<ForegroundStep> {
     if hotkey_registered {
         vec![
@@ -278,9 +267,7 @@ pub struct TmuxClient {
 }
 
 /// Everything about the machine at click time that changes what is planned.
-///
-/// Injected like `notify::Env`: a case pins it, and the production probe in
-/// `platform::focus` fills it from the real machine.
+/// Injected like `notify::Env`: a case pins it, `platform::focus` fills it.
 #[derive(Debug, Clone, Default)]
 pub struct Probes {
     /// The tools that resolved, each to the absolute path it will be run by.
@@ -320,20 +307,16 @@ impl Probes {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Plan {
     pub steps: Vec<Step>,
-    /// Why a step was not planned. Carries identity names and counts, never
-    /// the token.
+    /// Why a step was not planned: identity names and counts, never the token.
     pub notes: Vec<String>,
 }
 
-/// Turns a record and the probes into an ordered step list, without doing
-/// any of it.
-///
-/// The liveness rule (KTD9) sits here so it is testable: an anchor that is
-/// alive with the same start time gets the full list; one that is gone gets
-/// the window raise alone, and only while the window still verifies; on macOS
-/// the app activation is terminal-notifier's own handling of the click and
-/// needs no step. A non-unique identifier — a pid search, a Ghostty working
-/// directory — selects only when exactly one candidate matches.
+/// Turns a record and the probes into an ordered step list, without doing any
+/// of it. The liveness rule sits here so it is testable: a live anchor
+/// with the same start time gets the full list; a gone one gets the window
+/// raise alone, and only while the window still verifies. On macOS activation
+/// is terminal-notifier's own click handling and needs no step. A non-unique
+/// identifier selects only when exactly one candidate matches.
 pub fn plan(platform: Platform, record: &Record, probes: &Probes) -> Plan {
     let id = &record.identity;
     let mut plan = Plan::default();
@@ -347,14 +330,13 @@ pub fn plan(platform: Platform, record: &Record, probes: &Probes) -> Plan {
 
     match platform {
         Platform::Windows => {
-            // The helper spawns nothing at all (R12): a Windows record plans
-            // the window raise and never a tool, whatever multiplexer
-            // variables a Git Bash or MSYS environment carried into it.
+            // The helper spawns nothing: a Windows record plans the raise
+            // and never a tool, whatever multiplexer variables Git Bash set.
             raise_windows_window(id, probes, &mut plan);
             return plan;
         }
         Platform::Linux => raise_linux(id, probes, &mut plan),
-        // Activation is the transport's job on macOS (KTD2).
+        // Activation is the transport's job on macOS.
         Platform::Macos => {}
     }
 
@@ -416,8 +398,6 @@ pub fn plan(platform: Platform, record: &Record, probes: &Probes) -> Plan {
             plan.notes
                 .push("kitty: remote control socket absent".to_string());
         } else {
-            // `kitten @` and `kitty @` take the same arguments; the older
-            // kitty releases only have the latter.
             match probes.first_tool(&[Tool::Kitten, Tool::Kitty]) {
                 Some((_, tool)) => plan.steps.push(Step::KittenFocus {
                     tool,
@@ -471,7 +451,7 @@ fn raise_windows_window(id: &crate::focus::Identity, probes: &Probes, plan: &mut
 
 fn raise_linux(id: &crate::focus::Identity, probes: &Probes, plan: &mut Plan) {
     // The pids whose windows are searched: the recorded terminal process
-    // while it still verifies, or each attached tmux client (KTD9).
+    // while it still verifies, or each attached tmux client.
     let candidates: Vec<u64> = if id.tmux.is_some() {
         probes.tmux_clients.iter().map(|c| c.pid).collect()
     } else {
@@ -562,7 +542,7 @@ fn select_macos_tab(record: &Record, probes: &Probes, plan: &mut Plan) {
         return;
     };
     // Inside tmux the recorded tty is the pane's pty; the tabs are found
-    // through the attached clients' ttys instead (KTD9).
+    // through the attached clients' ttys instead.
     let ttys: Vec<String> = if id.tmux.is_some() {
         probes.tmux_clients.iter().map(|c| c.tty.clone()).collect()
     } else {
@@ -606,13 +586,11 @@ fn select_macos_tab(record: &Record, probes: &Probes, plan: &mut Plan) {
     }
 }
 
-/// The click handler. Accepts exactly one argument, resolves it through every
-/// gate, and exits quietly whatever happens (R11, R12).
-///
-/// Log lines about a rejected argument carry its byte length and the reason,
-/// never any of its bytes, so a page that invokes the scheme repeatedly
-/// cannot write into the debug log. Lines about a record carry the session
-/// part and the outcome, never the token (R20).
+/// The click handler: exactly one argument, resolved through every gate, and a
+/// quiet exit whatever happens. Log lines about a rejected argument
+/// carry its byte length and the reason, never its bytes, so a page invoking
+/// the scheme repeatedly cannot write into the debug log; lines about a record
+/// carry the session part and the outcome, never the token.
 pub fn run(args: &[OsString]) {
     if args.len() != 1 {
         let n = args.len();
@@ -654,7 +632,7 @@ pub fn run(args: &[OsString]) {
         return;
     };
     // The OS launched this process without the session's environment, so the
-    // session's own debug flag decides whether the rest is logged (KTD12).
+    // session's own debug flag decides whether the rest is logged.
     if record.debug {
         debug::enable();
     }

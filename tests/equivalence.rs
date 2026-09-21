@@ -31,7 +31,7 @@ use claude_statusline::transcript::{self, Scan, TokenRecord};
 
 const BIN: &str = env!("CARGO_BIN_EXE_claude-statusline");
 
-/// The Windows click helper, built on every host (KTD14).
+/// The Windows click helper, built on every host.
 const FOCUS_BIN: &str = env!("CARGO_BIN_EXE_claude-statusline-focus");
 
 struct Run {
@@ -384,7 +384,7 @@ fn unreadable_state_reads_as_its_conservative_value() {
     std::fs::write(&latch, b"\x00\x01 not json at all").unwrap();
 
     assert!(
-        state::latch_reads_as_notified(&latch),
+        matches!(notify_state::read_latch(&latch), LatchState::Unusable),
         "an unparseable latch must suppress, not re-fire"
     );
 }
@@ -497,7 +497,13 @@ fn our_own_state_file_round_trips_through_the_guard() {
         platform::file_owner(&target),
     );
     assert!(
-        state::latch_reads_as_notified(&target),
+        matches!(
+            notify_state::read_latch(&target),
+            LatchState::Usable(Latch {
+                context_high: true,
+                ..
+            })
+        ),
         "a latch we wrote with notified_context_high=true did not read as notified"
     );
 }
@@ -1115,7 +1121,7 @@ const PUBLISHED_TARGETS: [&str; 6] = [
     "aarch64-pc-windows-msvc",
 ];
 
-/// The two targets the Windows click helper ships for (KTD14).
+/// The two targets the Windows click helper ships for.
 const HELPER_TARGETS: [&str; 2] = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"];
 
 /// Every published target builds, tests, and is attested, and so does each
@@ -7688,7 +7694,7 @@ fn a_capture_inside_tmux_stores_only_the_multiplexer_identity() {
     failures.assert_empty("tmux capture");
 }
 
-/// One bad value per R18 field makes the whole record unusable.
+/// One bad value per field makes the whole record unusable.
 #[test]
 fn one_bad_value_per_field_makes_the_record_unusable() {
     let mut record = sample_record("bad-1");
@@ -7813,10 +7819,10 @@ fn one_bad_value_per_field_makes_the_record_unusable() {
             "loaded despite the bad field".to_string()
         });
     }
-    failures.assert_empty("R18 grammar");
+    failures.assert_empty("record grammar");
 }
 
-/// R12: length first, then byte-exact. Nothing is trimmed, decoded or folded.
+/// Length first, then byte-exact. Nothing is trimmed, decoded or folded.
 #[test]
 fn key_grammar_rejects_every_variation() {
     let token = "abcdefghijklmnopqrstuvwxyzABCDEF";
@@ -7905,7 +7911,7 @@ fn a_symlinked_focus_record_reads_as_none() {
         .is_symlink());
 }
 
-/// R19: on the flat temp-root fallback nothing is written, the outcome says
+/// On the flat temp-root fallback nothing is written, the outcome says
 /// so, and the toast is planned exactly as it is today.
 #[test]
 fn capture_on_an_unguarded_root_writes_nothing_and_leaves_the_toast_unchanged() {
@@ -7946,7 +7952,7 @@ fn capture_on_an_unguarded_root_writes_nothing_and_leaves_the_toast_unchanged() 
     );
 }
 
-/// KTD13: no randomness, no token, no record; and the tokens the OS does
+/// No randomness, no token, no record; and the tokens the OS does
 /// produce are 32 characters of the URL-safe alphabet and differ.
 #[test]
 fn a_randomness_failure_writes_no_record_and_tokens_are_well_formed() {
@@ -8003,7 +8009,7 @@ fn a_tick_without_an_alert_writes_no_focus_record() {
     );
 }
 
-/// KTD11: every hook event reads its payload when stdin is a pipe, so a stop
+/// Every hook event reads its payload when stdin is a pipe, so a stop
 /// toast can name its session; a null stdin proceeds with no record; a payload
 /// past the cap is truncated with a log line and the notification still goes
 /// out.
@@ -8829,7 +8835,7 @@ fn the_applescript_bodies_take_their_inputs_as_arguments() {
 }
 
 /// The compile-time candidate list covers the locations the login session's
-/// PATH lacks (KTD10).
+/// PATH lacks.
 #[test]
 fn the_tool_candidate_list_covers_the_locations_path_lacks() {
     let mac: Vec<String> = platform::focus::candidate_dirs(Platform::Macos)
@@ -8936,7 +8942,7 @@ fn a_resolved_record_with_nothing_to_do_logs_and_exits() {
     let root = claude_statusline::session::state_dir_in(&tmp);
     let mut record = sample_record("resolved-1");
     // A pid that never exists on any platform, with the debug flag carried
-    // in the record rather than the environment (KTD12).
+    // in the record rather than the environment.
     record.anchor = Anchor {
         pid: u64::from(u32::MAX) - 1,
         start: 1,
@@ -9055,7 +9061,7 @@ fn a_pseudo_console_window_is_never_stored_and_the_key_survives() {
     assert!(omitted.is_empty());
 }
 
-/// Candidate B's selection rule: exactly one visible window for an ordinary
+/// The parent-chain candidate's rule: exactly one visible window for an ordinary
 /// host; for VS Code the one whose title carries the workspace basename, and
 /// nothing when that is ambiguous.
 #[test]
@@ -9336,7 +9342,7 @@ fn the_helper_rejects_every_hostile_argument_quietly() {
     failures.check("log-exists", log.contains("focus:"), || {
         "with logging on, every rejection leaves a line".to_string()
     });
-    // The session part of a well-formed key is what the log names (R20);
+    // The session part of a well-formed key is what the log names;
     // everything else about an argument, and the token, stays out of it.
     for fragment in ["a.b", "a b", "%2D", "aaaa", &token, "second"] {
         failures.check("no-argument-bytes-in-log", !log.contains(fragment), || {

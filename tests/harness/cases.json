@@ -1,19 +1,19 @@
 {
   "schema": 1,
   "_comment": [
-    "The capture case table (R30, R31, R32). One entry per fixture the harness",
+    "The capture case table. One entry per fixture the harness",
     "can produce. Both drivers read this file, so a case is defined once and",
     "captured on all three platforms.",
     "",
     "Fields:",
     "  case          fixture id; becomes tests/fixtures/<component>/<case>/",
     "  component     git-refresh | subagent | notify | statusline",
-    "  observable    what R31 names as this component's captured output",
+    "  observable    this component's captured output",
     "  git_state     a name from states.json, or null for cases with no repo",
     "  payload       file fed on stdin, relative to tests/harness/",
     "  args          argv passed after the subcommand (notify only)",
     "  clock         pinned reference epoch; every mtime_offset is relative to it",
-    "  notify_config config input, relative to tests/harness/ (R30, R44)",
+    "  notify_config config input, relative to tests/harness/",
     "  inputs        state files the case supplies, with their intended mtimes",
     "  platforms     where the observable exists at all; defaults to all three.",
     "                A case is skipped with a printed reason on any platform it",
@@ -22,7 +22,7 @@
     "                everything downstream then asserts against nothing.",
     "  platform_note why the `platforms` list is narrowed, and who owns closing it",
     "  expect_render whether a full render is expected (default true). Drives",
-    "                KTD10's cache-miss assertion in both directions: a true",
+    "                the cache-miss assertion in both directions: a true",
     "                case must leave an output-cache file behind, and a false",
     "                one must not. Byte-diffing cannot tell a full render from a",
     "                served cache or an early exit — they produce the same",
@@ -45,7 +45,7 @@
 
     "_inputs_by_component": [
       "Applied to every case of that component before its own `inputs`, so the",
-      "render inputs R30 requires to be pinned are pinned once rather than",
+      "render inputs that must be pinned are pinned once rather than",
       "restated 16 times. The learned map is warmed here on purpose: an",
       "unwarmed map makes window resolution fall through to the seed table and",
       "then to the 200K default, which is a different code path from the one a",
@@ -87,7 +87,7 @@
         { "target": "{TMP}/statusline-oc-{SESSION}.txt", "content": "inputs/oc-cache.txt", "mtime_offset": -3 },
         { "target": "{TMP}/statusline-tasks-{SESSION}.json", "content": "inputs/tasks-feed.json", "mtime_offset": -2 }
       ],
-      "why": "The hook must delete exactly the git and output caches and leave the tasks feed — which is a data store, not a performance cache (R28) — alone."
+      "why": "The hook must delete exactly the git and output caches and leave the tasks feed — which is a data store, not a performance cache — alone."
     },
     {
       "case": "read-tool-is-a-noop",
@@ -130,7 +130,7 @@
       "payload": "payloads/tasks-feed.json",
       "git_state": null,
       "inputs": [],
-      "why": "R31: the observable is the exact bytes written to the tasks feed, and the handler must print nothing so the default agent panel survives."
+      "why": "The observable is the exact bytes written to the tasks feed, and the handler must print nothing so the default agent panel survives."
     },
     {
       "case": "tees-every-field",
@@ -180,8 +180,8 @@
       "git_state": null,
       "inputs": [],
       "platforms": ["macos", "linux"],
-      "platform_note": "The Windows *script* delivers entirely in-process — System.Media.SoundPlayer, SystemSounds, and the BurntToast module — so it spawns nothing a PATH shim can observe, and an empty capture would be indistinguishable from a notification that never fired. U7 resolved this: the port cannot call BurntToast in-process, so it raises the toast by invoking powershell.exe at its absolute path, which gives Windows an external observable for the first time. That observable has no script counterpart to be captured from, so it is asserted against a literal in tests/equivalence.rs instead (R20's mechanism). Windows sound stays in-process via winmm and remains unobservable by design.",
-      "why": "R31: the observable is the command and arguments notify invokes, captured through the PATH shims."
+      "platform_note": "The Windows *script* delivers entirely in-process — System.Media.SoundPlayer, SystemSounds, and the BurntToast module — so it spawns nothing a PATH shim can observe, and an empty capture would be indistinguishable from a notification that never fired. This was resolved: the port cannot call BurntToast in-process, so it raises the toast by invoking powershell.exe at its absolute path, which gives Windows an external observable for the first time. That observable has no script counterpart to be captured from, so it is asserted against a literal in tests/equivalence.rs instead. Windows sound stays in-process via winmm and remains unobservable by design.",
+      "why": "The observable is the command and arguments notify invokes, captured through the PATH shims."
     },
     {
       "case": "muted-sound-for-event",
@@ -194,7 +194,7 @@
       "inputs": [],
       "platforms": ["macos", "linux"],
       "platform_note": "Same Windows situation as permission-event.",
-      "why": "AE15: with `sound: false` for the event, no sound helper is invoked at all. THE CAPTURE DOES NOT SHOW THAT, and is kept as the record of why. Both bash scripts read the flag as `jq -r '.[$e].sound // true'`, and jq's `//` yields its right-hand side when the left is `false` as well as when it is null — so `false // true` is `true` and muting has never worked on macOS or Linux. R44 makes the flags gate delivery and the Product Contract wins on behaviour, so the port mutes correctly and this fixture is a divergence record rather than the port's target. tests/equivalence.rs names it in DIVERGENT_FIXTURES and asserts the required behaviour against a literal (R20)."
+      "why": "With `sound: false` for the event, no sound helper is invoked at all. THE CAPTURE DOES NOT SHOW THAT, and is kept as the record of why. Both bash scripts read the flag as `jq -r '.[$e].sound // true'`, and jq's `//` yields its right-hand side when the left is `false` as well as when it is null — so `false // true` is `true` and muting has never worked on macOS or Linux. The flags gate delivery and the Product Contract wins on behaviour, so the port mutes correctly and this fixture is a divergence record rather than the port's target. tests/equivalence.rs names it in DIVERGENT_FIXTURES and asserts the required behaviour against a literal."
     },
 
     {
@@ -211,7 +211,7 @@
       "observable": "stdout",
       "payload": "payloads/full.json",
       "git_state": "unborn-head-staged",
-      "why": "R20's unborn-HEAD divergence, captured from the state that actually reaches it. bash renders no git segment; Windows renders the literal `HEAD`. U13 records which one the binary keeps, and its expected output becomes a literal rather than either capture."
+      "why": "The unborn-HEAD divergence, captured from the state that actually reaches it. bash renders no git segment; Windows renders the literal `HEAD`. Which one the binary keeps is recorded, and its expected output becomes a literal rather than either capture."
     },
     {
       "case": "git-clean",
@@ -290,7 +290,7 @@
       "observable": "stdout",
       "payload": "payloads/minimal.json",
       "git_state": null,
-      "why": "R11 and KTD15: the fixture the binary's `self-check` subcommand compiles in and renders after installation. It is the only case with no repository, which is what makes it hermetic -- every other case's output depends on a git state the installing machine has no reason to have, and a self-check that consulted the real working directory would render a git row on a developer's machine and none on a server. With no transcript path and no model in the payload, the rendered box is a pure function of the payload, so the binary can reproduce it with no filesystem access at all."
+      "why": "The fixture the binary's `self-check` subcommand compiles in and renders after installation. It is the only case with no repository, which is what makes it hermetic -- every other case's output depends on a git state the installing machine has no reason to have, and a self-check that consulted the real working directory would render a git row on a developer's machine and none on a server. With no transcript path and no model in the payload, the rendered box is a pure function of the payload, so the binary can reproduce it with no filesystem access at all."
     },
     {
       "case": "payload-empty",
@@ -299,7 +299,7 @@
       "payload": "payloads/empty.txt",
       "git_state": "clean",
       "expect_render": false,
-      "why": "AE3. Degraded input exits before the render, so no output cache may be written — asserting that is what distinguishes a correct early exit from a render that produced nothing."
+      "why": "Degraded input exits before the render, so no output cache may be written — asserting that is what distinguishes a correct early exit from a render that produced nothing."
     },
     {
       "case": "payload-malformed",
@@ -308,7 +308,7 @@
       "payload": "payloads/malformed.json",
       "git_state": "clean",
       "expect_render": false,
-      "why": "AE3. The session id is still recoverable from the raw text, so unlike the empty case this one really does exercise the no-cache-written assertion."
+      "why": "The session id is still recoverable from the raw text, so unlike the empty case this one really does exercise the no-cache-written assertion."
     },
     {
       "case": "payload-astral",

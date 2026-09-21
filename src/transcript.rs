@@ -2,25 +2,20 @@
 //! verdict, from one pass over the session's JSONL file.
 //!
 //! Ported from the `# 5b/5c` awk program in `macos/statusline.sh`, which the
-//! PowerShell script mirrors line for line. Three properties of that program
-//! are load-bearing and easy to lose in a port:
+//! PowerShell script mirrors. Three properties are load-bearing:
 //!
-//! - **It is byte-oriented, not text-oriented.** The awk runs under `LC_ALL=C`
-//!   so `length()` counts bytes. An earlier version ran under a UTF-8 locale
-//!   and gawk's greedy token extraction then silently zeroed the token counts
-//!   of any line carrying a character outside the BMP — see
+//! - **Byte-oriented.** The awk runs under `LC_ALL=C`; a UTF-8 locale once
+//!   silently zeroed the token counts of any line with a non-BMP character —
 //!   `docs/solutions/logic-errors/gawk-utf8-locale-zeroes-astral-plane-extraction.md`.
-//!   Everything here works on `&[u8]` for the same reason: no decoding step
-//!   means no decoding bug, and a transcript is not guaranteed to be valid
-//!   UTF-8 anyway.
-//! - **Synthetic entries do not vote.** Slash commands, meta entries, and tool
-//!   results are filtered out of the idle/working decision. Without that filter
-//!   the detector sticks on "working" after any slash command.
-//! - **A line is consumed only if it fits inside the sampled size.** The size
-//!   is read once, before the scan; a line extending past it is a torn or
-//!   racing tail, so it is skipped and so is everything after it. That keeps
-//!   the consumed count covering an unbroken prefix, and it is why a transcript
-//!   being appended to while it is read cannot miscount.
+//!   Everything here works on `&[u8]`: no decoding step, no decoding bug, and a
+//!   transcript is not guaranteed to be valid UTF-8 anyway.
+//! - **Synthetic entries do not vote.** Slash commands, meta entries and tool
+//!   results are filtered out of the idle verdict, or the detector sticks on
+//!   "working" after any slash command.
+//! - **A line counts only if it fits inside the sampled size**, read once
+//!   before the scan. A line past it is a torn or racing tail; it and
+//!   everything after it are skipped, so the consumed count covers an unbroken
+//!   prefix and a transcript being appended to cannot miscount.
 
 /// What one pass over a transcript yields.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -31,42 +26,34 @@ pub struct Scan {
     pub cache_write_tokens: u64,
     pub cache_read_tokens: u64,
     pub output_tokens: u64,
-    /// The last non-synthetic entry's verdict, or the caller's starting value
-    /// when the scanned span contains no entry that votes.
+    /// The last vote, or the caller's starting value when nothing voted.
     pub idle: bool,
-    /// Bytes of the unbroken prefix actually consumed. Always a record
-    /// boundary, so it is a safe place for a later scan to resume from.
+    /// Bytes of the unbroken prefix consumed. Always a record boundary, so a
+    /// later scan can resume from it.
     pub consumed: u64,
 }
 
-/// The record format's version tag.
-///
-/// Not restarted at `v1`: the scripts' 16-field `v2` record lives at a
-/// different path and carries fields this one deliberately drops, and a shared
-/// version number across two incompatible formats is how a stale record gets
-/// read as a fresh one. Bump this whenever the field list changes.
+/// The record format's version tag. Not restarted at `v1`: the scripts'
+/// 16-field `v2` record is an incompatible format, and a shared version number
+/// is how a stale record gets read as fresh. Bump this whenever the field list
+/// changes.
 pub const RECORD_VERSION: &str = "v4";
 
 /// The per-session token record, the only part of the scripts' transcript
-/// cache that survives the port.
+/// cache that survives the port. A render input, not a performance cache: the
+/// `(+N)` beside each bucket is this tick's total minus the stored one, and an
+/// unchanged transcript re-displays the stored deltas rather than recomputing
+/// them to zero, which is why mtime and size are fields and not just the key.
 ///
-/// It is a render input, not a performance cache. The `(+N)` beside each token
-/// bucket is this tick's total minus the previous tick's, so without a stored
-/// previous there is no delta to render; and while the transcript is unchanged
-/// the stored deltas are re-displayed rather than recomputed to zero, which is
-/// why the mtime and size are part of the record and not just its key.
-///
-/// What the scripts stored and this does not: the incremental parser's byte
-/// offset and head checksum, deleted with the parser itself, and
-/// `working_start_out_tokens`, which both scripts compute, store, and read back
-/// solely to compute again — no platform renders it.
+/// Dropped from the scripts' record: the incremental parser's byte offset and
+/// head checksum, and `working_start_out_tokens`, which both scripts compute
+/// and store only to compute again — no platform renders it.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TokenRecord {
     pub mtime: i64,
     pub size: u64,
-    /// Carried so an unchanged transcript needs no scan at all. Everything the
-    /// tokens row and the model row render is then reconstructable from this
-    /// record, which is what makes the skip in `cmd::statusline` possible.
+    /// Carried so an unchanged transcript needs no scan: everything the tokens
+    /// and model rows render is reconstructable from this record.
     pub messages: u64,
     pub idle: bool,
     pub input_tokens: u64,
@@ -101,16 +88,11 @@ impl TokenRecord {
     }
 
     /// Parses a stored record, or `None` for anything that is not exactly one.
-    ///
-    /// Every rejection lands in the same place as an absent record: deltas are
-    /// computed against zero, which renders the totals as one large increment
-    /// once and then settles. That is the scripts' behaviour on a failed
-    /// validation too, and it is why this can afford to be strict.
-    ///
-    /// The scripts bound each digit run to 18 characters so a planted value
-    /// could not wrap 64-bit shell arithmetic. Parsing into `u64` is the
-    /// stronger form of the same guard: an over-long run fails to parse instead
-    /// of wrapping.
+    /// A rejection lands where an absent record does: deltas against zero, one
+    /// large increment that then settles, which is the scripts' behaviour on a
+    /// failed validation too. The scripts bound each digit run to 18 characters
+    /// against wrapping 64-bit shell arithmetic; parsing into `u64` is the
+    /// stronger form, since an over-long run fails instead of wrapping.
     pub fn parse(raw: &str) -> Option<Self> {
         let fields: Vec<&str> = raw.trim_end_matches(['\r', '\n']).split('|').collect();
         if fields.len() != 13 || fields[0] != RECORD_VERSION {
@@ -120,9 +102,8 @@ impl TokenRecord {
             mtime: fields[1].parse().ok()?,
             size: fields[2].parse().ok()?,
             messages: fields[3].parse().ok()?,
-            // Strict: anything that is not exactly `true` or `false` rejects
-            // the whole record rather than defaulting, because this field now
-            // decides whether the transcript is read at all.
+            // Strict, rejecting the whole record rather than defaulting: this
+            // field decides whether the transcript is read at all.
             idle: match fields[4] {
                 "true" => true,
                 "false" => false,
@@ -140,25 +121,16 @@ impl TokenRecord {
     }
 
     /// Combines a fresh scan with the previous record into what renders now.
-    ///
-    /// Two cases:
-    ///
-    /// - **The transcript is unchanged** (same mtime and size). The stored
-    ///   deltas are re-displayed rather than recomputed to zero, which is what
-    ///   the scripts do on a cache hit and is why an idle status line keeps
-    ///   showing the last turn's increments.
-    /// - **It changed.** Deltas are this scan's totals minus the stored ones,
-    ///   saturating at zero — a rotated or replaced transcript can shrink, and
-    ///   both scripts clamp rather than render a negative increment.
-    ///
-    /// The totals always come from this tick's scan, never from the record,
-    /// even in the unchanged case. That is what lets the head checksum go: the
-    /// scripts needed it to notice a same-size rewrite, because a cache hit
-    /// there would have skipped the scan and rendered stale totals forever.
-    /// This port scans every tick, so a same-size rewrite is simply seen.
-    ///
-    /// The second return value is whether the record needs storing — false
-    /// whenever nothing about it changed, which keeps idle ticks off the disk.
+    /// Unchanged transcript (same mtime and size): the stored deltas are
+    /// re-displayed rather than recomputed to zero, as the scripts do on a
+    /// cache hit. Changed: deltas are this scan's totals minus the stored ones,
+    /// saturating at zero, because a rotated transcript can shrink and
+    /// both scripts clamp rather than render a negative increment. The totals
+    /// always come from the scan handed in, never from the record, so a stale
+    /// record can only misstate a delta; whether the transcript is read at all
+    /// is `cmd::statusline`'s `(mtime, size)` decision. The second return value
+    /// is whether the record needs storing, false when nothing changed, which
+    /// keeps idle ticks off the disk.
     pub fn fold(prev: Option<&TokenRecord>, scan: &Scan, mtime: i64, size: u64) -> (Self, bool) {
         let unchanged = prev.is_some_and(|p| p.mtime == mtime && p.size == size);
         let (prev_in, prev_cw, prev_cr, prev_out) = match prev {
@@ -201,11 +173,9 @@ impl TokenRecord {
     }
 }
 
-/// Where this session's token record lives.
-///
-/// `None` for a session id that sanitizes to nothing, which would otherwise
-/// produce one shared `statusline-tokens-.txt` that every such session would
-/// read each other's deltas from.
+/// Where this session's token record lives. `None` for a session id that
+/// sanitizes to nothing, which would otherwise share one
+/// `statusline-tokens-.txt` across every such session.
 pub fn record_path(temp: &std::path::Path, session_id: &str) -> Option<std::path::PathBuf> {
     let safe = crate::session::sanitize_session_id(session_id);
     if safe.is_empty() {
@@ -214,22 +184,18 @@ pub fn record_path(temp: &std::path::Path, session_id: &str) -> Option<std::path
     Some(temp.join(format!("statusline-tokens-{safe}.txt")))
 }
 
-/// Scans `bytes`, counting only records that fit within `sampled_size`.
-///
-/// `sampled_size` is the file size observed before the read. `None` disables
-/// the gate, matching the script's `total < 0` path for the case where the size
-/// could not be determined — everything present is then consumed.
-///
-/// `init_idle` is the verdict that holds if nothing in this span votes.
+/// Scans `bytes`, counting only records that fit within `sampled_size`, the
+/// file size observed before the read. `None` disables the gate, matching
+/// the script's `total < 0` path when the size could not be determined:
+/// everything present is consumed. `init_idle` holds if nothing here votes.
 pub fn scan(bytes: &[u8], sampled_size: Option<u64>, init_idle: bool) -> Scan {
     let mut out = Scan {
         idle: init_idle,
         ..Default::default()
     };
 
-    // A trailing newline terminates the final record rather than starting an
-    // empty one, which is how awk reads it. Without this the empty tail would
-    // consume a phantom byte in the ungated case.
+    // A trailing newline ends the final record rather than starting an empty
+    // one, as in awk; otherwise the ungated case consumes a phantom byte.
     let body = match bytes.last() {
         Some(b'\n') => &bytes[..bytes.len() - 1],
         _ => bytes,
@@ -237,9 +203,8 @@ pub fn scan(bytes: &[u8], sampled_size: Option<u64>, init_idle: bool) -> Scan {
 
     let mut stop = false;
     for line in body.split(|b| *b == b'\n') {
-        // The record includes its newline, present or not: a final line lacking
-        // one does not fit the sampled size and is therefore left for the next
-        // scan rather than counted half-written.
+        // The record includes its newline, present or not, so a final line
+        // lacking one does not fit and is left for the next scan.
         let rec = line.len() as u64 + 1;
         if let Some(total) = sampled_size {
             if stop || out.consumed + rec > total {
@@ -273,11 +238,10 @@ pub fn scan(bytes: &[u8], sampled_size: Option<u64>, init_idle: bool) -> Scan {
                 .saturating_add(token_value(line, b"\"output_tokens\""));
         }
 
-        // The idle vote uses its own filter list, which is deliberately not the
-        // message filter above: `"isMeta"` is excluded whatever its value, and
-        // `toolUseResult` and `<local-command-` are matched unquoted and
-        // unterminated. The last surviving entry wins, which is the forward
-        // equivalent of the reverse scan this replaced.
+        // The idle vote's filter is deliberately not the message filter above:
+        // `"isMeta"` is excluded whatever its value, and `toolUseResult` and
+        // `<local-command-` are matched unquoted and unterminated. The last
+        // surviving entry wins, the forward equivalent of the reverse scan.
         if !contains(line, b"\"isMeta\"")
             && !contains(line, b"<command-name>")
             && !contains(line, b"<local-command-")
@@ -295,11 +259,8 @@ pub fn scan(bytes: &[u8], sampled_size: Option<u64>, init_idle: bool) -> Scan {
 }
 
 /// `/"type"[[:space:]]*:[[:space:]]*<literal>/`, used for the counting rules.
-///
-/// Distinct from [`ordered`], which the voting rule uses: that one requires no
-/// colon and so also matches a line where the words merely appear in order.
-/// The scripts use both, at different sites, and reconciling them would change
-/// which entries count.
+/// Distinct from [`ordered`], which the voting rule uses and needs no colon.
+/// The scripts use both, and reconciling them would change which entries count.
 fn is_typed(line: &[u8], literal: &[u8]) -> bool {
     keyed_literal(line, b"\"type\"", literal)
 }
@@ -321,21 +282,12 @@ fn keyed_literal(line: &[u8], key: &[u8], literal: &[u8]) -> bool {
 }
 
 /// The digits following the **last** `<key>` occurrence that is followed by a
-/// colon, or 0.
-///
-/// A faithful port of the awk `tok()` helper, including two behaviours that
-/// look like accidents and are not:
-///
-/// - An occurrence *not* followed by a colon leaves the previous value standing
-///   rather than clearing it, so `"input_tokens"` appearing inside a quoted
-///   string cannot wipe a real reading that preceded it.
-/// - An occurrence that is followed by a colon but not by digits — `null`, or a
-///   float — clears the value to 0. The last colon-bearing occurrence wins
-///   whatever it holds.
-///
-/// Values are read as bytes, never decoded, which is the whole point: the
-/// incident this replaces came from a UTF-8-aware extractor mis-slicing lines
-/// carrying astral-plane characters.
+/// colon, or 0. A faithful port of the awk `tok()` helper, two behaviours of
+/// which are deliberate: an occurrence not followed by a colon leaves the
+/// previous value standing, so `"input_tokens"` inside a quoted string cannot
+/// wipe a real reading; one followed by a colon but not digits (`null`, a
+/// float) clears it to 0. Values are read as bytes, never decoded — see the
+/// module doc.
 fn token_value(line: &[u8], key: &[u8]) -> u64 {
     let mut last: Option<u64> = None;
     let mut from = 0;
@@ -347,9 +299,8 @@ fn token_value(line: &[u8], key: &[u8]) -> u64 {
             while end < line.len() && line[end].is_ascii_digit() {
                 end += 1;
             }
-            // Non-digits, or a run too long for u64, both read as 0 — awk would
-            // hand bash a float in scientific notation and bash's `^[0-9]+$`
-            // guard would reject it.
+            // Non-digits, or a run too long for u64, both read as 0: bash's
+            // `^[0-9]+$` guard rejected awk's scientific-notation float too.
             last = Some(
                 std::str::from_utf8(&line[start..end])
                     .ok()
@@ -362,8 +313,7 @@ fn token_value(line: &[u8], key: &[u8]) -> u64 {
     last.unwrap_or(0)
 }
 
-/// `/<first>.*<second>/`: both present, the second starting at or after the end
-/// of the first. Testing only the first `first` is sufficient — any later one
+/// `/<first>.*<second>/`. Only the first `first` needs testing: any later one
 /// that satisfies the pattern implies the first does too.
 fn ordered(line: &[u8], first: &[u8], second: &[u8]) -> bool {
     match find_from(line, first, 0) {
@@ -376,13 +326,10 @@ fn contains(line: &[u8], needle: &[u8]) -> bool {
     find_from(line, needle, 0).is_some()
 }
 
-/// Substring search, first-byte-scan then compare.
-///
-/// The obvious `windows(n).position(..)` is a byte-at-a-time comparison at
-/// every offset; this form lets the first-byte scan vectorize and only runs a
-/// full compare where that byte hits. On a multi-megabyte transcript the
-/// difference is the difference between a scan you notice and one you do not,
-/// and it is the reason no search crate is needed.
+/// Substring search, first-byte scan then compare. `windows(n).position(..)`
+/// compares byte-at-a-time at every offset; this form lets the first-byte scan
+/// vectorize. On a multi-megabyte transcript that is the difference between a
+/// scan you notice and one you do not, and why no search crate is needed.
 fn find_from(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     let (first, rest) = needle.split_first()?;
     if from > hay.len() {

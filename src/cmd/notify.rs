@@ -3,17 +3,12 @@
 //! Usage: `claude-statusline notify <event> [value]`, with the permission
 //! event's hook payload on stdin.
 //!
-//! The whole unit is split into a pure [`plan`] and an impure executor
-//! (`crate::platform::notify`). Everything interesting — which helper runs,
-//! with which arguments, in which order — is decided by `plan`, so the
-//! observable this component is tested on — the command and arguments it
-//! invokes — can be asserted
-//! from a table without spawning anything or raising a toast on the developer's
-//! desktop.
-//!
-//! `plan` takes the platform as a parameter rather than reading `cfg!`, so one
-//! host can assert all three platforms' behaviour. That is what makes the
-//! captured macOS and Linux fixtures checkable from a Windows machine.
+//! Split into a pure [`plan`] and an impure executor
+//! (`crate::platform::notify`): `plan` decides which helper runs, with which
+//! arguments, in which order, so the case table asserts the invoked command
+//! without spawning anything. `plan` takes the platform as a parameter rather
+//! than reading `cfg!`, so one host can assert all three platforms — that is
+//! what makes the captured macOS and Linux fixtures checkable from Windows.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -47,35 +42,31 @@ impl Platform {
     }
 }
 
-/// One thing the notifier does.
-///
-/// Windows sound is not a `Spawn`: the shipped handler plays it in-process
-/// through `System.Media.SoundPlayer`, and spawning a player instead would be
-/// both slower and a visible behaviour change. That is also why Windows has no
-/// captured sound fixture — an in-process call leaves nothing for a `PATH` shim
-/// to record.
-/// Linux: the toast's click is observed by waiting on notify-send (KTD3).
-///
-/// The action flag implies `--wait`, and `--wait` is not reliably bounded on
-/// GNOME, so the executor owns the deadline: it reads notify-send's stdout,
-/// treats a first line of `default` as the click, and terminates the child
-/// when the deadline lapses. The key travels here, not in argv, so
-/// `as_records` and the captured fixtures never see it.
+/// Linux: the toast's click is observed by waiting on notify-send.
+/// The action flag implies `--wait`, which GNOME does not reliably bound, so
+/// the executor owns the deadline: a first stdout line of `default` is the
+/// click, and the child is terminated when the deadline lapses. The key
+/// travels here, not in argv, so `as_records` and the fixtures never see it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClickWait {
     pub key: String,
     pub deadline_secs: u64,
 }
 
-/// How long a Linux toast stays clickable: the notify process's lifetime
-/// per visual alert. A constant, revisited only with evidence from the
-/// real-desktop rows.
+/// How long a Linux toast stays clickable, and so the notify process's
+/// lifetime per visual alert. Revisit only with real-desktop evidence.
 pub const LINUX_CLICK_WAIT_SECS: u64 = 120;
 
-/// The notify-send action: the body click, which GNOME and KDE report as
-/// `default` on stdout.
+/// The notify-send action: the body click, reported as `default` on stdout.
 pub const LINUX_CLICK_ACTION: &str = "default=Focus";
 
+/// One thing the notifier does.
+///
+/// Windows sound is not a `Spawn`: the shipped handler plays it in-process
+/// through `System.Media.SoundPlayer`, and a spawned player would be slower
+/// and a visible behaviour change — which is also why Windows has no captured
+/// sound fixture: an in-process call leaves nothing for a `PATH` shim to
+/// record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     /// Run an external helper. `stdin` is fed to the child; `background` means
@@ -96,11 +87,9 @@ pub enum Action {
 
 /// Everything about the machine that changes what gets invoked.
 ///
-/// Injected rather than probed so a case can pin it. Which helpers exist
-/// and which sound files are present are as much an input to this component as
-/// the payload is — a fixture captured on a runner that had `paplay` is not
-/// reproducible on a host that does not, and probing at assert time would make
-/// the test pass or fail on the developer's installed packages.
+/// Injected rather than probed so a case can pin it: a fixture captured on a
+/// runner that had `paplay` is not reproducible on a host that does not, and
+/// probing at assert time would make the test depend on installed packages.
 #[derive(Debug, Default, Clone)]
 pub struct Env {
     pub home: PathBuf,
@@ -113,15 +102,13 @@ pub struct Env {
     pub files: BTreeSet<PathBuf>,
     /// This binary's absolute path, for the macOS `-execute` action.
     pub binary: PathBuf,
-    /// The launching application's bundle identifier on macOS, when the
-    /// inherited environment names one.
+    /// macOS: the launching application's bundle identifier, when inherited.
     pub bundle_id: Option<String>,
-    /// `TERM_PROGRAM`, the fallback for the bundle identifier when the
-    /// application did not export one (KTD2).
+    /// `TERM_PROGRAM`, the fallback when no bundle identifier was
+    /// exported.
     pub term_program: Option<String>,
     /// Windows: the `claude-statusline:` handler is registered and names the
-    /// helper beside this binary, which is what makes a protocol toast safe
-    /// to raise (KTD4).
+    /// helper beside this binary; only then is a protocol toast safe.
     pub handler_registered: bool,
 }
 
@@ -166,10 +153,9 @@ pub fn bundle_for_term_program(program: &str) -> Option<&'static str> {
     })
 }
 
-/// The `-execute` value: the binary's absolute path in single quotes, the
-/// word `focus`, and the key (KTD10). terminal-notifier hands it to `/bin/sh
-/// -c`, and `/bin/sh` expands `$`, backticks and backslashes inside double
-/// quotes but nothing inside single ones, so a path that contains a single
+/// The `-execute` value: the binary's absolute path in single quotes, `focus`,
+/// and the key. terminal-notifier hands it to `/bin/sh -c`, which
+/// expands nothing inside single quotes, so a path that contains a single
 /// quote, a control byte, or is not absolute yields no command at all rather
 /// than a differently quoted one.
 pub fn execute_command(binary: &Path, key: &Key) -> Option<String> {
@@ -180,14 +166,11 @@ pub fn execute_command(binary: &Path, key: &Key) -> Option<String> {
     Some(format!("'{path}' focus {}", key.as_string()))
 }
 
-/// Joins path components with the separator the **target** platform uses, not
-/// the host's.
-///
-/// `plan` is asserted for all three platforms from whichever machine runs the
-/// tests, and `PathBuf::join` would render a macOS icon path with backslashes
-/// on a Windows host — where the fixture, captured on a real macOS runner,
-/// spells it with slashes. Every path the planner *emits* goes through here;
-/// paths it merely compares against `Env::files` do too, so the two agree.
+/// Joins with the **target** platform's separator, not the host's: `plan` is
+/// asserted for all three platforms from one machine, and `PathBuf::join`
+/// would render a macOS icon path with backslashes on Windows where the
+/// fixture spells it with slashes. Every path the planner emits or compares
+/// against `Env::files` goes through here, so the two agree.
 fn join(platform: Platform, base: &Path, parts: &[&str]) -> PathBuf {
     let sep = match platform {
         Platform::Windows => '\\',
@@ -211,21 +194,16 @@ const DETAIL_LIMIT: usize = 80;
 /// The PowerShell that raises the Windows toast.
 ///
 /// **This body is a compile-time constant and must stay one.** The message is
-/// attacker-influenceable — on a permission event it is `tool_input.command`,
-/// which is whatever the model was about to run — so it crosses the interpreter
-/// boundary on **stdin**, as data, and never as script text.
-/// `notify_argv_never_carries_the_message` asserts exactly that.
+/// attacker-influenceable (`tool_input.command` on a permission event), so it
+/// crosses the interpreter boundary on **stdin**, as data, never as script
+/// text; `notify_argv_never_carries_the_message` asserts that. No double
+/// quotes here, so the Windows command-line encoding cannot alter what
+/// PowerShell parses.
 ///
-/// It contains no double quotes, so the Windows command-line encoding that
-/// `std::process::Command` applies cannot alter what PowerShell parses.
-///
-/// Verified on Windows 11 / PowerShell 5.1 on 2026-07-27 by running this exact
-/// invocation shape with a body that echoes back what it parsed: six hostile
-/// messages — shell metacharacters, an embedded newline, `%PATH%`, doubled and
-/// escaped quotes, backslashes — all arrived byte-identical, with exit 0 and
-/// empty stderr. That covers every step where the text could be evaluated or
-/// mangled. It does **not** cover BurntToast rendering the string, which is a
-/// visual fact, and only a live session on Windows can confirm it.
+/// Verified on Windows 11 / PowerShell 5.1 on 2026-07-27: six hostile messages
+/// (metacharacters, an embedded newline, `%PATH%`, doubled and escaped quotes,
+/// backslashes) arrived byte-identical, exit 0, empty stderr. That does **not**
+/// cover BurntToast rendering the string; only a live Windows session can.
 pub const WINDOWS_TOAST_SCRIPT: &str = concat!(
     "$ErrorActionPreference='SilentlyContinue';",
     "$p=[Console]::In.ReadToEnd()|ConvertFrom-Json;",
@@ -234,10 +212,9 @@ pub const WINDOWS_TOAST_SCRIPT: &str = concat!(
     "Import-Module BurntToast;",
     "$hasIcon=[bool]($p.icon -and (Test-Path -LiteralPath $p.icon));",
     "$done=$false;",
-    // The click transport (KTD4): protocol activation with the launch URI the
-    // stdin JSON carries. Never `-AppId` — the default identity is what keeps
-    // the toast rendering as it does today. Any failure falls through to the
-    // cmdlet below, so a BurntToast without these cmdlets still toasts.
+    // The click transport: protocol activation with the stdin JSON's
+    // launch URI. Never `-AppId` — the default identity keeps the toast
+    // rendering as today. Any failure falls through to the cmdlet below.
     "if($p.launch){",
     "try{",
     "$ErrorActionPreference='Stop';",
@@ -285,13 +262,9 @@ fn sound_file(platform: Platform, event: &str) -> Option<&'static str> {
 /// The Linux players, in the order the script tries them.
 const LINUX_PLAYERS: [&str; 3] = ["paplay", "ffplay", "ogg123"];
 
-/// Builds the message text for an event.
-///
-/// The permission case is the only one that reads the payload: it names the
-/// tool and, for the tools whose argument is worth seeing, its command or file
-/// path. An unparseable payload degrades to the bare prompt rather than
-/// dropping the notification — the user still needs to know something is
-/// waiting.
+/// Builds the message text for an event. Only the permission case reads the
+/// payload; an unparseable one degrades to the bare prompt rather than
+/// dropping the notification — the user still needs to know something waits.
 pub fn message(platform: Platform, event: &str, value: &str, stdin: &str, cwd: &Path) -> String {
     match event {
         "permission" => permission_message(platform, stdin, cwd),
@@ -338,20 +311,16 @@ fn permission_message(platform: Platform, stdin: &str, cwd: &Path) -> String {
     if matches!(tool, "Edit" | "Write" | "Read") {
         detail = strip_cwd(platform, &detail, cwd);
     }
-    // Characters, not bytes: bash counts characters here under a UTF-8 locale,
-    // and slicing a multi-byte character in half would render a replacement
-    // glyph in the notification.
+    // Characters, not bytes: bash counts characters under a UTF-8 locale, and
+    // a half-sliced multi-byte character renders as a replacement glyph.
     let detail: String = detail.chars().take(DETAIL_LIMIT).collect();
     format!("{tool}: {detail}")
 }
 
-/// Drops the working-directory prefix from a file path, so a notification shows
-/// `src/main.rs` rather than the user's whole home directory.
-///
-/// Windows compares case-insensitively and joins with a backslash; the bash
-/// scripts compare exactly and join with a slash. Preserved as-is: a path that
-/// differs only in case is the same file on Windows and two different files on
-/// Linux, so unifying this would be wrong on one of them.
+/// Drops the working-directory prefix from a file path. Windows compares
+/// case-insensitively and joins with a backslash; the bash scripts compare
+/// exactly and join with a slash. Preserved as-is: a path that differs only in
+/// case is the same file on Windows and two files on Linux.
 fn strip_cwd(platform: Platform, detail: &str, cwd: &Path) -> String {
     let cwd = cwd.to_string_lossy();
     let (cwd, sep) = match platform {
@@ -371,12 +340,11 @@ fn strip_cwd(platform: Platform, detail: &str, cwd: &Path) -> String {
         return detail.to_string();
     }
     match platform {
-        // Case folding can change a char's UTF-8 length — U+212A KELVIN SIGN
-        // lowercases to a one-byte ASCII `k` — so the region of `detail` that
-        // matched is not necessarily `prefix.len()` bytes long. Slicing at
-        // `prefix.len()` can land mid-char and panic, which the entry-point
-        // `catch_unwind` swallows into a dropped notification. Walk `detail`
-        // accumulating folded widths to find where the match actually ends.
+        // Case folding can change a char's UTF-8 length (U+212A KELVIN SIGN
+        // lowercases to a one-byte `k`), so the matched region of `detail` is
+        // not necessarily `prefix.len()` bytes; slicing there can panic
+        // mid-char, and `catch_unwind` turns that into a dropped notification.
+        // Walk `detail` accumulating folded widths to find the real end.
         Platform::Windows => {
             let want = prefix.to_lowercase().len();
             let mut folded = 0usize;
@@ -390,23 +358,20 @@ fn strip_cwd(platform: Platform, detail: &str, cwd: &Path) -> String {
             }
             detail[end..].to_string()
         }
-        // The other platforms compare and slice the same bytes, so the
-        // prefix length is the matched length by construction.
+        // The other platforms compare and slice the same bytes.
         _ => detail[prefix.len()..].to_string(),
     }
 }
 
 /// Decides everything this invocation will do, without doing any of it.
 ///
-/// Order is preserved per platform and is not cosmetic: the bash scripts
-/// background the sound and then raise the visual, while the Windows handler
-/// raises the toast first and plays its sound synchronously afterwards so the
-/// toast is not delayed behind the audio.
+/// Order per platform is not cosmetic: the bash scripts background the sound
+/// and then raise the visual, while the Windows handler raises the toast first
+/// and plays its sound synchronously so the toast is not delayed behind audio.
 ///
-/// `key` is the click key the alert captured, passed as its own parameter
-/// rather than probed into `Env` (KTD16): it is the product of a write that
-/// just happened, not a fact about the machine. With no key the plan is
-/// exactly today's, which is what keeps the captured fixtures untouched.
+/// `key` is its own parameter rather than probed into `Env`: it is the
+/// product of a write that just happened, not a fact about the machine. With
+/// no key the plan is exactly today's, which keeps the captured fixtures.
 pub fn plan(
     platform: Platform,
     event: &str,
@@ -447,10 +412,9 @@ pub fn plan(
 fn unix_sound(platform: Platform, event: &str, env: &Env) -> Option<Action> {
     let file = sound_file(platform, event)?;
     match platform {
-        // The macOS script never checks that the file or `afplay` exists — it
-        // runs the command and lets a missing one fail into /dev/null. Probing
-        // first would change the observable on any machine where the check
-        // fails, so this does the same and tolerates the spawn failing.
+        // The macOS script never checks that the file or `afplay` exists;
+        // probing first would change the observable, so this tolerates the
+        // spawn failing instead.
         Platform::Macos => Some(Action::Spawn {
             program: "afplay".to_string(),
             args: vec![format!("/System/Library/Sounds/{file}")],
@@ -458,8 +422,8 @@ fn unix_sound(platform: Platform, event: &str, env: &Env) -> Option<Action> {
             background: true,
             click: None,
         }),
-        // Linux does check: the asset ships in a package that is often absent,
-        // and three different players might be installed.
+        // Linux does check: the asset's package is often absent, and any of
+        // three players might be installed.
         Platform::Linux => {
             let path = PathBuf::from(format!("/usr/share/sounds/freedesktop/stereo/{file}"));
             if !env.file_exists(&path) {
@@ -509,10 +473,9 @@ fn unix_visual(platform: Platform, msg: &str, env: &Env, key: Option<&Key>) -> O
                 args.push("-contentImage".to_string());
                 args.push(icon);
             }
-            // The click actions (KTD2), stored with the notification by
-            // terminal-notifier and run on click in this order: activate the
-            // application, then execute the focus command. Only with a key,
-            // so the captured fixtures keep today's argv.
+            // The click actions, run by terminal-notifier on click in
+            // this order: activate the app, then execute the focus command.
+            // Only with a key, so the captured fixtures keep today's argv.
             if let Some(key) = key {
                 if let Some(bundle) = env.activation_bundle() {
                     args.push("-activate".to_string());
@@ -543,7 +506,7 @@ fn unix_visual(platform: Platform, msg: &str, env: &Env, key: Option<&Key>) -> O
             if let Some(icon) = icon {
                 args.push(format!("--icon={}", icon.to_string_lossy()));
             }
-            // The click action, only with a key (KTD3). The flag implies
+            // The click action, only with a key. The flag implies
             // `--wait`; the executor bounds it and hands the click back.
             let click = key.map(|key| {
                 args.push("-A".to_string());
@@ -567,26 +530,21 @@ fn unix_visual(platform: Platform, msg: &str, env: &Env, key: Option<&Key>) -> O
 
 /// The Windows toast, as a `powershell.exe` invocation.
 ///
-/// Three things here are load-bearing:
+/// Load-bearing: the interpreter is addressed by **absolute path** under
+/// `%SystemRoot%`, never by `PATH` or the current directory, so a
+/// `powershell.exe` dropped in the working directory must never be what raises
+/// the notification; `-NoProfile`, so a profile cannot change what the script
+/// means; and the message travels on **stdin as JSON**, never inside the
+/// `-Command` body, so a hostile message is harmless by construction rather
+/// than by escaping: the text is never parsed as code.
 ///
-/// - The interpreter is addressed by **absolute path** under `%SystemRoot%`,
-///   never by `PATH` or the current directory. A `powershell.exe` dropped in
-///   the working directory must never be what raises the notification.
-/// - `-NoProfile`, so a user profile cannot change what the script means.
-/// - The message travels on **stdin as JSON**, never inside the `-Command`
-///   body. This is what keeps a hostile message harmless by construction rather than by
-///   escaping: no quoting rule has to be right, because the text is never
-///   parsed as code.
+/// Unlike the shipped handler this does not first probe for BurntToast: the
+/// script checks itself, saving a second interpreter launch.
 ///
-/// Unlike the shipped handler this does not first probe for BurntToast — that
-/// check now lives inside the script, which costs nothing and saves a second
-/// interpreter launch just to answer a question the script can answer itself.
-///
-/// The click key travels the same way as the message, inside the stdin JSON as
-/// `launch`, and only when the handler is registered (AE6): an unregistered
-/// machine gets today's toast, and a click on it keeps today's behaviour (R9).
-/// The launch attribute is XML on the other side; the key alphabet's exclusion
-/// of `&<>"'` is what keeps it inert there.
+/// The click key travels the same way, as `launch` in the stdin JSON, and only
+/// when the handler is registered: an unregistered machine gets today's
+/// toast and today's click behaviour. The launch attribute is XML on the
+/// other side; the key alphabet's exclusion of `&<>"'` keeps it inert there.
 fn windows_toast(msg: &str, env: &Env, key: Option<&Key>) -> Action {
     let launch = match key {
         Some(key) if env.handler_registered => Some(key.uri()),
@@ -618,9 +576,9 @@ fn windows_toast(msg: &str, env: &Env, key: Option<&Key>) -> Action {
 pub const FOCUS_HELPER: &str = "claude-statusline-focus.exe";
 
 pub fn helper_beside(binary: &Path) -> PathBuf {
-    // The directory is cut at the last separator of either kind rather than
-    // through `Path::parent`, which on a Unix host would treat the whole
-    // Windows path as one file name; the case table asserts this from Linux.
+    // Cut at the last separator of either kind rather than `Path::parent`,
+    // which on a Unix host treats a whole Windows path as one file name; the
+    // case table asserts this from Linux.
     let text = binary.to_string_lossy();
     let dir = match text.rfind(['\\', '/']) {
         Some(i) => &text[..i],
@@ -635,9 +593,8 @@ pub fn protocol_command(helper: &Path) -> String {
 }
 
 /// Whether a registered open command names exactly the helper beside this
-/// binary (KTD5). The comparison folds case because the path came through the
-/// registry and the installer may have spelled the drive differently; it does
-/// not tolerate any other difference.
+/// binary. Case folds because the registry and the installer may spell
+/// the drive differently; no other difference is tolerated.
 pub fn handler_command_matches(command: &str, helper: &Path) -> bool {
     command.eq_ignore_ascii_case(&protocol_command(helper))
 }

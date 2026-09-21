@@ -1,27 +1,21 @@
 //! The assembled box.
 //!
-//! Everything here is a pure function over already-gathered data: the payload,
-//! the transcript scan, the git status, and the subagent rows. Nothing in this
-//! module touches the filesystem or the clock, which is what lets the case
-//! table drive the whole render without a process.
+//! Everything here is a pure function over already-gathered data; nothing
+//! touches the filesystem or the clock, which lets the case table drive the
+//! whole render without a process.
 //!
-//! Two width facts govern the file. Colour is emitted as ANSI SGR escapes that
-//! occupy no columns, and a row's *visible* width is what the box is padded to
-//! — so every width question goes through [`visible_width`] and never through
-//! `str::len`. The scripts learned this the hard way in the other direction:
-//! bash indexes by byte outside a UTF-8 locale, so its own width helper counted
-//! a 3-byte bar cell as three columns and mis-padded every row. Rust strings
-//! are UTF-8 and `chars()` yields characters, so the byte/character split
-//! cannot reappear here.
+//! SGR escapes occupy no columns, and the box is padded to a row's *visible*
+//! width, so every width question goes through [`visible_width`], never
+//! `str::len`. The scripts mis-padded every row by counting a 3-byte bar cell
+//! as three columns; `chars()` keeps that from reappearing here.
 
 use crate::git::GitStatus;
 use crate::payload::{sanitize_display, Payload};
 use crate::subagent::{normalize_model_id, Row};
 use crate::transcript::{Scan, TokenRecord};
 
-// Copied from the scripts verbatim. Every one of these is load-bearing for the
-// captured fixtures: change a code here and the case table fails on all three
-// platforms at once, which is the intended alarm rather than a nuisance.
+// Copied from the scripts verbatim; the captured fixtures depend on every one,
+// so a change fails the case table on all three platforms by design.
 pub const RESET: &str = "\x1b[0m";
 pub const DIM: &str = "\x1b[2m";
 pub const BOLD: &str = "\x1b[1m";
@@ -44,9 +38,8 @@ const BAR_WIDTH: usize = 30;
 /// The box never renders narrower than this, however short its rows are.
 const MIN_INNER: usize = 30;
 
-// User-visible thresholds, taken from the scripts. Changing either moves the
-// colour of a bar every user sees, so treat them as product decisions
-// rather than constants to tune.
+// Colour thresholds from the scripts: product decisions, not constants to
+// tune.
 const CONTEXT_CRIT: i64 = 85;
 const CONTEXT_WARN: i64 = 60;
 
@@ -62,10 +55,9 @@ fn row_sep() -> String {
 /// Visible terminal columns: SGR escapes contribute nothing, CJK and emoji
 /// count as two cells.
 ///
-/// The wide ranges are the scripts' list verbatim rather than a Unicode width
-/// table. A table would be *more* correct and would therefore disagree with
-/// the captured fixtures; widening it is a deliberate behaviour change for a
-/// later unit, not a tidy-up.
+/// The wide ranges are the scripts' list verbatim, not a Unicode width table:
+/// a more correct table would disagree with the captured fixtures, so
+/// widening it is a behaviour change, not a tidy-up.
 pub fn visible_width(s: &str) -> usize {
     let stripped = strip_sgr(s);
     if stripped.is_ascii() {
@@ -92,8 +84,7 @@ fn char_width(c: char) -> usize {
 }
 
 /// Removes `ESC [ <digits and semicolons> m`, the only escape form this tool
-/// emits. A sequence that never terminates is left alone rather than eating
-/// the rest of the row.
+/// emits. An unterminated sequence is left alone rather than eating the row.
 fn strip_sgr(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars().peekable();
@@ -140,16 +131,12 @@ fn repeat(c: char, n: usize) -> String {
 /// Truncating, not rounding, in every branch: the scripts divide with integer
 /// arithmetic and 999_999 renders `999.9K`, never `1000.0K`.
 ///
-/// The `B` tier is the port's, not the scripts'. Their ladder stopped at `M`,
-/// so a cumulative count past a billion — reachable on a long session's cache
-/// reads — rendered `1000.0M`, breaking the very invariant the truncation above
-/// exists to hold. Stopping at `B` is deliberate: `T` would need ~10^12 tokens
-/// in one session, which no tick rate reaches.
-///
-/// `B` alone carries two decimals (`1.23B`), because one decimal there is a
-/// 100M-token bucket — coarse enough to sit unchanged across many refreshes.
-/// The same digit buys 100-token resolution at `K`, so `K` and `M` keep one and
-/// stay byte-identical to the captures.
+/// The `B` tier is the port's: the scripts' ladder stopped at `M`, so a count
+/// past a billion rendered `1000.0M`. No `T` tier, because ~10^12 tokens in one
+/// session is unreachable. `B` alone carries two decimals, because one decimal
+/// there is a 100M-token bucket, whereas the same digit buys 100-token
+/// resolution at `K`; `K` and `M` keep one and stay byte-identical to the
+/// captures.
 pub fn format_tokens(n: u64) -> String {
     if n == 0 {
         return "0".to_string();
@@ -190,13 +177,11 @@ pub fn pct_color(pct: i64) -> &'static str {
     }
 }
 
-/// The whole effort segment — separator, colour, label — shared by the model
-/// row and every subagent row.
+/// The whole effort segment, shared by the model row and every subagent row.
 ///
-/// Extracted because `effort_color` below was the *only* shared part: the guard
-/// and the surrounding format string were written out twice, byte-identically,
-/// and the subagent copy has no fixture covering it. Two copies where one is
-/// unobserved is how a divergence lands without any test noticing.
+/// Extracted because the guard and format string were once duplicated and the
+/// subagent copy has no fixture covering it, so a divergence there would land
+/// unnoticed.
 fn effort_segment(sep: &str, effort: &str) -> String {
     if effort.is_empty() {
         return String::new();
@@ -204,8 +189,7 @@ fn effort_segment(sep: &str, effort: &str) -> String {
     format!("{sep}{}{effort} effort{RESET}", effort_color(effort))
 }
 
-/// Shared by the model row and every subagent row so the two cannot drift.
-/// Unknown values — including the integer form agent frontmatter allows — fall
+/// Unknown values, including the integer form agent frontmatter allows, fall
 /// through to `WHITE` rather than being rejected.
 pub fn effort_color(level: &str) -> &'static str {
     match level.to_ascii_lowercase().as_str() {
@@ -242,8 +226,7 @@ pub fn prettify_model_id(id: &str) -> String {
         let Some(rest) = rest.strip_prefix('-') else {
             continue;
         };
-        // The version is a dash-separated digit run; the match is a prefix, so
-        // `opus-5[1m]` still resolves to `Opus 5`.
+        // A prefix match, so `opus-5[1m]` still resolves to `Opus 5`.
         let version: String = rest
             .chars()
             .take_while(|c| c.is_ascii_digit() || *c == '-')
@@ -264,12 +247,10 @@ pub fn prettify_model_id(id: &str) -> String {
 
 /// `$X.YYYY` plus whether the value exceeds the cost-warning threshold.
 ///
-/// Four decimals up to `$999.9999`, then `$1,234.56` — grouped, and two
-/// decimals rather than four. Both halves of that switch are intentional: at
-/// four figures a run of ungrouped digits is hard to read at a glance, and
-/// sub-cent precision that carried real information at `$0.0834` is noise
-/// beside a thousand dollars. The scripts had neither tier, because they
-/// predate a session that could bill that much.
+/// Four decimals up to `$999.9999`, then `$1,234.56`: grouped for legibility,
+/// and two decimals because sub-cent precision is noise beside a thousand
+/// dollars. The scripts had neither tier; they predate a session that could
+/// bill that much.
 pub fn format_cost(raw: &str) -> (String, bool) {
     let numeric = numeric_prefix(raw);
     let value: f64 = numeric.parse().unwrap_or(0.0);
@@ -291,13 +272,11 @@ pub fn format_cost(raw: &str) -> (String, bool) {
     (formatted, decimal_exceeds_half(&decimal))
 }
 
-/// `1123.45` -> `1,123.45`. Groups the integer part on threes from the right;
-/// a leading sign and the fractional tail pass through untouched.
+/// `1123.45` -> `1,123.45`; a leading sign and the fraction pass through.
 ///
-/// Comma-grouped rather than locale-aware on purpose. A locale lookup would be
-/// a per-tick cost for a row whose other numbers (`10m54s`, `31%`) are already
-/// unlocalised, and a decimal-comma locale would render `$1.123,45` beside a
-/// dot-decimal `$0.5000` below the threshold.
+/// Comma-grouped, not locale-aware: a locale lookup is a per-tick cost for a
+/// row whose other numbers are already unlocalised, and a decimal-comma locale
+/// would render `$1.123,45` beside `$0.5000` below the threshold.
 fn group_thousands(s: &str) -> String {
     let (sign, rest) = match s.strip_prefix('-') {
         Some(rest) => ("-", rest),
@@ -426,11 +405,9 @@ pub fn format_duration(secs: i64) -> String {
     }
 }
 
-/// One rate-limit window: `5h 42% ⇡3% (1h)`.
-///
-/// The burn arrow compares actual usage against the linear expectation for the
-/// elapsed part of the window, so a session that is merely old does not look
-/// like one that is burning fast.
+/// One rate-limit window: `5h 42% ⇡3% (1h)`. The burn arrow compares usage
+/// against the linear expectation for the elapsed part of the window, so an
+/// old session does not look like a fast-burning one.
 pub fn format_rate_window(
     label: &str,
     pct_val: Option<f64>,
@@ -520,15 +497,13 @@ pub fn format_bucket(
 
 /// `~/projects/thing`, or `.../parent/leaf` when it is not under home.
 ///
-/// Separators are normalised on **both** sides so one implementation covers
-/// both platforms, and the home comparison stays case-sensitive, which is
-/// what bash does. Each of those diverges from `windows/statusline.ps1:287`,
-/// which normalised only the `cwd` and compared with `OrdinalIgnoreCase`; both
-/// are resolved to the behaviour here and recorded in the plan's Scope
-/// Boundaries and `docs/performance.md` §4, asserted by
-/// `resolved_cwd_divergences_keep_the_ports_behaviour`. Neither shape is
-/// reachable from a payload Claude Code produces, which is why no fixture
-/// covers them.
+/// Separators are normalised on both sides and the home comparison is
+/// case-sensitive, as in bash. Both diverge from `windows/statusline.ps1:287`,
+/// which normalised only the `cwd` and compared with `OrdinalIgnoreCase`; the
+/// divergences are resolved to this behaviour, recorded in the plan's Scope
+/// Boundaries and `docs/performance.md` §4, and asserted by
+/// `resolved_cwd_divergences_keep_the_ports_behaviour`. No payload Claude Code
+/// produces reaches either shape, so no fixture covers them.
 pub fn format_cwd(cwd: &str, home: Option<&str>) -> String {
     let normalized = cwd.replace('\\', "/");
     if let Some(home) = home.filter(|h| !h.is_empty()) {
@@ -572,21 +547,16 @@ pub fn format_git(status: &GitStatus) -> String {
         out += &format!(" {GRAY}~{}{RESET}", status.untracked);
     }
     if status.stash > 0 {
-        // The space is deliberate and unlike every other marker in this row.
-        // U+229F is drawn edge-to-edge in most terminal fonts, so an adjacent
-        // digit lands against the box wall and the pair reads as one composite
-        // glyph; `↑`/`+`/`-`/`~` all carry enough side-bearing not to need it.
+        // The space is deliberate: U+229F is drawn edge-to-edge in most
+        // terminal fonts, so an adjacent digit reads as part of the glyph.
         out += &format!(" {DIM}⊟ {}{RESET}", status.stash);
     }
     out
 }
 
-/// One subagent row.
-///
-/// The three untrusted display fields are scrubbed here, at the render sink,
-/// rather than at ingest: every source path — a live feed, a
-/// read-back cache, a transcript fallback — funnels through this function, so
-/// a value planted in any of them is caught once.
+/// One subagent row. The untrusted display fields are scrubbed here, at the
+/// render sink, because every source (feed, read-back cache, transcript
+/// fallback) funnels through this function.
 pub fn format_subagent_row(row: &Row) -> String {
     let window = if row.window > 0 {
         row.window
@@ -595,9 +565,8 @@ pub fn format_subagent_row(row: &Row) -> String {
     };
     let model = sanitize_display(&row.model);
     let display = sanitize_display(&row.display);
-    // Bounded at the sink so a record written by an older version is capped
-    // too. No real level exceeds six characters, so this never truncates a
-    // legitimate value.
+    // Bounded at the sink so an older version's record is capped too; no real
+    // level exceeds six characters, so this never truncates a legitimate value.
     let effort: String = sanitize_display(&row.effort).chars().take(16).collect();
 
     let pct = ((row.used.min(u64::MAX / 100) * 100 / window) as i64).clamp(0, 100);
@@ -726,9 +695,8 @@ pub fn render(inputs: &Inputs) -> String {
     model_row += &format!("{sep}{status_part}");
 
     // --- tokens -----------------------------------------------------------
-    // Totals always come from this tick's scan; only the deltas come from the
-    // stored record. On an unchanged transcript the stored deltas are
-    // re-displayed rather than recomputed to zero.
+    // Totals come from this tick's scan; only the deltas come from the stored
+    // record, so an unchanged transcript re-displays them instead of zeroing.
     let scan = inputs.scan;
     let d = inputs.record;
     let tokens_row = [

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Paired script-vs-binary measurement for macOS and Linux (U6, U13; R38).
+# Paired script-vs-binary measurement for macOS and Linux.
 # The functional twin of measure.ps1.
 #
-# Produces the end-to-end fresh-process medians R38 requires before a
+# Produces the end-to-end fresh-process medians required before a
 # component's scripts are deleted, for the script and the binary, on one host,
 # with their runs interleaved.
 #
@@ -98,7 +98,7 @@ case "$COMPONENT" in
     subagent|statusline) ;;
     *) fail "unknown component '$COMPONENT'" ;;
 esac
-(( RUNS >= 7 )) || fail "R38 and docs/performance.md §3 require at least 7 runs; got $RUNS"
+(( RUNS >= 7 )) || fail "docs/performance.md §3 requires at least 7 runs; got $RUNS"
 
 # The paired script-vs-binary measurement needs a script to pair against, and
 # the trees were deleted at 1f5acf2. Checking here rather than letting the run
@@ -157,7 +157,7 @@ if [[ $COMPONENT == statusline ]]; then
     transcript="$HOME/.claude/projects/fixtures/transcript.jsonl"
     mkdir -p "$(dirname -- "$transcript")"
     if (( ${TRANSCRIPT_BYTES:-0} > 0 )); then
-        # R38's large-transcript state. GENERATED to a target size rather than
+        # The large-transcript state. GENERATED to a target size rather than
         # pointed at a real session file: a machine-local transcript is not
         # reproducible on CI, on another machine, or next month, and a number
         # nobody else can reproduce is an anecdote. Repeating one pinned record

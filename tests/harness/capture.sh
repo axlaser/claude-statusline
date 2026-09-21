@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Fixture-capture harness for macOS and Linux (U3; R30, R31, R33; KTD9, KTD10).
+# Fixture-capture harness for macOS and Linux.
 #
 # Drives the *current scripts* under a fully isolated HOME and TMPDIR and stores
 # each component's observable as a golden fixture, so the Rust port has
@@ -22,7 +22,7 @@
 
 set -uo pipefail
 
-# KTD9. macOS ships bash 3.2 as /bin/bash forever. Re-exec under a real one
+# macOS ships bash 3.2 as /bin/bash forever. Re-exec under a real one
 # rather than writing the whole harness to the 2007 dialect.
 if (( ${BASH_VERSINFO[0]} < 4 )); then
     for _cand in /opt/homebrew/bin/bash /usr/local/bin/bash /usr/bin/bash; do
@@ -73,7 +73,7 @@ note() { printf '  %s\n' "$*" >&2; }
 command -v jq  >/dev/null || fail "jq is required"
 command -v git >/dev/null || fail "git is required"
 
-# The locale the scripts run in is a render input (R30), not harness hygiene.
+# The locale the scripts run in is a render input, not harness hygiene.
 #
 # bash indexes a string by BYTE under a non-UTF-8 locale, so `get_vis` charges
 # a 3-byte bar cell three terminal columns and every box row is padded to the
@@ -97,7 +97,7 @@ done
 unset _loc
 
 # ---------------------------------------------------------------------------
-# Source of the scripts under capture (R33)
+# Source of the scripts under capture
 # ---------------------------------------------------------------------------
 
 WORKTREE=""
@@ -182,12 +182,6 @@ touch_stamp() {
     date -d "@$epoch" +%Y%m%d%H%M.%S
 }
 
-mtime_of() {
-    local path=$1
-    if stat -f %m "$path" 2>/dev/null; then return; fi
-    stat -c %Y "$path" 2>/dev/null
-}
-
 # Replaces every machine-local path with a placeholder, then refuses to hand
 # back anything still carrying the real user's home or repo path. Fixtures are
 # committed, and CLAUDE.md forbids shipping a personal absolute path.
@@ -198,9 +192,9 @@ mtime_of() {
 # trailing newline, while the Windows driver reads through .NET's ReadAllText
 # and keeps them. Two drivers that disagree about a trailing byte write
 # fixtures that look like a real cross-platform divergence and are not — which
-# is exactly what U6 hit on the one observable whose captured bytes happened to
-# end in a newline. The trailing `x` below survives the stripping and is
-# removed afterwards.
+# is exactly what an earlier measurement hit on the one observable whose
+# captured bytes happened to end in a newline. The trailing `x` below
+# survives the stripping and is removed afterwards.
 scrub() {
     local text
     text=$(cat "$1"; printf x)
@@ -348,7 +342,7 @@ capture_case() {
     mkdir -p "$HOME_DIR/.claude" "$TMP_DIR" "$WORK_DIR" "$shim_dir"
     : > "$capture_file"
 
-    # KTD10's shim directory. One body, five names.
+    # The shim directory. One body, five names.
     local shim
     for shim in afplay paplay terminal-notifier notify-send; do
         cp "$HARNESS_DIR/shims/record.sh" "$shim_dir/$shim"
@@ -374,7 +368,7 @@ capture_case() {
     # shell script — so an intended mtime is materialised as an offset from
     # capture time and *recorded* as an offset from the pinned clock. Replaying
     # in Rust pins the clock to `clock` and the mtimes to clock+offset, which is
-    # what KTD6's Clock trait exists to make possible.
+    # what the Clock trait exists to make possible.
     for (( i = 0; i < count; i++ )); do
         target=$(jq -r --argjson i "$i" '.[$i].target' <<<"$inputs_json")
         content=$(jq -r --argjson i "$i" '.[$i].content' <<<"$inputs_json")
@@ -455,7 +449,7 @@ capture_case() {
 
     case "$observable" in
         stdout)
-            # KTD10, asserted in both directions. The isolated TMPDIR guarantees
+            # Asserted in both directions. The isolated TMPDIR guarantees
             # no output cache existed before the run, so a case that renders must
             # leave one behind and a case that exits early must not. Both
             # outcomes produce plausible bytes, so byte-diffing alone can never
@@ -475,7 +469,7 @@ capture_case() {
             cp "$stdout_file" "$observable_file"
             ;;
         deleted-paths)
-            # R31's observable for git-refresh is the exact set of paths that
+            # The observable for git-refresh is the exact set of paths that
             # disappeared from the isolated temp root. Diffing the whole root
             # rather than probing the two expected names is the point: a session
             # id that escaped sanitisation would delete something else, and only
@@ -516,7 +510,6 @@ capture_case() {
         --arg observable "$observable" \
         --arg source_commit "$SOURCE_COMMIT" \
         --arg platform "$PLATFORM" \
-        --arg script "$PLATFORM/$(basename "$script")" \
         --arg payload "$payload" \
         --arg notify_config "$notify_config" \
         --arg git_state "${git_state:-}" \

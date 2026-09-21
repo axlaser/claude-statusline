@@ -1,8 +1,6 @@
-//! Subcommand implementations.
-//!
-//! One module per runtime script the migration replaces. Each keeps its
-//! decision logic in pure functions so the case table can drive it without a
-//! process, and exposes one thin entry point that the dispatcher calls.
+//! Subcommand implementations, one module per runtime script replaced. Each
+//! keeps its decisions in pure functions the case table can drive without a
+//! process, behind one thin entry point the dispatcher calls.
 
 pub mod focus;
 pub mod git_refresh;

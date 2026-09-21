@@ -5,7 +5,7 @@ edition = "2021"
 description = "Cross-platform custom status line for Claude Code"
 license = "MIT"
 repository = "https://github.com/axlaser/claude-statusline"
-# Two binaries: `cargo run` needs to be told which one (KTD14).
+# Two binaries: `cargo run` needs to be told which one.
 default-run = "claude-statusline"
 
 [lib]
@@ -16,21 +16,18 @@ path = "src/lib.rs"
 name = "claude-statusline"
 path = "src/main.rs"
 
-# The Windows click helper (KTD14). Built everywhere so the entry contract
-# covers it on every host; shipped only for the Windows targets. `test = false`
-# because it has no unit tests of its own — the single integration test file
-# drives it as a process through `CARGO_BIN_EXE_claude-statusline-focus`.
+# The Windows click helper: built everywhere so the entry contract
+# covers it on every host, shipped only for Windows. `test = false` because
+# the integration test file drives it as a process instead.
 [[bin]]
 name = "claude-statusline-focus"
 path = "src/bin/focus.rs"
 test = false
 
 [dependencies]
-# `preserve_order` keeps settings.json's existing keys in the user's order
-# instead of re-sorting them alphabetically. Without it, installing rewrites the
-# whole file and the diff shows every line rather than only the entries the
-# installer meant to add — which is both alarming to read and useless as
-# verification. jq, which the shell installers used, preserves order too.
+# `preserve_order` keeps settings.json's keys in the user's order, so an
+# install's diff shows only the entries it added rather than a re-sorted file.
+# jq, which the shell installers used, preserves order too.
 serde_json = { version = "1", features = ["preserve_order"] }
 
 [dev-dependencies]
@@ -49,23 +46,20 @@ windows-sys = { version = "0.59", features = [
     "Win32_Security_Authorization",
     "Win32_System_Threading",
     "Win32_System_Console",
-    # U7: the notification sound, played in-process as the shipped handler did
-    # through System.Media.SoundPlayer. Spawning a player instead would be a
-    # visible behaviour change and a second process on every notification.
+    # The notification sound, played in-process as the shipped handler did;
+    # spawning a player would be a second process on every notification.
     "Win32_Media_Audio",
-    # Click-to-focus: the token's random bytes come from `ProcessPrng`, the
-    # source the standard library itself uses (KTD13), and the anchor process
-    # is found by walking the Toolhelp parent chain.
+    # Click-to-focus: `ProcessPrng` for the token, the standard library's own
+    # source; Toolhelp for walking the parent chain to the anchor.
     "Win32_Security_Cryptography",
     "Win32_System_Diagnostics_ToolHelp",
-    # Click-to-focus: the terminal window is found through the console's
-    # root owner or the parent chain's windows (KTD6), marked with a window
-    # property at capture and verified through it at click (KTD9).
+    # Click-to-focus: finding the terminal window and marking it with a
+    # window property at capture, verified at click.
     "Win32_UI_WindowsAndMessaging",
     # Click-to-focus: the per-user URI handler under HKCU\Software\Classes
     # is read on every visual alert and written by `settings protocol`.
     "Win32_System_Registry",
-    # Click-to-focus: the foreground recipe (KTD7) registers a hotkey and
+    # Click-to-focus: the foreground recipe registers a hotkey and
     # sends it, and skips its own verification under a debugger.
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_LibraryLoader",
@@ -74,7 +68,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
 ] }
 
-# KTD7: the top-level catch_unwind is a no-op under `panic = "abort"`, so the
+# The top-level catch_unwind is a no-op under `panic = "abort"`, so the
 # release profile must keep unwinding panics. Do not "optimize" this away.
 [profile.release]
 panic = "unwind"

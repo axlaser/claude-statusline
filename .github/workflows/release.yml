@@ -264,7 +264,7 @@ jobs:
           "$bin" self-check
           printf '' | "$bin" > /dev/null
 
-      # The click helper ships for Windows only (KTD14). Run with no arguments
+      # The click helper ships for Windows only. Run with no arguments
       # it must exit 0 and stay silent, which is its whole contract from the
       # shell's point of view; bash waits for a GUI-subsystem process where
       # PowerShell's `&` would not.

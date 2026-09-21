@@ -1,9 +1,7 @@
-//! The single injectable time source.
-//!
-//! Filesystem timestamps live on this trait alongside wall-clock reads on
-//! purpose: feed freshness and transcript staleness are both `now - mtime`, so
-//! a test that pinned only the clock would still read real file times and the
-//! stale-feed and stale-transcript states would be unreachable in the table.
+//! The single injectable time source. Filesystem mtimes live on the trait
+//! beside wall-clock reads: freshness is `now - mtime`, so a test that pinned
+//! only the clock would leave the stale-feed and stale-transcript states
+//! unreachable in the table.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

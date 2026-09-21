@@ -1,7 +1,7 @@
 ﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
-    Fixture-capture harness for Windows (U3; R30, R31, R33; KTD9, KTD10).
+    Fixture-capture harness for Windows.
 
 .DESCRIPTION
     Drives the current windows\ scripts under a fully isolated USERPROFILE and
@@ -10,7 +10,7 @@
     functional twin of capture.sh; both read cases.json and states.json, so a
     case is defined once and captured on all three platforms.
 
-    KTD9 puts Windows capture on the maintainer's machine rather than on CI,
+    Windows capture runs on the maintainer's machine rather than on CI,
     because the Windows script tree is the one with no hosted equivalent of the
     developer's real environment.
 
@@ -85,7 +85,7 @@ function Invoke-Git([string[]] $Arguments) {
 }
 
 # ---------------------------------------------------------------------------
-# Source of the scripts under capture (R33)
+# Source of the scripts under capture
 # ---------------------------------------------------------------------------
 
 $Worktree = $null
@@ -252,7 +252,7 @@ function Invoke-CaptureCase($Spec, [string] $OutRoot) {
     }
     Write-Utf8 $captureFile ''
 
-    # KTD10's shim directory. The status line spawns its notification with
+    # The shim directory. The status line spawns its notification with
     # `Start-Process -FilePath 'powershell'`, which resolves through PATH.
     Copy-Item (Join-Path $HarnessDir 'shims\record.cmd') (Join-Path $shimDir 'powershell.cmd')
     # ...and addresses the script itself by path, which PATH cannot intercept,
@@ -275,7 +275,7 @@ function Invoke-CaptureCase($Spec, [string] $OutRoot) {
     # shell script -- so an intended mtime is materialised as an offset from
     # capture time and *recorded* as an offset from the pinned clock. Replaying
     # in Rust pins the clock to `clock` and the mtimes to clock+offset, which is
-    # what KTD6's Clock trait exists to make possible.
+    # what the Clock trait exists to make possible.
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     foreach ($supplied in $inputs) {
         # Plain string replacement, not -replace: a Windows path is not a valid
@@ -378,7 +378,7 @@ function Invoke-CaptureCase($Spec, [string] $OutRoot) {
     $captured = ''
     switch ($observable) {
         'stdout' {
-            # KTD10, asserted in both directions. The isolated TEMP guarantees no
+            # Asserted in both directions. The isolated TEMP guarantees no
             # output cache existed before the run, so a case that renders must
             # leave one behind and a case that exits early must not. Both
             # outcomes produce plausible bytes, so byte-diffing alone can never
@@ -397,7 +397,7 @@ function Invoke-CaptureCase($Spec, [string] $OutRoot) {
             $captured = if (Test-Path $stdoutFile) { Read-Utf8 $stdoutFile } else { '' }
         }
         'deleted-paths' {
-            # R31's observable for git-refresh is the exact set of paths that
+            # The observable for git-refresh is the exact set of paths that
             # disappeared from the isolated temp root. Diffing the whole root
             # rather than probing the two expected names is the point: a session
             # id that escaped sanitisation would delete something else, and only

@@ -526,9 +526,7 @@ step "Notification configuration"
 if [[ -f $NOTIFY_CONFIG_PATH ]]; then
     ok "Config already exists (preserving)"
     info "$NOTIFY_CONFIG_PATH"
-    _config_was_new=false
 else
-    _config_was_new=true
     cat > "$NOTIFY_CONFIG_PATH" <<'NCEOF'
 {
   "permission":        { "sound": true, "visual": true },

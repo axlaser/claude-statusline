@@ -1,36 +1,27 @@
 //! The stdin payload: one tolerant reader over the JSON contract Claude Code
 //! pipes in on every refresh.
 //!
-//! The whole module exists to be *un*typed. A `#[derive(Deserialize)]`
-//! model would reject the entire document the day Claude Code changes one
-//! field's type, and under the silent-degradation contract that renders as a
-//! blank status line with no explanation. The scripts never had that failure
-//! mode: they pull each field out on its own, and a field that is missing or
-//! unusable costs exactly the row it feeds. This reproduces that — parse once
-//! to a generic value, then read each documented field through a helper that
-//! answers "absent" for anything it cannot use.
+//! Deliberately untyped: a `#[derive(Deserialize)]` model would reject the
+//! whole document when one field's type changes, which under silent
+//! degradation is a blank status line. The scripts pull each field out on its
+//! own, so a bad field costs exactly the row it feeds; the helpers here answer
+//! "absent" for anything they cannot use, to the same effect.
 //!
-//! The field list came from the JSON-extraction block in `macos/statusline.sh`,
-//! and the accessors below are named after the `J_*` variables it assigned so
-//! the two can be read side by side — see `eb56345` for the script's final
-//! state. The accessors here are the contract now; `CLAUDE.md` documents the
-//! fields.
+//! The field list came from the JSON-extraction block in `macos/statusline.sh`
+//! and the accessors are named after its `J_*` variables; see `eb56345` for
+//! the script's final state. `CLAUDE.md` documents the fields.
 //!
-//! Nothing here scrubs. [`sanitize_display`] lives in this module because
-//! it is the counterpart of that same block, but it is applied at
-//! the render sink, not at ingest: scrubbing on the way in would silently
-//! corrupt values that never reach the screen, notably `transcript_path`, which
-//! has to survive byte-intact to open a file.
+//! Nothing here scrubs. [`sanitize_display`] is applied at the render sink,
+//! not at ingest, because scrubbing on the way in would corrupt values that
+//! never reach the screen, notably `transcript_path`.
 
 use std::borrow::Cow;
 
 use serde_json::Value;
 
-/// A parsed stdin payload.
-///
-/// Construction is fallible in exactly the two cases the scripts treat as fatal
-/// — see [`Payload::parse`] — so holding one means the render path has a JSON
-/// object to read, and every field read after that degrades instead of failing.
+/// A parsed stdin payload. Construction fails only in the two cases
+/// the scripts treat as fatal (see [`Payload::parse`]); every field read
+/// after that degrades instead of failing.
 pub struct Payload {
     root: Value,
 }
@@ -39,18 +30,13 @@ impl Payload {
     /// Parses the raw stdin bytes, or `None` for input the scripts render
     /// `[statusline: bad JSON]` for.
     ///
-    /// Two rejections, both deliberate:
-    ///
-    /// - **Unparseable input**, including empty stdin. Empty is not a special
-    ///   case that renders a blank line; both scripts reach their bad-JSON
-    ///   branch on it, because jq emits no rows and `ConvertFrom-Json` has
-    ///   nothing to convert.
-    /// - **Valid JSON that is not an object** — an array, a bare string, a
-    ///   number. This mirrors the bash filter's explicit `if type != "object"
-    ///   then error` guard. Windows has no equivalent check and would render a
-    ///   defaults-only line instead; the bash behaviour is the one that was
-    ///   written on purpose, so it is the one ported. Recorded as a resolved
-    ///   divergence.
+    /// - **Unparseable input**, including empty stdin: both scripts reach their
+    ///   bad-JSON branch on it, because jq emits no rows and `ConvertFrom-Json`
+    ///   has nothing to convert.
+    /// - **Valid JSON that is not an object**: the bash filter's explicit `if
+    ///   type != "object" then error` guard. Windows had no such check and
+    ///   rendered a defaults-only line; the bash behaviour was written on
+    ///   purpose, so it is the one ported. Recorded as a resolved divergence.
     pub fn parse(raw: &str) -> Option<Self> {
         match serde_json::from_str::<Value>(raw) {
             Ok(root) if root.is_object() => Some(Self { root }),
@@ -58,9 +44,8 @@ impl Payload {
         }
     }
 
-    /// Walks a dotted path without ever panicking on a missing or non-object
-    /// link. `.get()` on a non-object value is `None`, so a payload where
-    /// `context_window` is a string simply has no `used_percentage`.
+    /// Walks a path; `.get()` on a non-object link is `None`, so a payload
+    /// where `context_window` is a string simply has no `used_percentage`.
     fn at(&self, path: &[&str]) -> Option<&Value> {
         let mut cur = &self.root;
         for key in path {
@@ -71,38 +56,27 @@ impl Payload {
 
     /// A string field, or `""` when it is absent, null, or any non-string type.
     ///
-    /// Empty and absent deliberately collapse to the same value: every
-    /// consuming site in the scripts tests `[[ -n ... ]]`, so a field present
-    /// as `""` already behaved exactly as a missing one.
+    /// Empty and absent collapse deliberately: every consuming site in
+    /// the scripts tests `[[ -n ... ]]`, so `""` already behaved as missing.
     ///
-    /// Wrong-typed values read as absent, which is a divergence from both
-    /// scripts, and the reason one bad field costs only its own row. jq renders an object to its compact JSON
-    /// text and PowerShell renders it `@{a=1}`, so a payload with
-    /// `model.display_name: {"a": 1}` puts `{"a":1}` in the model row on
-    /// macOS and `@{a=1}` on Windows. There is no byte-exact behaviour to
-    /// preserve between two platforms that already disagree, and neither
-    /// output is defensible on screen, so the row falls back instead.
+    /// Wrong-typed values read as absent, a divergence from both scripts: jq
+    /// renders an object as `{"a":1}` and PowerShell as `@{a=1}`, so the two
+    /// platforms already disagreed and neither output is defensible on screen.
     pub fn text(&self, path: &[&str]) -> &str {
         self.at(path).and_then(Value::as_str).unwrap_or("")
     }
 
     /// A field read as text, accepting a JSON number as its decimal spelling.
     ///
-    /// The scripts interpolated whatever they were handed into a string before
-    /// parsing it — `"$resetsAt"` in PowerShell, `jq -r` in bash — so a numeric
-    /// field and a quoted one behaved identically, and *both platforms spelled a
-    /// number the same way*. That is what separates this from [`Payload::text`]'s
-    /// deliberate strictness: the two scripts genuinely disagreed on how to
-    /// render an object, so there was no behaviour to preserve, but for a number
-    /// they agreed exactly.
+    /// The scripts interpolated the field into a string before parsing it
+    /// (`"$resetsAt"` in PowerShell, `jq -r` in bash), so a number and a quoted
+    /// number behaved identically on both platforms. Unlike the object case in
+    /// [`Payload::text`], there is a behaviour to preserve.
     ///
-    /// Used for the two fields where a number is a meaningful value rather than
-    /// malformed input: `resets_at`, which is an epoch instant, and
-    /// `effort.level`, which agent frontmatter is allowed to write as an
-    /// integer. Both were silently dropped before, and neither failure
-    /// announced itself — `resets_at` cost the burn arrow, the countdown, and
-    /// the rate alert's ability to re-arm; `effort.level` cost the whole
-    /// segment.
+    /// Used where a number is meaningful: `resets_at`, an epoch instant, and
+    /// `effort.level`, which agent frontmatter may write as an integer.
+    /// Dropping them silently cost the burn arrow, the countdown, the rate
+    /// alert's re-arm and the whole effort segment.
     pub fn text_or_number(&self, path: &[&str]) -> Cow<'_, str> {
         match self.at(path) {
             Some(Value::String(s)) => Cow::Borrowed(s.as_str()),
@@ -113,17 +87,14 @@ impl Payload {
 
     /// A numeric field, accepting a JSON number or a numeric string.
     ///
-    /// The string arm is not leniency for its own sake: jq hands bash every
-    /// field as text and bash re-parses it, so a payload quoting
-    /// `"used_percentage": "42.5"` renders identically to the unquoted form
-    /// today. Dropping the string arm would silently blank rows that currently
-    /// render.
+    /// The string arm matches jq handing bash every field as text, so a quoted
+    /// `"42.5"` renders identically to the unquoted form; dropping it would
+    /// silently blank rows that currently render.
     ///
     /// A JSON `false` reads as absent, matching jq's `//` operator, which
-    /// returns its right-hand side for `false` as well as `null`. That is the
-    /// same operator whose behaviour meant `notify`'s mute flags never worked
-    /// — here it is being reproduced rather than fixed, because for a
-    /// numeric field "false" has no sensible reading.
+    /// falls through on `false` as well as `null`. The same operator broke
+    /// `notify`'s mute flags; here it is reproduced, because a numeric `false`
+    /// has no sensible reading.
     pub fn number(&self, path: &[&str]) -> Option<f64> {
         match self.at(path)? {
             Value::Number(n) => n.as_f64(),
@@ -132,15 +103,12 @@ impl Payload {
         }
     }
 
-    /// A non-negative integer field, accepting a JSON number or a digits-only
-    /// string.
+    /// A non-negative integer field: a JSON number or a digits-only string.
     ///
-    /// The string arm is exactly bash's `^[0-9]+$` guard: no sign, no decimal
-    /// point, no leading blanks. An integral float (`200000.0`) is accepted
-    /// because jq 1.6 prints it as `200000` and bash's guard then passes it;
-    /// under jq 1.7's literal preservation the same payload would print
-    /// `200000.0` and fail the guard, so the platforms cannot agree on that
-    /// input anyway and the tolerant reading is the useful one.
+    /// The string arm is exactly bash's `^[0-9]+$` guard. An integral float
+    /// (`200000.0`) is accepted because jq 1.6 prints it as `200000` and passes
+    /// the guard while jq 1.7 preserves the literal and fails it, so the
+    /// tolerant reading is the useful one.
     pub fn uint(&self, path: &[&str]) -> Option<u64> {
         match self.at(path)? {
             Value::Number(n) => n.as_u64().or_else(|| {
@@ -156,9 +124,8 @@ impl Payload {
 
     // -- The documented fields, in the order the parity block assigns them ---
 
-    /// `J_SESSION_ID`. Names every per-session state file, so it reaches a
-    /// filename and must go through [`crate::session::sanitize_session_id`]
-    /// before it does.
+    /// `J_SESSION_ID`. Reaches a filename, so it must go through
+    /// [`crate::session::sanitize_session_id`] first.
     pub fn session_id(&self) -> &str {
         self.text(&["session_id"])
     }
@@ -174,11 +141,9 @@ impl Payload {
         }
     }
 
-    /// `J_GIT_CWD`. The parity block extracts `workspace.current_dir` a second
-    /// time for the git row and does **not** give it the `cwd` fallback, so the
-    /// git segment and the path segment can resolve differently. Kept separate
-    /// rather than aliased to [`Payload::cwd`] for that reason. The caller supplies
-    /// the process working directory when this is empty.
+    /// `J_GIT_CWD`. The parity block does **not** give this the `cwd` fallback,
+    /// so it is kept separate from [`Payload::cwd`]; the caller supplies the
+    /// process working directory when it is empty.
     pub fn git_cwd(&self) -> &str {
         self.text(&["workspace", "current_dir"])
     }
@@ -208,14 +173,11 @@ impl Payload {
         self.uint(&["context_window", "total_input_tokens"])
     }
 
-    /// `J_EFFORT_LEVEL`. A display field, so it is scrubbed at render.
-    ///
-    /// Read tolerantly because agent frontmatter may write the level as an
-    /// integer. Both scripts rendered that as `3 effort` in white — bash
-    /// through `jq -r`, PowerShell because `if ($effortLevel)` is truthy for a
-    /// number and its `switch` falls to `default` — and
-    /// [`crate::render::effort_color`]'s catch-all arm exists for exactly those
-    /// values, so dropping them here made that arm unreachable from a payload.
+    /// `J_EFFORT_LEVEL`. Scrubbed at render. Read tolerantly because agent
+    /// frontmatter may write an integer, which both scripts rendered as
+    /// `3 effort` in white (bash through `jq -r`, PowerShell because a number
+    /// is truthy and its `switch` falls to `default`);
+    /// [`crate::render::effort_color`]'s catch-all arm exists for those values.
     pub fn effort_level(&self) -> Cow<'_, str> {
         self.text_or_number(&["effort", "level"])
     }
@@ -226,20 +188,16 @@ impl Payload {
             .or_else(|| self.number(&["total_cost_usd"]))
     }
 
-    /// `J_DURATION_MS` and its two legacy spellings, in the scripts' order:
-    /// `cost.total_duration_ms`, then `total_duration_ms`, then `duration_ms`.
-    ///
-    /// Returned as a float because bash strips the fractional part textually
-    /// (`${duration_ms%.*}`) before dividing, so a fractional value has always
-    /// been accepted here.
+    /// `J_DURATION_MS` and its two legacy spellings, in the scripts' order.
+    /// A float because bash strips the fraction textually (`${duration_ms%.*}`)
+    /// before dividing, so fractional values have always been accepted.
     pub fn duration_ms(&self) -> Option<f64> {
         self.number(&["cost", "total_duration_ms"])
             .or_else(|| self.number(&["total_duration_ms"]))
             .or_else(|| self.number(&["duration_ms"]))
     }
 
-    /// `J_TRANSCRIPT_PATH`. Opened as a file, never rendered, and therefore
-    /// never scrubbed.
+    /// `J_TRANSCRIPT_PATH`. Opened as a file, never rendered, never scrubbed.
     pub fn transcript_path(&self) -> &str {
         self.text(&["transcript_path"])
     }
@@ -270,38 +228,28 @@ impl Payload {
         self.text(&["agent", "name"])
     }
 
-    /// `J_AGENT_IN`, defaulting to 0 rather than absent — both scripts pin it
-    /// to zero at extraction (`${agent_in:-0}` and an explicit `$null` test)
-    /// because it renders unconditionally inside the agent row.
+    /// `J_AGENT_IN`, defaulting to 0 because both scripts pin it to zero at
+    /// extraction: it renders unconditionally inside the agent row.
     pub fn agent_input_tokens(&self) -> u64 {
         self.uint(&["context_window", "current_usage", "input_tokens"])
             .unwrap_or(0)
     }
 
-    /// `J_AGENT_OUT`. Zero-defaulted for the same reason as
-    /// [`Payload::agent_input_tokens`].
+    /// `J_AGENT_OUT`. Zero-defaulted like [`Payload::agent_input_tokens`].
     pub fn agent_output_tokens(&self) -> u64 {
         self.uint(&["context_window", "current_usage", "output_tokens"])
             .unwrap_or(0)
     }
 }
 
-/// The render sink's scrub for untrusted display fields.
+/// The render sink's scrub for untrusted display fields, porting the scripts'
+/// `sa_sanitize_title`: control bytes, DEL and `|` (a forgeable column
+/// separator) become spaces, then spaces are trimmed so a field of nothing but
+/// control bytes reads as empty.
 ///
-/// Ports the scripts' `sa_sanitize_title`: control
-/// bytes and DEL become spaces, `|` becomes a space so a value cannot forge a
-/// column separator, and the result is trimmed of spaces so a field that was
-/// nothing but control bytes reads as empty rather than as whitespace.
-///
-/// Applied to the git branch, subagent model and title, agent name, effort, and
-/// model display name — every field whose bytes originate outside this tool.
-/// The trim is space-only, matching bash's `[! ]` trim, which is not a
-/// distinction that survives the replacement above but is kept literal so the
-/// two read as the same function.
-///
-/// One byte diverges: bash's range starts at `\x01` because a bash string
-/// cannot hold a NUL in the first place, while a JSON string can carry one.
-/// It is scrubbed here rather than passed through to a terminal.
+/// The trim is space-only, matching bash's `[! ]` trim. One byte diverges:
+/// bash's range starts at `\x01` because a bash string cannot hold a NUL,
+/// while a JSON string can, so NUL is scrubbed here too.
 pub fn sanitize_display(raw: &str) -> String {
     let replaced: String = raw
         .chars()

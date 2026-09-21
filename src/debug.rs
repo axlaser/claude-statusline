@@ -1,19 +1,13 @@
-//! `STATUSLINE_DEBUG` logging.
-//!
-//! `CLAUDE.md`'s Silent Degradation rule has two halves — never write to
-//! stderr, and log errors via the debug log. Shipping only the silencing half
-//! would make a field failure indistinguishable from no failure at all.
-//!
-//! The message is a closure so its cost is never paid when logging is off. This
-//! is the Rust form of the PowerShell rule that arguments are evaluated before
-//! the callee's guard.
+//! `STATUSLINE_DEBUG` logging: the second half of Silent Degradation. Never
+//! write to stderr, and log errors here, or a field failure is
+//! indistinguishable from none. The message is a closure so its cost is never
+//! paid when logging is off.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Set by [`enable`]: logging switched on by a caller rather than the
-/// environment.
+/// Set by [`enable`]: logging switched on by a caller, not the environment.
 static FORCED: AtomicBool = AtomicBool::new(false);
 
 /// True when `STATUSLINE_DEBUG` is set to anything other than empty or `0`,
@@ -28,12 +22,9 @@ pub fn is_enabled() -> bool {
     }
 }
 
-/// Switches logging on for the rest of this process.
-///
-/// The click handlers run without the session's environment — the OS launched
-/// them — so the debug flag travels in the focus record and is applied here
-/// before the first line the click path logs (KTD12). Nothing switches it off
-/// again: a process that reached this point exits within a second.
+/// Switches logging on for the rest of this process. The OS launches the click
+/// handlers without the session's environment, so the flag travels in the
+/// focus record and is applied here. Nothing switches it off again.
 pub fn enable() {
     FORCED.store(true, Ordering::Relaxed);
 }
@@ -45,9 +36,8 @@ pub fn default_path() -> Option<PathBuf> {
 }
 
 /// Appends one line to `path` when `enabled`. Never evaluates `msg` otherwise.
-///
-/// Every failure here is swallowed: a broken debug log must not become a
-/// visible failure of the status line itself.
+/// Every failure is swallowed: a broken debug log must not become a visible
+/// failure of the status line itself.
 pub fn log_to<F>(path: &Path, enabled: bool, msg: F)
 where
     F: FnOnce() -> String,
@@ -69,8 +59,7 @@ where
     }
 }
 
-/// Convenience wrapper around [`log_to`] using the ambient enable flag and the
-/// default path.
+/// [`log_to`] with the ambient enable flag and the default path.
 pub fn log<F>(msg: F)
 where
     F: FnOnce() -> String,

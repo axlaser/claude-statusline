@@ -1,25 +1,21 @@
 //! The focus record: the contract between the process that raises a toast and
 //! the process that handles its click.
 //!
-//! A click arrives long after the toast was raised, in a process the OS
-//! launched with none of the session's environment. Everything the click
-//! handler needs to find the right terminal is therefore captured when the
+//! A click arrives long after the toast, in a process launched without the
+//! session's environment, so everything the handler needs is captured when the
 //! alert fires and written to `statusline-focus-<session>.json` in the guarded
-//! state directory, and only there. The toast carries a key,
-//! `<session>.<token>`, that names the record and proves the click came from a
-//! toast this user's session raised rather than from a web page invoking the
-//! URI scheme with a guessed session id.
+//! state directory, and only there. The toast carries a key
+//! `<session>.<token>` that names the record and proves the click came from a
+//! toast this user's session raised, not from a web page guessing a session id.
 //!
-//! The token is a cross-session nonce, not a secret: it is visible in the
-//! session's own argv and to same-user processes, which are inside the boundary
-//! already because they can edit `settings.json`. Its job is to stop web content
-//! from raising the user's terminal by guessing. It never appears in a log
-//! line, a toast, or rendered output.
+//! The token is a cross-session nonce, not a secret: same-user processes can
+//! read it and are inside the boundary already, because they can edit
+//! `settings.json`. It never appears in a log line, a toast, or rendered
+//! output.
 //!
-//! Everything here is cfg-free. The platform primitives it needs — random
-//! bytes, the anchor process, the controlling tty, the Windows window — live in
-//! `platform::focus` and are injected through [`Observation`] so the case table
-//! can drive capture without a process tree.
+//! Everything here is cfg-free. The platform primitives live in
+//! `platform::focus` and are injected through [`Observation`] so the case
+//! table can drive capture without a process tree.
 
 use std::path::{Path, PathBuf};
 
@@ -30,8 +26,7 @@ use crate::debug;
 use crate::session::{sanitize_session_id, StateRoot};
 use crate::state::{self, WriteOutcome};
 
-/// The record format version. A record carrying any other version is refused,
-/// and the next capture regenerates it.
+/// The record format version. Any other version is refused and regenerated.
 pub const RECORD_VERSION: u64 = 1;
 
 /// The token is 24 random bytes in the URL-safe alphabet: 32 characters.
@@ -41,9 +36,8 @@ pub const TOKEN_BYTES: usize = 24;
 /// A record larger than this is refused before parsing.
 pub const MAX_RECORD_BYTES: u64 = 64 * 1024;
 
-/// The URI scheme the Windows handler is registered under, and the prefix the
-/// shell passes to the helper.
-pub const SCHEME: &str = "claude-statusline";
+/// The Windows URI scheme plus its colon: the prefix the shell passes to the
+/// helper.
 pub const SCHEME_PREFIX: &str = "claude-statusline:";
 
 /// The session part shares `sanitize_session_id`'s alphabet and length bound.
@@ -53,8 +47,7 @@ const MAX_SESSION: usize = 128;
 const MAX_PATH_BYTES: usize = 4096;
 
 /// The window classes a Windows record may name. Anything else is refused by
-/// the loader and never stored by capture, so a handle is only ever raised
-/// when it still belongs to a terminal host this tool knows.
+/// the loader and never stored, so only a known terminal host is ever raised.
 pub const WINDOW_CLASSES: [&str; 7] = [
     // Windows Terminal, after the pseudo-console window is reparented.
     "CASCADIA_HOSTING_WINDOW_CLASS",
@@ -104,10 +97,8 @@ pub fn is_tty(s: &str) -> bool {
 }
 
 /// Absolute on either family, at most 4096 bytes, free of control bytes.
-///
-/// "Absolute" is spelled out rather than asked of `Path::is_absolute`, which
-/// answers for the host: the case table loads macOS and Linux records on a
-/// Windows machine, and a record never crosses machines in production.
+/// Spelled out rather than `Path::is_absolute`, which answers for the host:
+/// the case table loads macOS and Linux records on a Windows machine.
 pub fn is_abs_path(s: &str) -> bool {
     if s.is_empty() || s.len() > MAX_PATH_BYTES {
         return false;
@@ -215,10 +206,9 @@ fn is_host_kind(s: &str) -> bool {
 
 /// The click key: `<session>.<token>`.
 ///
-/// The only way to build a record path from a key is through this type, and
-/// the only way to get one is [`Key::parse`], which applies R12: length first,
-/// then the byte-exact grammar, with no trimming, decoding, case folding or
-/// tolerance of extra separators.
+/// A record path is built from a key only through this type, and a key comes
+/// only from [`Key::parse`]: length first, then the byte-exact grammar,
+/// with no trimming, decoding, case folding or extra separators.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Key {
     session: String,
@@ -245,10 +235,9 @@ impl Key {
     }
 
     /// Parses a click handler's argument: the bare key, or the key behind the
-    /// exact lowercase scheme prefix the Windows shell passes.
-    ///
-    /// The prefix is matched byte for byte. `CLAUDE-STATUSLINE:`, `//` after
-    /// the colon, a percent-encoded key and every other variation fail here.
+    /// exact lowercase scheme prefix the Windows shell passes. The prefix is
+    /// matched byte for byte; `CLAUDE-STATUSLINE:`, `//` after the colon and a
+    /// percent-encoded key all fail here.
     pub fn parse_argument(arg: &str) -> Option<Key> {
         if arg.len() > SCHEME_PREFIX.len() + MAX_SESSION + 1 + TOKEN_LEN {
             return None;
@@ -288,8 +277,7 @@ impl Key {
     }
 }
 
-/// Where a session's record lives. `safe_session` has already been through
-/// `sanitize_session_id`.
+/// Where a session's record lives; `safe_session` is already sanitised.
 pub fn record_path(root: &Path, safe_session: &str) -> PathBuf {
     root.join(format!("statusline-focus-{safe_session}.json"))
 }
@@ -307,9 +295,8 @@ pub fn encode_token(bytes: &[u8; TOKEN_BYTES]) -> String {
     out
 }
 
-/// Constant-time equality over two strings of equal length. Hygiene, not a
-/// control: the token is a nonce, and this only keeps the comparison from
-/// being the one place its bytes influence timing.
+/// Constant-time equality. Hygiene, not a control: the token is a nonce, and
+/// this only keeps the comparison from being where its bytes influence timing.
 fn tokens_equal(a: &str, b: &str) -> bool {
     if a.len() != b.len() {
         return false;
@@ -321,12 +308,10 @@ fn tokens_equal(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-/// The process the click path checks for liveness: the nearest ancestor of
-/// the capturing process that is not a shell, which is Claude Code itself.
-///
-/// The start time is what makes a pid meaningful after the process exits and
-/// the number is reused; on Linux start times count from boot, so the boot id
-/// travels with it.
+/// The process the click path checks for liveness: the nearest non-shell
+/// ancestor of the capturing process, which is Claude Code itself. The start
+/// time disambiguates a reused pid; on Linux start times count from boot, so
+/// the boot id travels with it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Anchor {
     pub pid: u64,
@@ -344,9 +329,8 @@ pub struct ProcessInfo {
     pub start: u64,
 }
 
-/// Shells that sit between Claude Code and the process it spawned, and
-/// between the terminal and Claude Code. Compared against a lowercased image
-/// name with any `.exe` removed.
+/// Shells between the terminal, Claude Code and the process it spawned.
+/// Compared against a lowercased image name with any `.exe` removed.
 const SHELLS: [&str; 13] = [
     "sh",
     "bash",
@@ -371,12 +355,9 @@ pub fn is_shell(name: &str) -> bool {
 }
 
 /// Picks the anchor and, above it, the terminal process from an ancestor
-/// chain (self first).
-///
-/// `CLAUDE_PID`, when Claude Code exports it and it appears in the chain,
-/// names the anchor outright; otherwise the anchor is the first ancestor that
-/// is not a shell. The terminal process is the first non-shell above the
-/// anchor: the emulator that forked the user's shell, or nothing recognisable.
+/// chain (self first). `CLAUDE_PID`, when exported and present in the chain,
+/// names the anchor; otherwise it is the first non-shell ancestor. The
+/// terminal is the first non-shell above the anchor, or nothing.
 pub fn select_anchor(
     chain: &[ProcessInfo],
     claude_pid: Option<u64>,
@@ -411,13 +392,11 @@ pub struct WindowCandidate {
 }
 
 /// Picks the terminal window among the visible top-level windows one ancestor
-/// process owns (KTD6 candidate B).
-///
-/// For VS Code the window whose title carries the workspace folder's basename
-/// is preferred; when several do, or none does and several exist, nothing is
-/// stored, because a wrong window is worse than no raise (KTD9). For every
-/// other host the process must own exactly one visible window. The pseudo-
-/// console window is never a candidate.
+/// owns (the parent-chain candidate). For VS Code the window whose title
+/// carries the workspace basename is preferred; when several match, or none
+/// does and several exist, nothing is stored, because a wrong window is worse
+/// than no raise. Every other host must own exactly one visible window. The
+/// pseudo-console window is never a candidate.
 pub fn select_window_candidate(
     windows: &[WindowCandidate],
     is_vscode: bool,
@@ -466,11 +445,10 @@ pub struct WindowFacts {
     pub marker_present: bool,
 }
 
-/// KTD9 for a window: every recorded particular must still hold, and the
-/// capture-time marker must still be on it. A handle recycled inside a
-/// surviving terminal process keeps pid, creation time and class, so the
-/// marker is what proves it is the captured window. `None` facts mean the
-/// handle is no longer a window at all.
+/// For a window, every recorded particular must still hold and the
+/// capture-time marker must still be on it, because a handle recycled inside
+/// a surviving terminal keeps pid, creation time and class. `None` facts mean
+/// the handle is no longer a window at all.
 pub fn window_still_verifies(recorded: &WindowIdentity, facts: Option<&WindowFacts>) -> bool {
     let Some(facts) = facts else {
         return false;
@@ -482,9 +460,8 @@ pub fn window_still_verifies(recorded: &WindowIdentity, facts: Option<&WindowFac
         && facts.marker_present
 }
 
-/// The name of the window property capture sets and the click verifies:
-/// session-specific, so a handle recycled inside a surviving terminal process
-/// cannot carry another session's mark.
+/// The window property capture sets and the click verifies: session-specific,
+/// so a recycled handle cannot carry another session's mark.
 pub fn window_marker(session: &str) -> String {
     format!("ClaudeStatusline.{session}")
 }
@@ -520,9 +497,8 @@ pub struct WindowIdentity {
     pub host: String,
 }
 
-/// Everything the click handler may use to find the terminal, each field
-/// optional and each validated against its grammar both when captured and when
-/// loaded.
+/// Everything the click handler may use to find the terminal; each field is
+/// optional and validated against its grammar when captured and when loaded.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Identity {
     pub bundle_id: Option<String>,
@@ -551,16 +527,15 @@ pub struct Identity {
 }
 
 impl Identity {
-    /// True when the record was captured inside a multiplexer, which is the
-    /// case where the tty and window id the process sees belong to the
-    /// multiplexer rather than the terminal.
+    /// True when captured inside a multiplexer, where the tty and window id
+    /// the process sees belong to the multiplexer rather than the terminal.
     pub fn multiplexed(&self) -> bool {
         self.tmux.is_some() || self.screen.is_some() || self.zellij_pane.is_some()
     }
 }
 
-/// What the platform layer observed at capture time. Injected so the case
-/// table can drive capture with a chosen anchor, tty, window and randomness.
+/// What the platform layer observed at capture time; injected so a case can
+/// pin it.
 #[derive(Debug, Clone, Default)]
 pub struct Observation {
     pub anchor: Option<Anchor>,
@@ -576,8 +551,7 @@ pub struct Observation {
     pub random: Option<[u8; TOKEN_BYTES]>,
 }
 
-/// Parses a decimal environment value, refusing signs, spaces and anything
-/// else `str::parse` would tolerate.
+/// Parses a decimal value, refusing the signs and spaces `str::parse` allows.
 fn env_u64(v: &str) -> Option<u64> {
     if is_digits(v) {
         v.parse().ok()
@@ -586,9 +560,8 @@ fn env_u64(v: &str) -> Option<u64> {
     }
 }
 
-/// Builds the identity from the environment and the observation, dropping any
-/// field that fails its grammar and naming it, so an unusual terminal loses one
-/// step rather than the whole record.
+/// Builds the identity, dropping and naming any field that fails its grammar,
+/// so an unusual terminal loses one step rather than the whole record.
 pub fn identity_from_env(
     platform: Platform,
     var: &dyn Fn(&str) -> Option<String>,
@@ -630,9 +603,8 @@ pub fn identity_from_env(
         }
     }
 
-    // The multiplexer identity first: when one is present, the tty, window id
-    // and terminal process the capturing process sees are the multiplexer's,
-    // and storing them would select the wrong tab on click.
+    // Multiplexer first: with one present, the tty, window id and terminal
+    // process seen here are the multiplexer's and would select the wrong tab.
     if let Some(tmux) = var("TMUX") {
         let socket = tmux.split(',').next().unwrap_or("").to_string();
         let pane = var("TMUX_PANE").unwrap_or_default();
@@ -889,10 +861,8 @@ impl Record {
 
     /// The whole loader gate: size, version, session, token, then every field
     /// against its grammar. One failure and there is no record.
-    ///
-    /// `expected_token` is compared in constant time when given; capture passes
-    /// `None` because it is reading the record to reuse whatever token is
-    /// there.
+    /// `expected_token` is compared in constant time when given; capture
+    /// passes `None` to reuse whatever token is there.
     pub fn load(bytes: &[u8], session: &str, expected_token: Option<&str>) -> Option<Record> {
         if bytes.len() as u64 > MAX_RECORD_BYTES {
             return None;
@@ -1062,9 +1032,9 @@ pub enum CaptureOutcome {
     Reused,
     /// The session id sanitised to nothing.
     NoSession,
-    /// The state root is the flat fallback: capture is skipped there (R19).
+    /// The state root is the flat fallback: capture is skipped there.
     Unguarded,
-    /// The OS produced no randomness, so there is no token (KTD13).
+    /// The OS produced no randomness, so there is no token.
     NoRandomness,
     /// The guarded write did not land.
     NotWritten(WriteOutcome),
@@ -1097,9 +1067,8 @@ pub fn capture_with(
             omitted: Vec::new(),
         };
     }
-    // R19: the flat temp root is shared and unverified. A record there could
-    // be planted by another local user, so none is written and the toast goes
-    // out without click handling.
+    // Another local user could plant a record in the flat temp root, so
+    // none is written there and the toast goes out without click handling.
     if !root.is_guarded() {
         return Capture {
             key: None,

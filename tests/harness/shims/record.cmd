@@ -1,5 +1,5 @@
 @echo off
-rem Windows PATH shim, installed as powershell.cmd (KTD10). The status line
+rem Windows PATH shim, installed as powershell.cmd. The status line
 rem spawns its detached notification with `Start-Process -FilePath 'powershell'`,
 rem which resolves through PATH, so a shim directory prepended to PATH sees the
 rem spawn before System32 does.

@@ -1,10 +1,8 @@
 //! Entry point for the multi-call binary.
 //!
-//! The whole file is the silent-degradation contract. Claude
-//! Code spawns this process on every refresh and renders whatever reaches
-//! stdout; anything on stderr, or a non-zero exit, breaks the user's status
-//! line. The five layers live in `entry`, shared with the click helper; this
-//! file places the two deliberate exemptions between them.
+//! Claude Code spawns this process on every refresh; anything on stderr, or a
+//! non-zero exit, breaks the user's status line. The five silent-degradation
+//! layers live in `entry`; this file places the two exemptions between them.
 
 use std::io::Write;
 
@@ -12,10 +10,8 @@ use claude_statusline::{
     clock, cmd, config, debug, entry, focus, platform, self_check, session, settings,
 };
 
-/// Reads all of stdin, treating an unreadable or non-UTF-8 stream as empty.
-///
-/// Every caller degrades to "no payload" rather than failing: a hook that
-/// errored on odd input would break the tool call that triggered it.
+/// Reads all of stdin. An unreadable or non-UTF-8 stream degrades to "no
+/// payload": a hook that errored on odd input would break its tool call.
 fn read_stdin() -> String {
     use std::io::Read;
     let mut buf = Vec::new();
@@ -31,11 +27,9 @@ const HOOK_STDIN_CAP: u64 = 32 * 1024 * 1024;
 
 /// The hook payload for `notify`: read when stdin is not a terminal, capped.
 ///
-/// One rule for every event (KTD11). The session id in the payload is what
-/// lets a stop or compaction toast be clicked into, so every hook reads its
-/// input now, not only `permission`. An interactive shell is skipped so
-/// `claude-statusline notify stop` typed at a prompt stays usable, and the
-/// tick-spawned child's null stdin returns end-of-file at once.
+/// Every event reads it: the session id is what a toast's click
+/// resolves. A terminal is skipped so `notify stop` typed at a prompt stays
+/// usable; the tick-spawned child's null stdin returns end-of-file at once.
 fn read_hook_stdin() -> String {
     use std::io::{IsTerminal, Read};
     let stdin = std::io::stdin();
@@ -58,14 +52,12 @@ fn read_hook_stdin() -> String {
 }
 
 fn main() {
-    // Layers 1 and 2: fd 2 is gone and the panic hook is silent before argv
-    // is even read.
+    // Layers 1 and 2: fd 2 gone and the panic hook silent before argv is read.
     entry::silence();
 
-    // Read as OS strings: `env::args` panics on an argument that is not
-    // valid Unicode, and the click helper is launched by the shell with
-    // whatever a URI carried (R12). Every subcommand but `focus` reads the
-    // lossy form; `focus` sees the raw bytes and rejects what it cannot use.
+    // OS strings, because `env::args` panics on non-Unicode and the shell
+    // launches the click helper with whatever a URI carried. Only
+    // `focus` sees the raw bytes; the rest read the lossy form.
     let os_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let args: Vec<String> = os_args
         .iter()
@@ -79,40 +71,34 @@ fn main() {
         &os_args[1..]
     };
 
-    // `self-check` is deliberately outside the catch below. It is
-    // the installer's only signal that a binary launches but renders wrongly,
-    // so it has to be able to exit non-zero.
+    // `self-check` stays outside the catch: it is the installer's only signal
+    // that a binary launches but renders wrongly, so it must be able to fail.
     if sub == "self-check" {
         let (rendered, code) = self_check();
         emit(&rendered);
         std::process::exit(code);
     }
 
-    // `settings` is exempt for the same reason, from the other direction. The
-    // exit-0 contract exists for the tick path, where a failure must never
-    // break the user's status line. Here the caller is an installer deciding
-    // whether it just configured Claude Code — a subcommand that reported
-    // success while having written nothing is the worst outcome available.
+    // `settings` is exempt too: an installer that reports success having
+    // written nothing is the worst outcome. The exit-0 contract is for the
+    // tick path, where a failure must never break the user's status line.
     if sub == "settings" {
         std::process::exit(settings_cli(&rest));
     }
 
-    // Layers 3 and 4: an unwinding panic anywhere below becomes a silent
-    // no-op, and stdout is flushed with the result checked.
+    // Layers 3 and 4: catch the panic, flush stdout and check the flush.
     entry::guarded(sub, || dispatch(sub, &rest, os_rest));
 
     // Layer 5.
     std::process::exit(0);
 }
 
-/// `settings apply|remove|has|has-foreign|has-legacy`, the installers' JSON
-/// editor, and `settings protocol register|unregister|has`, the Windows URI
-/// handler's owner.
+/// The installers' `settings.json` editor and, under `protocol`, the Windows
+/// URI handler's owner.
 ///
-/// Returns the process exit code: 0 for success or a true query, 1 otherwise.
-/// Errors go to stdout, not stderr — fd 2 is already redirected to the null
-/// device by the time this runs, so anything written there would vanish and
-/// leave a failing installer with nothing to show the user.
+/// Returns the exit code: 0 for success or a true query, 1 otherwise. Errors
+/// go to stdout, because fd 2 is already the null device and a failing
+/// installer would have nothing to show the user.
 fn settings_cli(rest: &[&str]) -> i32 {
     let mut binary = String::new();
     let mut path: Option<std::path::PathBuf> = None;
@@ -134,8 +120,7 @@ fn settings_cli(rest: &[&str]) -> i32 {
                 Some(v) => path = Some(std::path::PathBuf::from(v)),
                 None => return fail("--settings needs a value"),
             },
-            // Testing hook for `protocol`: the case table registers under a
-            // scratch key rather than the real scheme.
+            // Testing hook: the case table registers under a scratch key.
             "--key" => match args.next() {
                 Some(v) => key = Some(v.to_string()),
                 None => return fail("--key needs a value"),
@@ -153,12 +138,9 @@ fn settings_cli(rest: &[&str]) -> i32 {
             // Testing hooks: the platform default is what installers use.
             "--quote" => spec.quote = true,
             "--no-quote" => spec.quote = false,
-            // A mistyped flag must not reach `positional` and be dropped. This
-            // subcommand is exempt from the exit-0 contract precisely so a
-            // caller can tell it configured nothing; silently accepting
-            // `--subagnet` and then reporting success is the outcome that
-            // exemption exists to prevent. Non-flag tokens still fall through:
-            // `has`, `has-foreign` and `has-legacy` read a feature name there.
+            // A mistyped flag must not reach `positional` and be dropped:
+            // accepting `--subagnet` and reporting success is what the exit-0
+            // exemption exists to prevent. The `has` forms take a name there.
             other if other.starts_with("--") => return fail(&format!("unknown option: {other}")),
             other => positional.push(other),
         }
@@ -174,9 +156,9 @@ fn settings_cli(rest: &[&str]) -> i32 {
         return fail("--binary is required");
     }
 
-    // The URI handler lives in the registry, not in settings.json, so it is
-    // decided before the file is loaded: a machine with no settings.json can
-    // still register, and a broken one must not stop an unregister.
+    // Decided before settings.json loads, because the handler lives in the
+    // registry: a missing file can still register, and a broken one must not
+    // stop an unregister.
     if action == "protocol" {
         return protocol_cli(positional.get(1).copied(), &binary, key.as_deref());
     }
@@ -206,8 +188,7 @@ fn settings_cli(rest: &[&str]) -> i32 {
                 Err(e) => fail(&e),
             }
         }
-        // Query forms report through the exit code so a shell can branch on
-        // them without parsing output.
+        // Queries answer through the exit code so a shell can branch on them.
         "has" => match positional.get(1) {
             Some(f) if settings::has(&root, &binary, f) => 0,
             Some(_) => 1,
@@ -218,9 +199,8 @@ fn settings_cli(rest: &[&str]) -> i32 {
             Some(_) => 1,
             None => fail("has-foreign needs a feature name"),
         },
-        // Unlike its siblings the feature name is optional: the installer
-        // asks the unscoped form to decide whether it is migrating at all, and
-        // the scoped form to carry one setting across.
+        // The feature name is optional: unscoped, the installer asks whether
+        // it is migrating at all; scoped, whether to carry one setting across.
         "has-legacy" => {
             if settings::has_legacy(&root, positional.get(1).copied()) {
                 0
@@ -239,12 +219,9 @@ fn fail(message: &str) -> i32 {
 
 /// `settings protocol register|unregister|has --binary <path> [--key <path>]`.
 ///
-/// `register` writes the key when it is absent or already names a
-/// `claude-statusline-focus.exe`, leaves a foreign command alone and says so,
-/// and refuses a helper path a quote or a percent sign could turn into a
-/// different command. `unregister` deletes the key only when its command is
-/// ours. `has` answers whether exactly the helper beside `--binary` is
-/// registered. Off Windows every verb is unsupported (KTD5).
+/// `register` leaves a foreign command alone and refuses a helper path a quote
+/// or a percent sign could turn into another command; `unregister` deletes
+/// only our own key. Off Windows every verb is unsupported.
 fn protocol_cli(verb: Option<&str>, binary: &str, key: Option<&str>) -> i32 {
     let key = key.unwrap_or(platform::focus::PROTOCOL_KEY);
     let helper = cmd::notify::helper_beside(std::path::Path::new(binary));
@@ -301,9 +278,8 @@ fn protocol_cli(verb: Option<&str>, binary: &str, key: Option<&str>) -> i32 {
 
 fn dispatch(sub: &str, rest: &[&str], os_rest: &[std::ffi::OsString]) {
     match sub {
-        // The click handler on macOS (terminal-notifier's `-execute`) and the
-        // manual form everywhere; the Windows helper and the Linux click path
-        // reach the same `run`.
+        // macOS's click handler (terminal-notifier `-execute`) and the manual
+        // form; the Windows helper and Linux click path reach the same `run`.
         "focus" => cmd::focus::run(os_rest),
         "statusline" => {
             let payload = read_stdin();
@@ -317,9 +293,8 @@ fn dispatch(sub: &str, rest: &[&str], os_rest: &[std::ffi::OsString]) {
             let cfg = config::NotifyConfig::default_path()
                 .map(|p| config::NotifyConfig::load(&p))
                 .unwrap_or_default();
-            // The tick-spawned child carries the key the tick captured as a
-            // fourth value; a hook captures its own, naming the session from
-            // the payload. Either way only a toast gets one (R5).
+            // The tick-spawned child carries the tick's key as a fourth value;
+            // a hook captures its own. Only a toast gets one either way.
             let key = match rest.get(2) {
                 Some(arg) => focus::Key::parse(arg),
                 None if cfg.event(event).visual => {
@@ -340,8 +315,7 @@ fn dispatch(sub: &str, rest: &[&str], os_rest: &[std::ffi::OsString]) {
                 key.as_ref(),
             ) {
                 // On Linux the executor waits for the click and hands the key
-                // back here; the same `run` the subcommand and the Windows
-                // helper use takes it from there (KTD3).
+                // back; the same `run` as the Windows helper takes it.
                 if let Some(clicked) = platform::notify::execute(&action) {
                     cmd::focus::run(&[std::ffi::OsString::from(clicked)]);
                 }
@@ -349,19 +323,16 @@ fn dispatch(sub: &str, rest: &[&str], os_rest: &[std::ffi::OsString]) {
         }
         "git-refresh" => {
             let payload = read_stdin();
-            // Resolved the same way the status line resolves it, or the hook
-            // invalidates a path nothing reads — invisible, because a cache that
-            // is never invalidated still renders correctly.
+            // Resolved as the status line resolves it, or the hook invalidates
+            // a path nothing reads, invisibly: a stale cache still renders.
             cmd::git_refresh::run(&payload, &session::state_dir());
         }
-        // Prints nothing on purpose: stdout here replaces Claude Code's default
-        // agent panel rather than adding to it.
+        // Prints nothing: stdout here would replace Claude Code's agent panel.
         "subagent" => {
             let payload = read_stdin();
             cmd::subagent::run(&payload, &session::state_dir());
         }
-        // Forces a panic so the catch above can be exercised. Kept in release
-        // builds so the test drives the artifact that actually ships.
+        // Exercises the catch; in release builds so the test drives what ships.
         "__panic-probe" => panic!("deliberate panic probe"),
         other => {
             let other = other.to_string();

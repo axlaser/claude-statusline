@@ -1,13 +1,10 @@
 //! The status line itself: gather, render, alert.
 //!
-//! This is the only place the four data sources meet. Everything it calls is
-//! either a pure function or a guarded read, and the order is the one the
-//! scripts use — the learned map is refreshed before the subagent rows resolve
-//! their windows against it, and the alerts fire after the render is already a
-//! string, so a slow notification cannot delay the output.
-//!
-//! There is no output cache. The scripts kept one because a fresh
-//! interpreter cost more than the work; the binary recomputes every tick.
+//! The only place the four data sources meet, in the scripts' order: the
+//! learned map is refreshed before the subagent rows resolve against it, and
+//! alerts fire after the render is a string so a slow notification cannot
+//! delay the output. There is no output cache: the scripts kept one to hide
+//! interpreter startup, and the binary recomputes every tick.
 
 use std::path::{Path, PathBuf};
 
@@ -23,15 +20,12 @@ use crate::transcript::{self, Scan, TokenRecord};
 
 /// The two filesystem roots every state path hangs off.
 ///
-/// Passed rather than read from the environment at each use site. The scripts
-/// had no choice — a shell reads `$HOME` wherever it stands — but ambient reads
-/// make the render path untestable in-process, and a case has to pin every
-/// render input, which these are. `from_env` is the production
-/// construction and the only place the variables are consulted.
+/// Passed rather than read from the environment, unlike the scripts, because
+/// ambient reads make the render path untestable in-process. `from_env` is the
+/// only place the variables are consulted.
 pub struct Roots {
     pub home: Option<PathBuf>,
-    /// Where state lives, and whether this binary owns that directory. It
-    /// derefs to `Path`, so every `roots.temp.join(..)` reads as before.
+    /// Where state lives, and whether this binary owns that directory.
     pub temp: StateRoot,
 }
 
@@ -58,20 +52,14 @@ impl Roots {
     }
 }
 
-/// Renders one refresh and fires whatever alerts it crossed.
-///
-/// Returns the bytes to write to stdout. Degraded input returns the bad-JSON
-/// notice and does nothing else — no state is read, written, or invalidated,
-/// because a tick that could not be understood must not overwrite what the
-/// last good tick recorded.
+/// Renders one refresh and fires whatever alerts it crossed. Degraded input
+/// returns the bad-JSON notice and touches no state: a tick that could not be
+/// understood must not overwrite what the last good tick recorded.
 pub fn run(clock: &dyn Clock, roots: &Roots, raw: &str) -> String {
     let Some(payload) = Payload::parse(raw) else {
-        // The one user-visible failure the status line has, and until now it
-        // wrote nothing to the log — so the scenario README's own
-        // troubleshooting section describes produced no evidence at all, even
-        // with STATUSLINE_DEBUG=1. The reason is recovered by re-parsing rather
-        // than plumbed out of `Payload::parse`, which keeps that function pure
-        // and keeps the cost behind the flag: this runs only when logging is on.
+        // The reason is recovered by re-parsing rather than plumbed out of
+        // `Payload::parse`, which keeps that function pure and the cost behind
+        // the flag.
         if crate::debug::is_enabled() {
             let n = raw.len();
             let reason = match serde_json::from_str::<serde_json::Value>(raw) {
@@ -95,9 +83,8 @@ pub fn run(clock: &dyn Clock, roots: &Roots, raw: &str) -> String {
     let git = git_status(clock, roots, &payload, &session_id);
     let (scan, record) = transcript_state(clock, roots, &payload, &session_id);
 
-    // Refreshed before the rows resolve, so a session on a newly seen model
-    // gives its own subagents a real denominator on the very first refresh
-    // rather than one tick later.
+    // Refreshed before the rows resolve, so a newly seen model gives its own
+    // subagents a real denominator on the first refresh, not one tick later.
     let learned = learn_and_load(roots, &payload);
     let windows = Windows::new(payload.model_id(), payload.context_window_size(), learned);
     let subagents = subagent_rows(clock, roots, &payload, &session_id, &windows);
@@ -127,10 +114,9 @@ fn git_status(
 }
 
 /// This tick's totals, and the record that carries the per-bucket deltas.
-///
-/// The totals always come from this tick's scan; only the deltas come from the
-/// stored record. That is what lets the head checksum the scripts needed
-/// go away: they cached the totals, so a same-size rewrite was invisible.
+/// Totals come from the scan and only deltas from the record, which is what
+/// let the scripts' head checksum go away: they cached the totals, so a
+/// same-size rewrite was invisible.
 fn transcript_state(
     clock: &dyn Clock,
     roots: &Roots,
@@ -155,25 +141,17 @@ fn transcript_state(
         .and_then(|b| String::from_utf8(b).ok())
         .and_then(|t| TokenRecord::parse(&t));
 
-    // An unchanged transcript is not read at all. Everything the tokens row and
-    // the model row render is already in the record, so re-scanning reproduces
-    // it byte for byte at the cost of the whole file.
+    // An unchanged transcript is not read at all: everything the tokens and
+    // model rows render is already in the record. This is the port's one
+    // computation cache, kept on measured grounds: an unconditional rescan cost
+    // ~50 ms on an 8 MB transcript, invisible next to PowerShell's ~124 ms
+    // interpreter floor but four times bash's entire tick, and a static
+    // transcript is most ticks.
     //
-    // This is the one place the port keeps a *computation* cache, and it is
-    // here on measured grounds rather than by symmetry with the scripts. The
-    // paired measurements found the unconditional rescan costing ~50 ms on an 8 MB
-    // transcript, which is invisible next to PowerShell's ~124 ms interpreter
-    // floor but is four times bash's entire tick — so dropping the scripts'
-    // incremental parser was right on Windows and a regression on Linux.
-    // A static transcript is what a session looks like between messages, which
-    // is most ticks.
-    //
-    // What always scanning gave up was noticing a same-size rewrite. That
-    // trade is reversed here deliberately: transcripts are append-only JSONL,
-    // a rewrite landing on the byte-identical length is close to unreachable,
-    // and the mtime has to match as well. The scripts' version of this bug came
-    // from caching totals behind a key that could go stale *and* having no
-    // second signal; `(mtime, size)` together is that second signal.
+    // The cost is missing a same-size rewrite. Accepted deliberately:
+    // transcripts are append-only JSONL, and the mtime must match too. The
+    // scripts' version of this bug cached totals behind a stale-able key with
+    // no second signal; `(mtime, size)` is that second signal.
     if let Some(record) = previous
         .clone()
         .filter(|p| p.mtime == mtime && p.size == size)
@@ -186,19 +164,16 @@ fn transcript_state(
             cache_read_tokens: record.cache_read_tokens,
             output_tokens: record.output_tokens,
             idle: record.idle,
-            // Not stored and not rendered: `consumed` exists for the scan's own
-            // torn-tail bound, and nothing downstream reads it.
+            // Not stored: `consumed` is the scan's own torn-tail bound and
+            // nothing downstream reads it.
             consumed: 0,
         };
         return (Some(scan), Some(record));
     }
 
-    // A failed read must not become an empty scan. `fold` would treat its zero
-    // totals as authoritative, write that record with this tick's
-    // (mtime, size), and the skip above would then serve the zero record on
-    // every later tick — one transient error rendering the tokens row wrong
-    // until the transcript happens to change again. Degrade this tick instead
-    // and leave the stored record for the next one to retry against.
+    // A failed read must not become an empty scan: `fold` would record zero
+    // totals under this tick's (mtime, size) and the skip above would serve
+    // them until the transcript changes again. Degrade this tick instead.
     let Ok(bytes) = std::fs::read(path) else {
         crate::debug::log(|| "transcript: read failed, stored record left intact".to_string());
         return (None, None);
@@ -208,9 +183,8 @@ fn transcript_state(
 
     if needs_write {
         if let Some(p) = record_path.as_deref() {
-            // A record that never lands means the next tick re-scans the whole
-            // transcript, and the one after that, forever -- the cost the
-            // (mtime, size) skip exists to avoid. Nothing else can report it.
+            // A record that never lands means every later tick re-scans the
+            // whole transcript, and nothing else can report it.
             let outcome =
                 crate::state::write_guarded_under(&roots.temp, p, record.to_line().as_bytes());
             if outcome != crate::state::WriteOutcome::Written {
@@ -225,11 +199,8 @@ fn transcript_state(
 }
 
 /// Merges this session's model→window pair into the learned map and returns
-/// the map to resolve against.
-///
-/// The write is skipped when the entry already matches, so an unchanged pair
-/// leaves the file's mtime alone — the scripts key their output cache on that
-/// mtime, and churning it every tick would have defeated it.
+/// the map to resolve against. An already-matching entry is not rewritten: the
+/// scripts key their output cache on the file's mtime.
 fn learn_and_load(roots: &Roots, payload: &Payload) -> std::collections::BTreeMap<String, u64> {
     let Some(path) = roots.model_windows_path() else {
         return Default::default();
@@ -244,16 +215,14 @@ fn learn_and_load(roots: &Roots, payload: &Payload) -> std::collections::BTreeMa
         return map;
     }
 
-    // Re-read as the merge base rather than serialising the flattened map: a
-    // concurrent session may have learned a different model since the load
-    // above, and writing the stale view would drop its entry.
+    // Re-read as the merge base: a concurrent session may have learned another
+    // model since the load above, and writing the stale view would drop it.
     let mut base = Windows::load_learned(&path);
     base.insert(key.clone(), window);
     let body = serde_json::to_string(&base).unwrap_or_default();
     if !body.is_empty() {
-        // Report what actually happened. Logging "learned" unconditionally
-        // claimed success on a hostile or unwritable target, which is the one
-        // case where the log is the only way to find out.
+        // Log the outcome, not "learned": on a hostile or unwritable target
+        // the log is the only way to find out.
         let outcome = crate::state::write_guarded(&path, format!("{body}\n").as_bytes());
         crate::debug::log(|| format!("model-windows: learned {key}={window} -> {outcome:?}"));
     }
@@ -294,8 +263,7 @@ fn subagent_rows(
 }
 
 /// Reads the latch, decides the edges, spawns what crossed, stores the result.
-///
-/// `rendered` is taken only so this cannot be called before the render exists —
+/// `rendered` is taken only so this cannot be called before the render exists:
 /// the alert must never sit between the work and the output.
 fn fire_alerts(roots: &Roots, payload: &Payload, session_id: &str, rendered: &str) {
     let _ = rendered;
@@ -313,10 +281,8 @@ fn fire_alerts(roots: &Roots, payload: &Payload, session_id: &str, rendered: &st
         .unwrap_or(0);
     let (rate_max, resets_now) = rate_inputs(payload);
 
-    // Read once. The write below needs to know whether the latch was usable,
-    // and re-reading the file to find out cost a second open/read of the same
-    // path on every tick that crossed a threshold. Matching a fieldless variant
-    // binds nothing, so this does not move the value out from under `decide`.
+    // Read once: the write below needs to know whether the latch was usable,
+    // and re-reading cost a second open of the same path per crossing tick.
     let latch = notify_state::read_latch(&path);
     let latch_unusable = matches!(latch, LatchState::Unusable);
 
@@ -330,15 +296,13 @@ fn fire_alerts(roots: &Roots, payload: &Payload, session_id: &str, rendered: &st
     );
 
     for alert in &decision.alerts {
-        // the per-event flags gate delivery. A muted event still latches,
-        // so unmuting mid-window does not immediately fire for a crossing the
-        // user already lived through.
+        // A muted event still latches, so unmuting mid-window does not fire for
+        // a crossing the user already lived through.
         let event = config.event(alert.event);
         if event.sound || event.visual {
-            // Click handling exists only for a toast (KD4, R5): a sound-only
-            // alert captures nothing, so the alert path stays as cheap as it
-            // was. Capture happens here, in the tick, because the detached
-            // child cannot see the terminal this session runs in.
+            // Click handling exists only for a toast; a sound-only
+            // alert captures nothing. Capture happens in the tick because the
+            // detached child cannot see the terminal this session runs in.
             let key = if event.visual {
                 crate::focus::capture(&roots.temp, session_id, crate::debug::is_enabled())
             } else {
@@ -348,9 +312,8 @@ fn fire_alerts(roots: &Roots, payload: &Payload, session_id: &str, rendered: &st
         }
     }
     if decision.changed && !latch_unusable {
-        // A latch that does not persist re-fires the same alert on the next
-        // tick, so a failure here is worth a line in the debug log -- it is the
-        // only channel that can carry it.
+        // A latch that does not persist re-fires the same alert next tick; the
+        // debug log is the only channel that can carry the failure.
         let outcome = crate::state::write_guarded_under(
             &roots.temp,
             &path,

@@ -57,7 +57,7 @@
     },
     {
       "name": "unborn-head-staged",
-      "why": "The state that actually reaches `# branch.oid (initial)`: `git add` creates `.git/index`, so the outer guard passes and each script's unborn-HEAD branch is executed. This is R20's divergence case — bash blanks the branch and renders no git segment, Windows substitutes the literal `HEAD`. Without an index the divergence is unreachable, which is why `unborn-head` alone made the U13 scenario pass vacuously.",
+      "why": "The state that actually reaches `# branch.oid (initial)`: `git add` creates `.git/index`, so the outer guard passes and each script's unborn-HEAD branch is executed. This is the divergence case — bash blanks the branch and renders no git segment, Windows substitutes the literal `HEAD`. Without an index the divergence is unreachable, which is why `unborn-head` alone made the divergence scenario pass vacuously.",
       "steps": [
         ["git", "init", "-b", "main"],
         ["write", "README.md", "staged, never committed\n"],
