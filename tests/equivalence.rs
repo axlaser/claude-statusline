@@ -3273,6 +3273,57 @@ fn verification_is_pinned_and_fails_closed() {
     failures.assert_empty("verification pinning");
 }
 
+/// `gh attestation verify` exits 1 for a download the release workflow did not
+/// build and for a gh that cannot check anything, alike — and every gh before
+/// 2.56.0 is the second whatever it is given (install.sh's `gh_cannot_verify`
+/// has the measured breakdown). Reading that exit as a failed verification
+/// refused every install on a stock Ubuntu gh. Both installers consult a
+/// version floor before verifying, and the floors have to agree: a dialect
+/// left behind either refuses installs again or skips a check its gh could run.
+#[test]
+fn an_old_gh_is_an_inability_to_verify_not_a_failure() {
+    let mut failures = Failures::default();
+    let mut floors = Vec::new();
+    for (rel, marker, gate) in [
+        (
+            "install/install.sh",
+            "GH_MIN_VERSION=\"",
+            "_gh_blocker=$(gh_cannot_verify)",
+        ),
+        (
+            "install/install.ps1",
+            "$ghMinVersion   = \"",
+            "$ghBlocker = Get-GhVerifyBlocker",
+        ),
+    ] {
+        let text = read_repo_file(rel);
+        let floor = text
+            .split(marker)
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_default()
+            .to_string();
+        failures.check(rel, text.contains(gate), || {
+            "runs gh attestation verify without consulting the gh version floor".to_string()
+        });
+        // 2.56.0 is the oldest gh measured to verify the published bundles
+        // against Sigstore's current trusted root; a lower floor hands a gh
+        // that cannot verify back to the fail-closed branch.
+        let parsed: Vec<u32> = floor.split('.').filter_map(|p| p.parse().ok()).collect();
+        failures.check(rel, parsed.len() == 3 && parsed[..2] >= [2, 56][..], || {
+            format!("pins gh floor {floor:?}, below 2.56.0 or not a version")
+        });
+        floors.push((rel, floor));
+    }
+    failures.check("installers", floors[0].1 == floors[1].1, || {
+        format!(
+            "{} pins gh {:?} but {} pins {:?}",
+            floors[0].0, floors[0].1, floors[1].0, floors[1].1
+        )
+    });
+    failures.assert_empty("gh version floor");
+}
+
 /// Three ways to choose a release, and the default has to stay
 /// the conservative one.
 ///

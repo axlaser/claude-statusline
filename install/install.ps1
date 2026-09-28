@@ -17,6 +17,9 @@ if ($PSVersionTable.PSVersion -lt [Version]'5.1') {
 
 $repoSlug       = "axlaser/claude-statusline"
 $signerWorkflow = "$repoSlug/.github/workflows/release.yml"
+# The oldest gh that can verify this release's attestations; see
+# Get-GhVerifyBlocker. install.sh pins the same floor.
+$ghMinVersion   = "2.56.0"
 
 $claudeDir    = "$env:USERPROFILE\.claude"
 $binDir       = "$claudeDir\bin"
@@ -107,6 +110,45 @@ function Invoke-Binary {
         return [PSCustomObject]@{ Ran = $false; Code = $null; Output = $output }
     }
     return [PSCustomObject]@{ Ran = $true; Code = $LASTEXITCODE; Output = $output }
+}
+
+# Why gh cannot verify provenance on this machine, or $null when it can.
+#
+# `gh attestation verify` exits 1 both for "this is not what the release
+# workflow built" and for "this gh cannot check anything", and only the first
+# is a negative result. Every gh older than $ghMinVersion is in the second case
+# whatever it is given; install.sh's gh_cannot_verify has the measured
+# breakdown. A version that does not parse gets the benefit of the doubt:
+# verification runs, and still fails closed.
+function Get-GhVerifyBlocker {
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return "gh CLI not found" }
+    $probe = Invoke-Binary 'gh' @('--version')
+    if (-not $probe.Ran -or $probe.Code -ne 0) { return "gh could not be launched" }
+    $m = [regex]::Match(((@($probe.Output) | ForEach-Object { "$_" }) -join "`n"), 'gh version (\d{1,6})\.(\d{1,6})')
+    if (-not $m.Success) { return $null }
+    # Compared field by field: [Version]'2.56' sorts below [Version]'2.56.0',
+    # so building a Version from the two parsed fields would reject 2.56 itself.
+    $maj = [int]$m.Groups[1].Value
+    $min = [int]$m.Groups[2].Value
+    $floor = [Version]$ghMinVersion
+    if ($maj -lt $floor.Major -or ($maj -eq $floor.Major -and $min -lt $floor.Minor)) {
+        return "gh $maj.$min is too old to verify provenance (needs $ghMinVersion or later)"
+    }
+    return $null
+}
+
+# The line of gh's output that says why a verification failed, made safe to
+# print. Display only, as in install.sh: nothing decides on it.
+function Get-GhFailureReason($Output) {
+    foreach ($line in @($Output)) {
+        $s = "$line"
+        if ($s -match '^(error|unknown|x )') {
+            $s = $s -replace '[^\x20-\x7E]', ''
+            if ($s.Length -gt 160) { $s = $s.Substring(0, 160) }
+            return $s
+        }
+    }
+    return $null
 }
 
 # --- Options ---
@@ -439,7 +481,10 @@ Write-Host ""
 # tolerated, and only without the flag.
 Step "Verifying build provenance"
 $attested = $false
-if (Get-Command gh -ErrorAction SilentlyContinue) {
+$ghBlocker = Get-GhVerifyBlocker
+if ($ghBlocker) {
+    Warn "$ghBlocker - provenance not verified"
+} else {
     $gotBundle = $false
     try {
         Invoke-WebRequest -Uri "$baseUrl/$asset.sigstore.json" -OutFile $script:bundlePath `
@@ -468,6 +513,8 @@ if (Get-Command gh -ErrorAction SilentlyContinue) {
             Err "Attestation verification FAILED for $asset"
             Info "The download matched its checksum but does not carry a valid"
             Info "provenance attestation from this repository's release workflow."
+            $ghSaid = Get-GhFailureReason $verify.Output
+            if ($ghSaid) { Info "gh: $ghSaid" }
             Info "Refusing to install."
             Remove-Stage
             return
@@ -475,8 +522,6 @@ if (Get-Command gh -ErrorAction SilentlyContinue) {
     } else {
         Warn "No attestation bundle published for this release"
     }
-} else {
-    Warn "gh CLI not found - provenance not verified"
 }
 
 if (-not $attested) {
@@ -638,7 +683,7 @@ if ($helperFetched) {
         $helperWhy = "checksums.txt has no entry for $helperAsset"
     } elseif (-not $helperActual -or $helperActual.ToLower() -ne $helperExpected.ToLower()) {
         $helperWhy = "checksum mismatch for $helperAsset"
-    } elseif (Get-Command gh -ErrorAction SilentlyContinue) {
+    } elseif (-not $ghBlocker) {
         $gotHelperBundle = $false
         try {
             Invoke-WebRequest -Uri "$baseUrl/$helperAsset.sigstore.json" -OutFile $script:helperBundle `
@@ -660,7 +705,7 @@ if ($helperFetched) {
             $helperWhy = "no attestation bundle published for $helperAsset"
         }
     } elseif ($requireAttestation) {
-        $helperWhy = "gh CLI not found and --require-attestation was given"
+        $helperWhy = "$ghBlocker and --require-attestation was given"
     }
 }
 if ($helperFetched -and -not $helperWhy) {

@@ -123,7 +123,7 @@ Nothing here pipes a download into a shell — every step is one you can inspect
    chmod 700 ~/.claude/bin/claude-statusline
    ```
 
-   Optionally verify the build provenance as well (needs the [GitHub CLI](https://cli.github.com)):
+   Optionally verify the build provenance as well (needs the [GitHub CLI](https://cli.github.com) 2.56.0 or later):
    ```bash
    curl -fsSL "$BASE/claude-statusline-$TARGET.sigstore.json" -o /tmp/claude-statusline.sigstore.json
    gh attestation verify ~/.claude/bin/claude-statusline \
@@ -264,7 +264,7 @@ Nothing here pipes a download into a shell — every step is one you can inspect
    chmod 700 ~/.claude/bin/claude-statusline
    ```
 
-   Optionally verify the build provenance as well (needs the [GitHub CLI](https://cli.github.com)):
+   Optionally verify the build provenance as well (needs the [GitHub CLI](https://cli.github.com) 2.56.0 or later):
    ```bash
    curl -fsSL "$BASE/claude-statusline-$TARGET.sigstore.json" -o /tmp/claude-statusline.sigstore.json
    gh attestation verify ~/.claude/bin/claude-statusline \
@@ -413,7 +413,7 @@ Nothing here pipes a download into `iex` — every step is one you can inspect b
    # each pair of hashes must match (case aside)
    ```
 
-   Optionally verify the build provenance as well (needs the [GitHub CLI](https://cli.github.com)):
+   Optionally verify the build provenance as well (needs the [GitHub CLI](https://cli.github.com) 2.56.0 or later):
    ```powershell
    Invoke-WebRequest -Uri "$base/claude-statusline-$target.exe.sigstore.json" -OutFile "$env:TEMP\claude-statusline.sigstore.json" -UseBasicParsing
    gh attestation verify $bin --bundle "$env:TEMP\claude-statusline.sigstore.json" `
@@ -658,9 +658,11 @@ The installer downloads a prebuilt binary, verifies its SHA-256 against the
 execute bit. A checksum that cannot be fetched or computed stops the install —
 there is no path that skips verification.
 
-If the [GitHub CLI](https://cli.github.com) is installed, the installer also
-verifies the release's build-provenance attestation. That check is skipped when
-`gh` is absent, and you can demand it instead:
+If the [GitHub CLI](https://cli.github.com) 2.56.0 or later is installed, the
+installer also verifies the release's build-provenance attestation. That check
+is skipped when `gh` is absent or older — an older `gh` cannot verify these
+attestations at all, which is common with distribution-packaged builds — and
+you can demand it instead:
 
 ```bash
 bash install.sh --require-attestation

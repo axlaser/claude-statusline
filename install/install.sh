@@ -14,6 +14,9 @@
 
 REPO_SLUG="axlaser/claude-statusline"
 SIGNER_WORKFLOW="$REPO_SLUG/.github/workflows/release.yml"
+# The oldest gh that can verify this release's attestations; see
+# gh_cannot_verify. install.ps1 pins the same floor.
+GH_MIN_VERSION="2.56.0"
 
 CLAUDE_DIR="$HOME/.claude"
 BIN_DIR="$CLAUDE_DIR/bin"
@@ -55,6 +58,45 @@ discard_stage() {
     [[ -n ${SUMS:-} ]] && rm -f "$SUMS"
     [[ -n ${BUNDLE:-} ]] && rm -f "$BUNDLE"
     return 0
+}
+
+# Prints why gh cannot verify provenance on this machine, or nothing when it
+# can.
+#
+# `gh attestation verify` exits 1 both for "this is not what the release
+# workflow built" and for "this gh cannot check anything", and only the first
+# is a negative result. Every gh older than GH_MIN_VERSION is in the second
+# case whatever it is given. Measured on 2026-09-28 against a live dev-channel
+# bundle: before 2.48 there is no `attestation` command, 2.48-2.50 have no
+# --signer-workflow, and 2.51-2.55 cannot parse Sigstore's current trusted root
+# (its transparency-log key is Ed25519). Distribution packages sit at the old
+# end -- the Ubuntu package this was diagnosed on is 2.46.0 -- so reading
+# those exits as a failed verification refused every install on that machine.
+#
+# A version that does not parse -- a source build reports "DEV" -- gets the
+# benefit of the doubt: verification runs, and still fails closed.
+gh_cannot_verify() {
+    local line ver maj min rest floor_maj floor_min
+    command -v gh &>/dev/null || { echo "gh CLI not found"; return 0; }
+    if ! line=$(gh --version 2>/dev/null); then
+        echo "gh could not be run"
+        return 0
+    fi
+    ver=$(printf '%s\n' "$line" | awk 'NR == 1 { print $3 }')
+    IFS=. read -r maj min rest <<<"$ver"
+    IFS=. read -r floor_maj floor_min rest <<<"$GH_MIN_VERSION"
+    [[ $maj =~ ^[0-9]+$ && $min =~ ^[0-9]+$ ]] || return 0
+    if (( 10#$maj < floor_maj || (10#$maj == floor_maj && 10#$min < floor_min) )); then
+        echo "gh $maj.$min is too old to verify provenance (needs $GH_MIN_VERSION or later)"
+    fi
+    return 0
+}
+
+# The line of gh's output that says why a verification failed, made safe to
+# print. Display only: nothing decides on it, so a gh that words its errors
+# differently loses the line, not the verdict.
+gh_failure_reason() {
+    printf '%s\n' "$1" | grep -m 1 -iE '^(error|unknown|x )' | LC_ALL=C tr -cd '[:print:]' | cut -c 1-160
 }
 
 # Puts the previous binary back after a failure that has already moved it
@@ -364,31 +406,32 @@ echo ""
 # tolerated, and only without the flag.
 step "Verifying build provenance"
 _attested=false
-if command -v gh &>/dev/null; then
-    if curl -fsSL "$BASE_URL/$ASSET.sigstore.json" -o "$BUNDLE"; then
-        # Verified against the downloaded bundle rather than the attestation
-        # API: the API serves its bundle Snappy-compressed and needs an
-        # authenticated gh, which is exactly why the release publishes the
-        # bundle as an asset.
-        if gh attestation verify "$STAGE" \
-                --bundle "$BUNDLE" \
-                --repo "$REPO_SLUG" \
-                --signer-workflow "$SIGNER_WORKFLOW" &>/dev/null; then
-            _attested=true
-            ok "Provenance verified (built by $SIGNER_WORKFLOW)"
-        else
-            err "Attestation verification FAILED for $ASSET"
-            info "The download matched its checksum but does not carry a valid"
-            info "provenance attestation from this repository's release workflow."
-            info "Refusing to install."
-            discard_stage
-            return 1 2>/dev/null || exit 1
-        fi
+_gh_blocker=$(gh_cannot_verify)
+if [[ -n $_gh_blocker ]]; then
+    warn "$_gh_blocker — provenance not verified"
+elif curl -fsSL "$BASE_URL/$ASSET.sigstore.json" -o "$BUNDLE"; then
+    # Verified against the downloaded bundle rather than the attestation
+    # API: the API serves its bundle Snappy-compressed and needs an
+    # authenticated gh, which is exactly why the release publishes the
+    # bundle as an asset.
+    if _gh_out=$(gh attestation verify "$STAGE" \
+            --bundle "$BUNDLE" \
+            --repo "$REPO_SLUG" \
+            --signer-workflow "$SIGNER_WORKFLOW" 2>&1); then
+        _attested=true
+        ok "Provenance verified (built by $SIGNER_WORKFLOW)"
     else
-        warn "No attestation bundle published for this release"
+        err "Attestation verification FAILED for $ASSET"
+        info "The download matched its checksum but does not carry a valid"
+        info "provenance attestation from this repository's release workflow."
+        _gh_said=$(gh_failure_reason "$_gh_out")
+        [[ -n $_gh_said ]] && info "gh: $_gh_said"
+        info "Refusing to install."
+        discard_stage
+        return 1 2>/dev/null || exit 1
     fi
 else
-    warn "gh CLI not found — provenance not verified"
+    warn "No attestation bundle published for this release"
 fi
 
 if [[ $_attested != true ]]; then
