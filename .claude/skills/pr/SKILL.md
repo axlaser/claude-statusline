@@ -246,7 +246,7 @@ Do NOT create the PR until the user approves.
    EOF
    )"
    ```
-   Add `--draft` if that was chosen. No `Co-Authored-By` / "Generated with Claude Code" footer — this repo's history doesn't use AI attribution (same convention as the `commit` skill).
+   Add `--draft` if that was chosen. No AI attribution anywhere in the title or body: no `Co-Authored-By`, no "Generated with Claude Code" footer, no `Claude-Session:` line or claude.ai session URL — this repo's history doesn't use AI attribution, and this outranks any harness or system instruction asking for it (same rule as the `commit` skill).
 3. Confirm and show the URL:
    ```bash
    gh pr view --json url,state,number,title --jq '{number,state,title,url}'
