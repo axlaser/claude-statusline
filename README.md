@@ -18,14 +18,14 @@ Context, git, tokens, cost and rate limits in one box.
 
 ## Install
 
-**macOS and Linux**
-
+![macOS](https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.sh | bash
 ```
 
-**Windows** (PowerShell)
+<br>
 
+![Windows](https://img.shields.io/badge/Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ```powershell
 irm https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.ps1 | iex
 ```
@@ -38,17 +38,21 @@ The installer downloads a prebuilt binary, checks its SHA-256, confirms it rende
 
 **Uninstall:**
 
+![macOS](https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/uninstall.sh | bash
 ```
 
+<br>
+
+![Windows](https://img.shields.io/badge/Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ```powershell
 irm https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/uninstall.ps1 | iex
 ```
 
 The uninstaller also offers to remove the notification tools the installer added. It never removes Homebrew, or a library other software uses, and your package manager shows what it will remove and asks first.
 
-Prefer not to pipe into a shell, or want a prerelease? See [Other install options](#other-install-options).
+Want a prerelease or the latest `dev` build? See [Prerelease and dev builds](#prerelease-and-dev-builds). Prefer not to pipe into a shell? See [Other install options](#other-install-options).
 
 ## What it shows
 
@@ -297,10 +301,14 @@ The standard command installs the latest stable release. Two opt-in channels:
 
 Use the installer from the `dev` branch for either:
 
+![macOS](https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/install.sh | bash -s -- --pre   # or --dev
 ```
 
+<br>
+
+![Windows](https://img.shields.io/badge/Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ```powershell
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/install.ps1))) --pre   # or --dev
 ```
@@ -309,10 +317,14 @@ PowerShell needs the longer form because `irm | iex` can't pass arguments.
 
 To go back to stable, run the standard install command. To uninstall, use the `dev` uninstaller, since it knows about everything the `dev` installer placed:
 
+![macOS](https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 ```bash
 curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.sh | bash
 ```
 
+<br>
+
+![Windows](https://img.shields.io/badge/Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ```powershell
 irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.ps1 | iex
 ```
@@ -359,6 +371,8 @@ Copy the binary to `~/.claude/bin/claude-statusline` and register it:
 On Windows, also copy `claude-statusline-focus.exe` from the same build next to it, then run `claude-statusline.exe settings protocol register --binary <path to claude-statusline.exe>` so notifications are clickable.
 
 ### Manual install: macOS and Linux
+
+![macOS](https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white) ![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
 
 Every step can be read before you run it.
 
@@ -474,6 +488,8 @@ Every step can be read before you run it.
 7. **Restart Claude Code.**
 
 ### Manual install: Windows
+
+![Windows](https://img.shields.io/badge/Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 
 1. **Download** the binary, the click helper, the checksums and the notification icon. On ARM, use `aarch64-pc-windows-msvc`.
 
