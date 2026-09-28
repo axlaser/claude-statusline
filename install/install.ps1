@@ -861,8 +861,8 @@ if (Test-Path $configPath) {
 
 Write-Host ""
 Step "Notifications"
-Info "Plays a sound and shows a popup when Claude needs attention."
-Info "Popups use Windows' built-in notifications, so nothing else is installed."
+Info "Plays a sound and shows a desktop notification when Claude needs attention."
+Info "Desktop notifications use Windows' own notification system, so nothing else is installed."
 # The legacy check is what carries the choice across an upgrade: someone
 # who enabled notifications under the scripts has hooks pointing at notify.ps1,
 # which `has` does not recognise, and re-prompting them would turn a silent

@@ -523,7 +523,7 @@ fn the_settings_supports_query_answers_without_a_settings_file() {
         &[
             "settings",
             "supports",
-            "popup-tools",
+            "notification-tools",
             "--settings",
             settings,
         ],
@@ -3751,9 +3751,9 @@ fn the_self_check_gates_every_destructive_step() {
             after: &[
                 "rm -f \"$CLAUDE_DIR/$_script\"",
                 "settings apply --binary",
-                // The popup tools step's call site, which may run sudo and a
-                // package manager: behind the gate like everything else.
-                "\n    popup_tools_offer\n",
+                // The notification tools step's call site, which may run sudo
+                // and a package manager: behind the gate like everything else.
+                "\n    notification_tools_offer\n",
             ],
         },
         Gate {
@@ -3824,12 +3824,12 @@ fn installer_output_falls_back_to_plain_text() {
     failures.assert_empty("plain output");
 }
 
-/// The popup tools step and its removal. Consent comes before anything
+/// The notification tools step and its removal. Consent comes before anything
 /// privileged, a credential the step created is dropped at its end, the
 /// override is exact and announced, the download is pinned, and nothing read
 /// from the record ever reaches a command line.
 #[test]
-fn the_popup_tools_steps_ask_before_anything_privileged() {
+fn the_notification_tools_steps_ask_before_anything_privileged() {
     let mut failures = Failures::default();
     let sh = read_repo_file("install/install.sh");
     let un = read_repo_file("install/uninstall.sh");
@@ -3948,10 +3948,10 @@ fn the_popup_tools_steps_ask_before_anything_privileged() {
     }
     failures.check(
         "uninstall.sh",
-        un.contains("remove=\"Kept: other software uses this shared library\""),
+        un.contains("remove=\"kept: other software uses this shared library\""),
         || "a shared libnotify must never be removed".to_string(),
     );
-    failures.assert_empty("popup tools steps");
+    failures.assert_empty("notification tools steps");
 }
 
 /// An upgrade from a script installation has to leave nothing
@@ -12223,15 +12223,16 @@ fn the_windows_toast_uses_the_built_in_api_and_escapes_every_value() {
 /// script silences them, so a parse error, a WinRT type that will not load,
 /// or toast XML Windows' own parser rejects would otherwise look exactly like
 /// success. The message is hostile, the icon and the click URI are present, so
-/// every escaped value reaches the XML. Whether a person sees the popup stays
+/// every escaped value reaches the XML. Whether a person sees the notification stays
 /// a manual check.
 ///
-/// CI only: run on a desktop, this raises a real popup on every `cargo test`.
+/// CI only: run on a desktop, this raises a real notification on every
+/// `cargo test`.
 #[cfg(windows)]
 #[test]
 fn the_windows_toast_script_runs_through_the_built_in_api() {
     if std::env::var_os("CI").is_none() {
-        println!("skipped: raises a real popup, so it runs only in CI");
+        println!("skipped: raises a real notification, so it runs only in CI");
         return;
     }
     let dir = scratch_dir("windows-toast-live");

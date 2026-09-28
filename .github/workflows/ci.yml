@@ -497,19 +497,20 @@ jobs:
             || { echo "::error::the upgraded binary fails its own self-check"; exit 1; }
           echo "upgraded: scripts removed, binary wired in, user settings intact"
 
-      # The popup tools step where installing would be possible: passwordless
-      # sudo, a desktop variable set, notifications on from the legacy hook,
-      # and no terminal to ask. The terminal probe is what has to refuse, so
-      # nothing is installed and the commands are printed instead. DISPLAY is
-      # only read, so no X server is needed. --dev because the step runs only
-      # against a binary that answers `settings supports popup-tools`.
-      - name: Without a terminal, the popup tools step installs nothing
+      # The notification tools step where installing would be possible:
+      # passwordless sudo, a desktop variable set, notifications on from the
+      # legacy hook, and no terminal to ask. The terminal probe is what has to
+      # refuse, so nothing is installed and the commands are printed instead.
+      # DISPLAY is only read, so no X server is needed. --dev because the step
+      # runs only against a binary that answers `settings supports
+      # notification-tools`.
+      - name: Without a terminal, the notification tools step installs nothing
         run: |
-          log="$RUNNER_TEMP/popup-step.log"
+          log="$RUNNER_TEMP/notification-step.log"
           DISPLAY=:99 bash install/install.sh --dev < /dev/null > "$log" 2>&1
           cat "$log"
-          grep -q 'Popup tools' "$log" \
-            || { echo "::error::the popup tools step never ran"; exit 1; }
+          grep -q 'Notification tools' "$log" \
+            || { echo "::error::the notification tools step never ran"; exit 1; }
           grep -q 'no terminal to answer, so no' "$log" \
             || { echo "::error::the step did not stop at the missing terminal"; exit 1; }
           grep -q 'To install by hand' "$log" \
@@ -521,13 +522,14 @@ jobs:
             || { echo "::error::a record was written with nothing installed"; exit 1; }
           echo "no terminal, no install: the commands were printed instead"
 
-  # The popup tools step's install routes, end to end: detect, install, record,
-  # then uninstall and remove. They install real packages outside the scratch
-  # profile, so they run only on disposable runners. CLAUDE_STATUSLINE_DEPS
-  # answers the question a terminal would, and --dev is the build that carries
-  # the binary's popup-tools capability until a release does.
-  popup-tools:
-    name: popup tools ${{ matrix.name }}
+  # The notification tools step's install routes, end to end: detect, install,
+  # record, then uninstall and remove. They install real packages outside the
+  # scratch profile, so they run only on disposable runners.
+  # CLAUDE_STATUSLINE_DEPS answers the question a terminal would, and --dev is
+  # the build that carries the binary's notification-tools capability until a
+  # release does.
+  notification-tools:
+    name: notification tools ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
     needs: gates
     timeout-minutes: 20
@@ -560,7 +562,7 @@ jobs:
 
       - name: Stage a profile with notifications on
         run: |
-          scratch="${RUNNER_TEMP}/popup-probe"
+          scratch="${RUNNER_TEMP}/notification-probe"
           mkdir -p "$scratch/.claude"
           echo "HOME=$scratch" >> "$GITHUB_ENV"
           echo "PROBE=$scratch" >> "$GITHUB_ENV"
@@ -585,7 +587,7 @@ jobs:
           fi
           # A tool still present leaves the step nothing to install, which the
           # next step reports.
-          echo "popup tools on PATH before the install:"
+          echo "notification tools on PATH before the install:"
           for t in terminal-notifier notify-send xdotool wmctrl; do
             printf '  %-18s %s\n' "$t" "$(command -v "$t" || echo absent)"
           done
@@ -598,7 +600,7 @@ jobs:
           # Greps for the step's own output, so a binary that skips the step
           # fails the leg rather than passing it with nothing done.
           grep -q 'CLAUDE_STATUSLINE_DEPS=yes answers this step' "$log" \
-            || { echo "::error::the popup tools step installed nothing: skipped, or nothing was missing"; exit 1; }
+            || { echo "::error::the notification tools step installed nothing: skipped, or nothing was missing"; exit 1; }
 
       - name: The tools are installed and recorded
         run: |
@@ -614,7 +616,7 @@ jobs:
           before=$(cksum < "$record")
           log="$RUNNER_TEMP/reinstall.log"
           bash install/install.sh --dev < /dev/null > "$log" 2>&1
-          grep -q 'Everything popups need is installed' "$log" \
+          grep -q 'Everything desktop notifications need is installed' "$log" \
             || { cat "$log"; echo "::error::the installed tools are not found"; exit 1; }
           test "$before" = "$(cksum < "$record")" \
             || { echo "::error::a second run changed the record"; exit 1; }

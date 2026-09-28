@@ -86,32 +86,55 @@ footer() {
     printf "  ${GREEN}✓${RESET} ${BOLD}Done.${RESET} %s\n\n" "$1"
 }
 
-# A panel: panel_open, rows with dividers between groups, panel_close. Plain
-# mode prints the same rows unframed, a blank line between groups.
-panel_open()    { $PLAIN || printf "  ${GRAY}┏%s┓${RESET}\n" "$HEAVY"; }
-panel_close()   { $PLAIN || printf "  ${GRAY}┗%s┛${RESET}\n" "$HEAVY"; echo ""; }
-panel_divider() { if $PLAIN; then echo ""; else printf "  ${GRAY}┣%s┫${RESET}\n" "$HEAVY"; fi; }
-# panel_row <label> <text>: the text wraps at word boundaries into the 47
-# columns beside the label, and continuation lines carry no label.
-panel_row() {
-    local label=$1 line="" word
+# A card per tool: its name in the top edge, a sentence, then labelled
+# details, in a light rounded frame. Everything inside is ASCII, so ${#s}
+# counts columns under any locale. Plain mode prints the same lines unframed
+# and unwrapped, so each stays one line a grep can find.
+card_open() {
+    local d
+    if $PLAIN; then
+        printf "    %s\n" "$1"
+        return 0
+    fi
+    d=$(printf '%*s' $(( INNER - 3 - ${#1} )) '')
+    printf "  ${GRAY}╭─${RESET} ${BOLD}${CYAN}%s${RESET} ${GRAY}%s╮${RESET}\n" "$1" "${d// /─}"
+}
+card_close() {
+    local d
+    d=$(printf '%*s' "$INNER" '')
+    $PLAIN || printf "  ${GRAY}╰%s╯${RESET}\n" "${d// /─}"
+    echo ""
+}
+card_blank() { $PLAIN || printf "  ${GRAY}│${RESET}%*s${GRAY}│${RESET}\n" "$INNER" ""; }
+# card_text <sentence>, and card_row <label> <value> [colour]: wrapped at word
+# boundaries, a row's continuation lines lined up under its value.
+card_text() { _card_wrap "" "$1" ""; }
+card_row() { _card_wrap "$1" "$2" "${3:-}"; }
+_card_wrap() {
+    local label=$1 colour=$3 width=56 line="" word
     local -a words
+    if $PLAIN; then
+        if [[ -n $label ]]; then printf "      %-10s  %s\n" "$label" "$2"; else printf "      %s\n" "$2"; fi
+        return 0
+    fi
+    [[ -n $label ]] && width=44
     read -r -a words <<<"$2"
     for word in "${words[@]}"; do
-        if [[ -n $line ]] && (( ${#line} + 1 + ${#word} > 47 )); then
-            _panel_line "$label" "$line"
-            label="" line=$word
+        if [[ -n $line ]] && (( ${#line} + 1 + ${#word} > width )); then
+            _card_line "$label" "$line" "$colour"
+            [[ -n $label ]] && label=" "
+            line=$word
         else
             line=${line:+$line }$word
         fi
     done
-    _panel_line "$label" "$line"
+    _card_line "$label" "$line" "$colour"
 }
-_panel_line() {
-    if $PLAIN; then
-        printf "  %-7s  %s\n" "$1" "$2"
+_card_line() {
+    if [[ -z $1 ]]; then
+        printf "  ${GRAY}│${RESET}  %-56s  ${GRAY}│${RESET}\n" "$2"
     else
-        printf "  ${GRAY}┃${RESET} ${DIM}%-7s${RESET} ${GRAY}│${RESET}  %-47s ${GRAY}┃${RESET}\n" "$1" "$2"
+        printf "  ${GRAY}│${RESET}  ${DIM}%-10s${RESET}  %s%-44s${RESET}  ${GRAY}│${RESET}\n" "$1" "$3" "$2"
     fi
 }
 
@@ -429,7 +452,7 @@ if [[ ! -e $BIN_PATH ]]; then
     done
 fi
 # Sweep anything a previous interrupted run left behind before adding one,
-# including the directory the popup tools step unpacks into.
+# including the directory the notification tools step unpacks into.
 rm -rf "$BIN_DIR/$STAGE_PREFIX"* 2>/dev/null
 
 # Staged inside the destination directory, never in a shared world-writable
@@ -673,7 +696,7 @@ fi
 
 echo ""
 step "Notifications"
-info "Plays a sound and shows a popup when Claude needs attention."
+info "Plays a sound and shows a desktop notification when Claude needs attention."
 # The legacy check is what carries the choice across an upgrade: someone
 # who enabled notifications under the scripts has hooks pointing at notify.sh,
 # which `has` does not recognise, and re-prompting them would turn a silent
@@ -744,9 +767,10 @@ if (( ${#_legacy_found[@]} > 0 )); then
     info "Your notification settings were kept."
 fi
 
-# --- Popup tools ---
-# Popups need a third-party tool: terminal-notifier on macOS, and on Linux
-# notify-send plus the helper that brings the terminal forward when a popup is
+# --- Notification tools ---
+# Desktop notifications need a third-party tool: terminal-notifier on macOS,
+# and on Linux notify-send plus the helper that brings the terminal forward when
+# a notification is
 # clicked. This step finds which are missing the way the binary looks for them
 # at runtime, explains each one, and installs them with one yes, recording what
 # it installed for the uninstaller. It runs last, once settings.json and the
@@ -837,11 +861,10 @@ _record() {
     printf '%s %s\n' "$1" "$2" >>"$TOOLS_RECORD"
 }
 
-# Prints commands below the frame, indented and without a glyph, so they copy
-# cleanly.
+# Prints commands below the cards, indented and without a glyph, so they copy
+# cleanly. The caller spaces it from whatever came before.
 _print_commands() {
     local line
-    echo ""
     progress "To install by hand:"
     echo ""
     for line in "$@"; do
@@ -917,7 +940,7 @@ _pm_run() {
 }
 
 # One package per transaction, so a click helper the repositories lack never
-# costs the popup itself. Branches on status codes only: sudo-rs and the
+# costs the notification itself. Branches on status codes only: sudo-rs and the
 # managers word their messages differently from release to release.
 _pkg_install() {
     case $_pm in
@@ -987,18 +1010,18 @@ _commands_for() {
     esac
 }
 
-popup_tools_offer() {
-    local tools=() installable=() left=() tool pkg what why how link first=true
+notification_tools_offer() {
+    local tools=() installable=() left=() tool pkg what why how link with
     local override="" go=false sudo_cached=false sudo_asked=false pm_name updated=false method
     local desktop=true kde=false subject
-    _popup_missing=""
+    _notify_missing=""
     _interrupted=false
     echo ""
-    step "Popup tools"
+    step "Notification tools"
     # A binary older than this installer finds terminal-notifier only on PATH,
     # so a tool placed elsewhere would install and still show nothing.
     if ! "$BIN_PATH" settings supports popup-tools &>/dev/null; then
-        info "This release cannot use installed popup tools yet, so none were checked."
+        info "This release cannot use installed notification tools yet, so none were checked."
         return 0
     fi
 
@@ -1034,79 +1057,82 @@ popup_tools_offer() {
     fi
 
     if (( ${#tools[@]} == 0 )); then
-        ok "Everything popups need is installed"
+        ok "Everything desktop notifications need is installed"
         return 0
     fi
 
-    # A click helper alone does not show popups, so say what is missing.
-    subject="Popups need"
+    # A click helper alone does not show notifications, so say what is missing.
+    subject="Desktop notifications need"
     case " ${tools[*]} " in
         *" terminal-notifier "* | *" notify-send "*) ;;
-        *) subject="Clicking a popup needs" ;;
+        *) subject="Clicking a notification needs" ;;
     esac
     if (( ${#tools[@]} == 1 )); then
-        printf "\n    %s a tool that is not installed yet:\n\n" "$subject"
+        printf "\n    %s a tool that isn't installed yet:\n\n" "$subject"
     else
-        printf "\n    %s %d tools that are not installed yet:\n\n" "$subject" "${#tools[@]}"
+        printf "\n    %s %d tools that aren't installed yet:\n\n" "$subject" "${#tools[@]}"
     fi
     pm_name=${_pm%-get}
-    panel_open
+    with=", with sudo"
+    [[ $_me == 0 ]] && with=""
     for tool in "${tools[@]}"; do
         pkg=$(_pkg_name "$tool")
-        why="Without it, notifications are sound only"
+        why="notifications are sound only"
         case $tool in
             terminal-notifier)
-                what="Shows macOS notification popups for Claude Code events"
+                what="Shows Claude Code's notifications in macOS Notification Center."
                 if [[ $(uname -m) == arm64 && $_me != 0 && -x $BREW && $(_stat_owner "$BREW") == "$_me" ]]; then
-                    how="Homebrew: brew install terminal-notifier. No password needed."
+                    how="brew install terminal-notifier, no password needed"
                 else
-                    how="Its official $TN_VERSION release from GitHub, 400 KB, checksum-checked, unpacked into ~/Applications. No password needed."
+                    how="its official $TN_VERSION release from GitHub (400 KB, checksum-checked) into ~/Applications, no password needed"
                 fi
                 link="https://github.com/julienXX/terminal-notifier"
                 ;;
             notify-send)
-                what="Shows desktop notification popups for Claude Code events"
-                how="The $pm_name package $pkg"
+                what="Shows Claude Code's notifications on your desktop."
+                how="$pm_name package $pkg$with"
                 link="https://gitlab.gnome.org/GNOME/libnotify"
                 ;;
             xdotool)
-                what="Brings your terminal forward when you click a popup"
-                why="Without it, a click only dismisses the popup"
-                how="The $pm_name package xdotool"
+                what="Brings your terminal forward when you click a notification."
+                why="a click only dismisses the notification"
+                how="$pm_name package xdotool$with"
                 link="https://github.com/jordansissel/xdotool"
                 ;;
             kdotool)
-                what="Brings your terminal forward when you click a popup on KDE Wayland"
-                why="Without it, a click only dismisses the popup"
-                how="The dnf package kdotool"
+                what="Brings your terminal forward when you click a notification on KDE Wayland."
+                why="a click only dismisses the notification"
+                how="dnf package kdotool$with"
                 link="https://github.com/jinliu/kdotool"
                 ;;
         esac
         if _installable "$tool"; then
             installable+=("$tool")
         elif [[ $tool == kdotool ]]; then
-            how="Not packaged here: cargo install kdotool, or the AUR package on Arch"
+            how="not packaged here: cargo install kdotool, or the AUR package on Arch"
         else
-            how="Not installed automatically on this system; the commands follow"
+            how="not automatically on this system; the commands follow"
         fi
-        $first || panel_divider
-        first=false
-        panel_row "tool" "$tool"
-        panel_row "what" "$what"
-        panel_row "why" "$why"
-        panel_row "how" "$how"
-        panel_row "link" "$link"
+        card_open "$tool"
+        card_blank
+        card_text "$what"
+        card_blank
+        card_row "Without it" "$why"
+        card_row "Installs" "$how"
+        card_row "Website" "$link" "$CYAN"
+        card_blank
+        card_close
     done
-    panel_close
 
     case ${CLAUDE_STATUSLINE_DEPS:-} in
         yes | no) override=$CLAUDE_STATUSLINE_DEPS ;;
     esac
     if (( ${#installable[@]} > 0 )) && [[ $_kernel != Darwin ]] && ! $desktop && [[ $override != yes ]]; then
-        # Over SSH, or on a server: popups appear only inside a desktop
+        # Over SSH, or on a server: notifications appear only inside a desktop
         # session, so installing here would change the machine for nothing.
-        info "Popups appear only when Claude Code runs in a desktop session, and this"
-        info "shell has none (no DISPLAY or WAYLAND_DISPLAY), so nothing was installed."
+        info "Desktop notifications appear only when Claude Code runs in a desktop"
+        info "session, and this shell has none (no DISPLAY or WAYLAND_DISPLAY), so"
+        info "nothing was installed."
     elif (( ${#installable[@]} > 0 )); then
         if [[ $_kernel != Darwin && $_me != 0 ]]; then
             warn "Installing packages needs administrator rights, so sudo may ask for"
@@ -1186,34 +1212,36 @@ popup_tools_offer() {
     done
     if (( ${#left[@]} > 0 )); then
         case " ${left[*]} " in
-            *" terminal-notifier "* | *" notify-send "*) _popup_missing=popups ;;
-            *) _popup_missing=clicks ;;
+            *" terminal-notifier "* | *" notify-send "*) _notify_missing=notifications ;;
+            *) _notify_missing=clicks ;;
         esac
         $_interrupted && warn "Interrupted, so the rest were not installed"
         _commands_for "${left[@]}"
+        # With nothing installable, the last card's own blank line is the gap.
+        (( ${#installable[@]} > 0 )) && echo ""
         _print_commands "${_cmds[@]}"
     elif [[ $_kernel == Darwin && -n ${_tn_path:-} && -z ${SSH_CONNECTION:-} ]] && has_tty; then
         # macOS asks once whether terminal-notifier may notify. A test now puts
         # that question in front of the user while they are watching.
-        "$_tn_path" -title "Claude Code" -message "Popups are on. This is a test." >/dev/null 2>&1 &
+        "$_tn_path" -title "Claude Code" -message "Notifications are on. This is a test." >/dev/null 2>&1 &
         info "macOS may ask whether terminal-notifier can send notifications: click Allow."
         info "Missed it? Allow it in System Settings > Notifications > terminal-notifier."
     fi
 }
 
 if [[ " ${_apply_flags[*]} " == *" --notify "* ]]; then
-    popup_tools_offer
+    notification_tools_offer
 fi
 
 # --- Done ---
-case ${_popup_missing:-} in
-    popups)
+case ${_notify_missing:-} in
+    notifications)
         echo ""
-        warn "Popups stay off until the tools above are installed."
+        warn "Desktop notifications stay off until those are installed."
         ;;
     clicks)
         echo ""
-        warn "Clicking a popup won't bring the terminal forward until that is installed."
+        warn "Clicks won't bring the terminal forward until that is installed."
         ;;
 esac
 footer "Restart Claude Code to turn it on."

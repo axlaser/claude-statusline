@@ -299,8 +299,9 @@ Write-Host ""
 
 # --- Notification config and debug log ---
 # Both are removed unconditionally, which is what the script uninstaller did.
-# Windows asks nothing here: popups use Windows' built-in notifications, so the
-# installer never put a tool on this machine for this uninstaller to offer back.
+# Windows asks nothing here: notifications use Windows' own notification
+# system, so the installer never put a tool on this machine for this
+# uninstaller to offer back.
 Step "Removing notification configuration"
 if (Test-Path $configPath) {
     Remove-Item $configPath -Force -ErrorAction SilentlyContinue

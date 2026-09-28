@@ -76,32 +76,55 @@ footer() {
     printf "  ${GREEN}✓${RESET} ${BOLD}Done.${RESET} %s\n\n" "$1"
 }
 
-# A panel: panel_open, rows with dividers between groups, panel_close. Plain
-# mode prints the same rows unframed, a blank line between groups.
-panel_open()    { $PLAIN || printf "  ${GRAY}┏%s┓${RESET}\n" "$HEAVY"; }
-panel_close()   { $PLAIN || printf "  ${GRAY}┗%s┛${RESET}\n" "$HEAVY"; echo ""; }
-panel_divider() { if $PLAIN; then echo ""; else printf "  ${GRAY}┣%s┫${RESET}\n" "$HEAVY"; fi; }
-# panel_row <label> <text>: the text wraps at word boundaries into the 47
-# columns beside the label, and continuation lines carry no label.
-panel_row() {
-    local label=$1 line="" word
+# A card per tool: its name in the top edge, a sentence, then labelled
+# details, in a light rounded frame. Everything inside is ASCII, so ${#s}
+# counts columns under any locale. Plain mode prints the same lines unframed
+# and unwrapped, so each stays one line a grep can find.
+card_open() {
+    local d
+    if $PLAIN; then
+        printf "    %s\n" "$1"
+        return 0
+    fi
+    d=$(printf '%*s' $(( INNER - 3 - ${#1} )) '')
+    printf "  ${GRAY}╭─${RESET} ${BOLD}${CYAN}%s${RESET} ${GRAY}%s╮${RESET}\n" "$1" "${d// /─}"
+}
+card_close() {
+    local d
+    d=$(printf '%*s' "$INNER" '')
+    $PLAIN || printf "  ${GRAY}╰%s╯${RESET}\n" "${d// /─}"
+    echo ""
+}
+card_blank() { $PLAIN || printf "  ${GRAY}│${RESET}%*s${GRAY}│${RESET}\n" "$INNER" ""; }
+# card_text <sentence>, and card_row <label> <value> [colour]: wrapped at word
+# boundaries, a row's continuation lines lined up under its value.
+card_text() { _card_wrap "" "$1" ""; }
+card_row() { _card_wrap "$1" "$2" "${3:-}"; }
+_card_wrap() {
+    local label=$1 colour=$3 width=56 line="" word
     local -a words
+    if $PLAIN; then
+        if [[ -n $label ]]; then printf "      %-10s  %s\n" "$label" "$2"; else printf "      %s\n" "$2"; fi
+        return 0
+    fi
+    [[ -n $label ]] && width=44
     read -r -a words <<<"$2"
     for word in "${words[@]}"; do
-        if [[ -n $line ]] && (( ${#line} + 1 + ${#word} > 47 )); then
-            _panel_line "$label" "$line"
-            label="" line=$word
+        if [[ -n $line ]] && (( ${#line} + 1 + ${#word} > width )); then
+            _card_line "$label" "$line" "$colour"
+            [[ -n $label ]] && label=" "
+            line=$word
         else
             line=${line:+$line }$word
         fi
     done
-    _panel_line "$label" "$line"
+    _card_line "$label" "$line" "$colour"
 }
-_panel_line() {
-    if $PLAIN; then
-        printf "  %-7s  %s\n" "$1" "$2"
+_card_line() {
+    if [[ -z $1 ]]; then
+        printf "  ${GRAY}│${RESET}  %-56s  ${GRAY}│${RESET}\n" "$2"
     else
-        printf "  ${GRAY}┃${RESET} ${DIM}%-7s${RESET} ${GRAY}│${RESET}  %-47s ${GRAY}┃${RESET}\n" "$1" "$2"
+        printf "  ${GRAY}│${RESET}  ${DIM}%-10s${RESET}  %s%-44s${RESET}  ${GRAY}│${RESET}\n" "$1" "$3" "$2"
     fi
 }
 
@@ -123,7 +146,7 @@ ask() {
 
 header "claude-statusline" "uninstaller"
 
-# --- The popup tools the installer added ---
+# --- The notification tools the installer added ---
 # Read before anything is deleted. The record is a hint, not proof: anything
 # running as this user can write it, so only the fixed pairs below are
 # understood, each maps to a fixed command, and nothing from the file ever
@@ -243,8 +266,8 @@ echo ""
 
 # --- Notification config and debug log ---
 # Both are removed unconditionally, which is what the script uninstaller did.
-# The one question this uninstaller asks is about the popup tools below, which
-# the installer, not the user, put on this machine.
+# The one question this uninstaller asks is about the notification tools
+# below, which the installer, not the user, put on this machine.
 step "Removing notification configuration"
 if [[ -f $NOTIFY_CONFIG_PATH ]]; then
     rm -f "$NOTIFY_CONFIG_PATH" && ok "Deleted $NOTIFY_CONFIG_PATH"
@@ -256,7 +279,7 @@ if [[ -f "$CLAUDE_DIR/statusline-debug.log" ]]; then
     rm -f "$CLAUDE_DIR/statusline-debug.log" && ok "Deleted $CLAUDE_DIR/statusline-debug.log"
 fi
 
-# --- Popup tools ---
+# --- Notification tools ---
 # Offered with one question, and only what the installer recorded and is still
 # here. Homebrew is never removed, and neither is a shared library: on dnf,
 # pacman and apk notify-send ships inside libnotify itself. A package that
@@ -290,39 +313,38 @@ _removal() {
     esac
 }
 
-popup_tools_removal() {
+notification_tools_removal() {
     local entry t m offer=() kept=() override="" go=false tty=false sudo_cached=false sudo_asked=false
-    local first=true added remove s=""
+    local added remove s=""
     _interrupted=false
     _sudo=()
     [[ $_me == 0 ]] || s="sudo "
     echo ""
-    step "Popup tools"
-    printf "\n    The installer added these for notification popups:\n\n"
-    panel_open
+    step "Notification tools"
+    printf "\n    The installer added these for desktop notifications:\n\n"
     for entry in "${_recorded[@]}"; do
         t=${entry% *}
         m=${entry#* }
         case $m in
-            brew) added="Homebrew formula $t"; remove="brew uninstall $t. Homebrew itself stays." ;;
-            app) added="The app bundle ~/Applications/terminal-notifier.app"; remove="Deletes that bundle" ;;
-            *) added="The $m package $t"; remove="${s}$( [[ $m == apt ]] && echo apt-get || echo "$m") remove $t, which asks you first" ;;
+            brew) added="Homebrew formula $t"; remove="brew uninstall $t; Homebrew itself stays" ;;
+            app) added="app bundle ~/Applications/terminal-notifier.app"; remove="deletes that bundle" ;;
+            *) added="$m package $t"; remove="${s}$( [[ $m == apt ]] && echo apt-get || echo "$m") remove $t, which asks you first" ;;
         esac
         if [[ $t == libnotify && $m != apt ]]; then
-            remove="Kept: other software uses this shared library"
+            remove="kept: other software uses this shared library"
         elif ! _leaf "$t" "$m"; then
-            remove="Kept: other installed software depends on it"
+            remove="kept: other installed software depends on it"
             kept+=("$entry")
         else
             offer+=("$entry")
         fi
-        $first || panel_divider
-        first=false
-        panel_row "tool" "$t"
-        panel_row "added" "$added"
-        panel_row "remove" "$remove"
+        card_open "$t"
+        card_blank
+        card_row "Added" "$added"
+        card_row "Removal" "$remove"
+        card_blank
+        card_close
     done
-    panel_close
 
     if (( ${#offer[@]} > 0 )); then
         case ${CLAUDE_STATUSLINE_DEPS:-} in
@@ -334,7 +356,7 @@ popup_tools_removal() {
             [[ $override == yes ]] && go=true
         else
             if (( ${#offer[@]} > 1 )); then ask "Remove them too?"; else ask "Remove it too?"; fi
-            if [[ $answer =~ ^[Yy]$ ]]; then go=true; else progress "Kept them"; fi
+            if [[ $answer =~ ^[Yy]$ ]]; then go=true; else progress "Nothing was removed"; fi
         fi
     fi
 
@@ -389,7 +411,8 @@ popup_tools_removal() {
         _pkg_present "${entry% *}" "${entry#* }" && [[ " ${kept[*]} " != *" $entry "* ]] && kept+=("$entry")
     done
     if (( ${#kept[@]} > 0 )); then
-        echo ""
+        # With nothing offered, the last card's own blank line is the gap.
+        (( ${#offer[@]} > 0 )) && echo ""
         progress "To remove by hand:"
         echo ""
         for entry in "${kept[@]}"; do
@@ -406,7 +429,7 @@ popup_tools_removal() {
 }
 
 if (( ${#_recorded[@]} > 0 )); then
-    popup_tools_removal
+    notification_tools_removal
 fi
 # The record goes whatever the answer, when it is ours to delete.
 if [[ -f $TOOLS_RECORD && ! -L $TOOLS_RECORD && -O $TOOLS_RECORD ]]; then
