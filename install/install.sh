@@ -1223,6 +1223,7 @@ notification_tools_offer() {
         "$_tn_path" -title "Claude Code" -message "Notifications are on. This is a test." >/dev/null 2>&1 &
         info "macOS may ask whether terminal-notifier can send notifications: click Allow."
         info "Missed it? Allow it in System Settings > Notifications > terminal-notifier."
+        info "If it only reaches Notification Center, set its alert style to Banners there."
     fi
 }
 
