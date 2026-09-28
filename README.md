@@ -212,7 +212,7 @@ They're only available on Claude Pro and Max plans, not API keys, and only after
 <details>
 <summary><strong>No popups</strong></summary>
 
-- **Test it:** `~/.claude/bin/claude-statusline notify stop` should show a popup. On Windows: `& "$env:USERPROFILE\.claude\bin\claude-statusline.exe" notify stop`.
+- **Test it:** `~/.claude/bin/claude-statusline notify stop` should show a popup. On Windows: `& "$env:USERPROFILE\.claude\bin\claude-statusline.exe" notify stop`. A test popup isn't tied to a Claude Code session, so clicking it only dismisses it.
 - **Tool missing:** run the installer again. It checks for the tool and offers it, or prints the commands.
 - **macOS:** open **System Settings > Notifications > terminal-notifier** and turn on **Allow Notifications**. If it isn't listed, run `terminal-notifier -title Test -message Hello` once, then look again.
 - **Linux:** test with `notify-send Test Hello`. Your desktop needs a notification service; some Wayland compositors need extra setup. Over SSH there's no desktop to show popups in.

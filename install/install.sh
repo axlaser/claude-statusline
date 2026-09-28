@@ -990,8 +990,8 @@ _commands_for() {
 popup_tools_offer() {
     local tools=() installable=() left=() tool pkg what why how link first=true
     local override="" go=false sudo_cached=false sudo_asked=false pm_name updated=false method
-    local desktop=true kde=false
-    _popup_missing=false
+    local desktop=true kde=false subject
+    _popup_missing=""
     _interrupted=false
     echo ""
     step "Popup tools"
@@ -1038,10 +1038,16 @@ popup_tools_offer() {
         return 0
     fi
 
+    # A click helper alone does not show popups, so say what is missing.
+    subject="Popups need"
+    case " ${tools[*]} " in
+        *" terminal-notifier "* | *" notify-send "*) ;;
+        *) subject="Clicking a popup needs" ;;
+    esac
     if (( ${#tools[@]} == 1 )); then
-        printf "\n    Popups need a tool that is not installed yet:\n\n"
+        printf "\n    %s a tool that is not installed yet:\n\n" "$subject"
     else
-        printf "\n    Popups need %d tools that are not installed yet:\n\n" "${#tools[@]}"
+        printf "\n    %s %d tools that are not installed yet:\n\n" "$subject" "${#tools[@]}"
     fi
     pm_name=${_pm%-get}
     panel_open
@@ -1179,7 +1185,10 @@ popup_tools_offer() {
         _present "$tool" || left+=("$tool")
     done
     if (( ${#left[@]} > 0 )); then
-        _popup_missing=true
+        case " ${left[*]} " in
+            *" terminal-notifier "* | *" notify-send "*) _popup_missing=popups ;;
+            *) _popup_missing=clicks ;;
+        esac
         $_interrupted && warn "Interrupted, so the rest were not installed"
         _commands_for "${left[@]}"
         _print_commands "${_cmds[@]}"
@@ -1197,9 +1206,15 @@ if [[ " ${_apply_flags[*]} " == *" --notify "* ]]; then
 fi
 
 # --- Done ---
-if [[ ${_popup_missing:-false} == true ]]; then
-    echo ""
-    warn "Popups stay off until the tools above are installed."
-fi
+case ${_popup_missing:-} in
+    popups)
+        echo ""
+        warn "Popups stay off until the tools above are installed."
+        ;;
+    clicks)
+        echo ""
+        warn "Clicking a popup won't bring the terminal forward until that is installed."
+        ;;
+esac
 footer "Restart Claude Code to turn it on."
 }
