@@ -29,6 +29,11 @@ pub fn probe_env() -> Env {
         }
     }
 
+    let terminal_notifier = (platform == Platform::Macos
+        && !programs.contains("terminal-notifier"))
+    .then(|| first_trusted(&terminal_notifier_candidates(&home)))
+    .flatten();
+
     let mut files = BTreeSet::new();
     let icon = home.join(".claude").join("claude-icon.png");
     if icon.is_file() {
@@ -52,6 +57,7 @@ pub fn probe_env() -> Env {
         cwd,
         system_root,
         programs,
+        terminal_notifier,
         files,
         binary,
         // Handed to every child by the launching app on macOS; empty under an
@@ -72,6 +78,31 @@ fn helpers(platform: Platform) -> &'static [&'static str] {
         // The Windows toast is reached by absolute path, never through `PATH`.
         Platform::Windows => &[],
     }
+}
+
+/// Where terminal-notifier is looked for when `PATH` lacks it, in order: the
+/// installer's bundle in `~/Applications`, a drag-installed one, then the
+/// package managers' prefixes, which the environment Claude Code hands its
+/// hooks does not always have on `PATH`.
+pub fn terminal_notifier_candidates(home: &Path) -> Vec<PathBuf> {
+    let bundle = Path::new("terminal-notifier.app/Contents/MacOS/terminal-notifier");
+    vec![
+        home.join("Applications").join(bundle),
+        Path::new("/Applications").join(bundle),
+        PathBuf::from("/opt/homebrew/bin/terminal-notifier"),
+        PathBuf::from("/usr/local/bin/terminal-notifier"),
+        PathBuf::from("/opt/local/bin/terminal-notifier"),
+    ]
+}
+
+/// The first candidate that exists and passes the ownership guard. A bundle
+/// directory whose executable is missing, as after an interrupted unpack, is
+/// no hit.
+pub fn first_trusted(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|p| p.is_file() && crate::platform::trusted_tool(p))
+        .cloned()
 }
 
 /// Every sound file any event could resolve to, so one probe covers them all.
@@ -143,8 +174,9 @@ pub fn execute(action: &Action) -> Option<String> {
             stdin,
             background,
             click: None,
+            env_remove,
         } => {
-            spawn(program, args, stdin.as_deref(), *background);
+            spawn(program, args, stdin.as_deref(), *background, env_remove);
             None
         }
         Action::PlayWav(path) => {
@@ -267,7 +299,7 @@ pub fn wait_for_click(
     if rejected {
         debug::log(|| "notify: the action flag was rejected, re-raising without it".to_string());
         let without: Vec<String> = strip_click_action(args);
-        spawn(program, &without, None, false);
+        spawn(program, &without, None, false, &[]);
         return None;
     }
     let first = String::from_utf8_lossy(&run.stdout);
@@ -299,8 +331,17 @@ pub fn strip_click_action(args: &[String]) -> Vec<String> {
     out
 }
 
-fn spawn(program: &str, args: &[String], stdin: Option<&str>, background: bool) {
+fn spawn(
+    program: &str,
+    args: &[String],
+    stdin: Option<&str>,
+    background: bool,
+    env_remove: &[String],
+) {
     let mut command = Command::new(program);
+    for name in env_remove {
+        command.env_remove(name);
+    }
     command
         .args(args)
         .stdout(Stdio::null())
@@ -331,8 +372,8 @@ fn spawn(program: &str, args: &[String], stdin: Option<&str>, background: bool) 
     };
 
     if let Some(payload) = stdin {
-        // A write failure is routine: the child may have exited already
-        // (BurntToast absent), and a broken pipe must not become visible.
+        // A write failure is routine: the child may have exited already, and
+        // a broken pipe must not become visible.
         if let Some(mut pipe) = child.stdin.take() {
             let _ = pipe.write_all(payload.as_bytes());
         }

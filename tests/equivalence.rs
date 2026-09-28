@@ -509,6 +509,48 @@ fn our_own_state_file_round_trips_through_the_guard() {
     );
 }
 
+/// `settings supports` answers before `--binary` and settings.json load,
+/// because an installer asks it of the binary it has just placed, and an
+/// unknown name is a no through the exit code, as an older binary's refusal
+/// of the whole action is.
+#[test]
+fn the_settings_supports_query_answers_without_a_settings_file() {
+    let dir = scratch_dir("settings-supports");
+    let absent = dir.join("settings.json");
+    let settings = absent.to_str().expect("the scratch path is UTF-8");
+
+    let yes = run_bin(
+        &[
+            "settings",
+            "supports",
+            "popup-tools",
+            "--settings",
+            settings,
+        ],
+        "",
+        &[],
+    );
+    assert_eq!(yes.code, Some(0), "stdout: {}", yes.stdout);
+    assert!(yes.stdout.is_empty() && yes.stderr.is_empty());
+    assert!(!absent.exists(), "the query must not create settings.json");
+
+    let no = run_bin(&["settings", "supports", "something-else"], "", &[]);
+    assert_eq!(no.code, Some(1));
+    assert!(
+        no.stdout.contains("does not support something-else"),
+        "{}",
+        no.stdout
+    );
+
+    let bare = run_bin(&["settings", "supports"], "", &[]);
+    assert_eq!(bare.code, Some(1));
+    assert!(
+        bare.stdout.contains("usage: settings supports <name>"),
+        "{}",
+        bare.stdout
+    );
+}
+
 /// `settings` at the process boundary, which is the only place its contract
 /// exists.
 ///
@@ -2152,6 +2194,7 @@ fn full_env() -> Env {
         .iter()
         .map(|s| s.to_string())
         .collect(),
+        terminal_notifier: None,
         files,
         binary: PathBuf::from("/home/fixture/.claude/bin/claude-statusline"),
         bundle_id: Some("com.apple.Terminal".to_string()),
@@ -2476,6 +2519,177 @@ fn muting_is_honoured_on_every_platform() {
         || format!("a muted event still planned audio: {plan:?}"),
     );
     failures.assert_empty("muted delivery");
+}
+
+/// terminal-notifier off `PATH`, as the installer's `~/Applications` bundle
+/// or a Homebrew prefix the hook's environment lacks, is spawned by the
+/// absolute path the probe resolved. On `PATH` it keeps its bare name, and
+/// the other platforms never read the field.
+#[test]
+fn terminal_notifier_off_path_is_spawned_by_its_resolved_path() {
+    // `as_records` keeps only the program's file name, as the capture shim
+    // did, so the programs are compared whole here.
+    fn programs(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Spawn { program, .. } => Some(program.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+    let cfg = NotifyConfig::default();
+    let bundle =
+        "/home/fixture/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier";
+    let mut off_path = full_env();
+    off_path.programs.remove("terminal-notifier");
+    off_path.terminal_notifier = Some(PathBuf::from(bundle));
+    let mut absent = off_path.clone();
+    absent.terminal_notifier = None;
+    let mut both = full_env();
+    both.terminal_notifier = Some(PathBuf::from(bundle));
+
+    let mut failures = Failures::default();
+    for (name, platform, env, want) in [
+        (
+            "on-path-keeps-the-bare-name",
+            Platform::Macos,
+            &both,
+            vec!["afplay", "terminal-notifier"],
+        ),
+        (
+            "off-path-uses-the-resolved-path",
+            Platform::Macos,
+            &off_path,
+            vec!["afplay", bundle],
+        ),
+        (
+            "nowhere-plans-sound-only",
+            Platform::Macos,
+            &absent,
+            vec!["afplay"],
+        ),
+        (
+            "linux-ignores-the-field",
+            Platform::Linux,
+            &off_path,
+            vec!["paplay", "notify-send"],
+        ),
+    ] {
+        let got = programs(&notify::plan(platform, "stop", "", "", &cfg, env, None));
+        failures.check(name, got == want, || format!("got {got:?}, want {want:?}"));
+    }
+    let off = notify::plan(Platform::Macos, "stop", "", "", &cfg, &off_path, None);
+    let on = notify::plan(Platform::Macos, "stop", "", "", &cfg, &full_env(), None);
+    failures.check(
+        "same-argv-either-way",
+        as_records(&off) == as_records(&on),
+        || format!("the argv changed with the program's location: {off:?}"),
+    );
+    let windows = |env: &Env| notify::plan(Platform::Windows, "stop", "", "", &cfg, env, None);
+    failures.check(
+        "windows-ignores-the-field",
+        windows(&off_path) == windows(&full_env()),
+        || "the Windows plan changed with the macOS-only field".to_string(),
+    );
+    failures.assert_empty("terminal-notifier resolution");
+}
+
+/// The fixed locations are searched in the installer's order, and a hit
+/// counts only when it is a file the ownership guard passes: a bundle left
+/// without its executable, or one whose directory anyone else can write, is
+/// no hit, so the plan falls back to sound alone.
+#[cfg(unix)]
+#[test]
+fn terminal_notifier_is_found_only_in_trusted_fixed_locations() {
+    use claude_statusline::platform::notify::{first_trusted, terminal_notifier_candidates};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("terminal-notifier-fixed");
+    let home = dir.join("home");
+    let candidates = terminal_notifier_candidates(&home);
+    let bundle = home.join("Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier");
+    assert_eq!(
+        candidates[0], bundle,
+        "the installer's bundle must be tried first"
+    );
+    assert_eq!(
+        candidates[1],
+        PathBuf::from("/Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier")
+    );
+    for prefix in ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"] {
+        assert!(
+            candidates.contains(&Path::new(prefix).join("terminal-notifier")),
+            "{prefix} is not searched"
+        );
+    }
+    // Only the staged entry: the host's own /Applications or Homebrew must
+    // not decide this test.
+    let staged = &candidates[..1];
+    let macos_dir = bundle.parent().unwrap();
+    std::fs::create_dir_all(macos_dir).unwrap();
+    std::fs::set_permissions(macos_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        first_trusted(staged),
+        None,
+        "a bundle without its executable is no hit"
+    );
+
+    std::fs::write(&bundle, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(first_trusted(staged), Some(bundle.clone()));
+
+    std::fs::set_permissions(macos_dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+    assert_eq!(
+        first_trusted(staged),
+        None,
+        "a group-writable directory must not pass"
+    );
+    std::fs::set_permissions(macos_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o757)).unwrap();
+    assert_eq!(
+        first_trusted(staged),
+        None,
+        "a world-writable executable must not pass"
+    );
+
+    // Ownership cannot be staged without root, so the predicate is asked
+    // directly: this user and root pass, another account does not.
+    assert!(platform::tool_owner_passes(501, 0o755, &[501, 0]));
+    assert!(platform::tool_owner_passes(0, 0o555, &[501, 0]));
+    assert!(!platform::tool_owner_passes(502, 0o755, &[501, 0]));
+    assert!(!platform::tool_owner_passes(501, 0o775, &[501, 0]));
+}
+
+/// The click handler's tool lookup skips a candidate the guard refuses and
+/// keeps searching, so a planted `osascript` early in the list cannot hide
+/// the real one later in it.
+#[cfg(unix)]
+#[test]
+fn a_refused_tool_candidate_does_not_end_the_search() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = scratch_dir("resolve-tool-guard");
+    let (early, late) = (dir.join("early"), dir.join("late"));
+    for d in [&early, &late] {
+        std::fs::create_dir_all(d).unwrap();
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::write(d.join("osascript"), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(d.join("osascript"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let dirs = [early.clone(), late.clone()];
+    assert_eq!(
+        platform::focus::resolve_in(&dirs, "osascript"),
+        Some(early.join("osascript"))
+    );
+    std::fs::set_permissions(&early, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        platform::focus::resolve_in(&dirs, "osascript"),
+        Some(late.join("osascript")),
+        "a writable-by-anyone directory must be skipped, not end the search"
+    );
+    assert_eq!(platform::focus::resolve_in(&dirs[..1], "osascript"), None);
 }
 
 /// A helper that is not installed is skipped, and the rest of the notification
@@ -11735,17 +11949,112 @@ fn the_windows_toast_carries_the_launch_uri_only_when_registered_with_a_key() {
         "an unregistered machine must get today's toast: {unregistered}"
     );
 
-    // The script stays a constant without double quotes, still exits quietly
-    // without BurntToast, and falls back to today's cmdlet.
+    // The script sets protocol activation only from the payload's launch.
     let script = notify::WINDOWS_TOAST_SCRIPT;
     assert!(!script.contains('"'));
-    assert!(script.contains("if(-not (Get-Module -ListAvailable -Name BurntToast)){exit 0}"));
-    assert!(script.contains("-ActivationType Protocol -Launch $p.launch"));
+    assert!(script
+        .contains("if($p.launch){$a=' activationType=''protocol'' launch='''+(E $p.launch)+''''}"));
+}
+
+/// The toast needs nothing installed: it goes through Windows' own
+/// notification API rather than the BurntToast module, escapes every value it
+/// puts into the toast XML, and runs in a child that computes its own module
+/// path. Its argv keeps the flags that make the constant body the only code.
+#[test]
+fn the_windows_toast_uses_the_built_in_api_and_escapes_every_value() {
+    let script = notify::WINDOWS_TOAST_SCRIPT;
+    for gone in [
+        "BurntToast",
+        "Import-Module",
+        "New-BurntToastNotification",
+        "New-BT",
+    ] {
+        assert!(
+            !script.contains(gone),
+            "the script still reaches for {gone}"
+        );
+    }
+    assert!(script
+        .contains("[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("));
     assert!(
-        !script.contains("-AppId"),
-        "the default identity keeps the toast rendering as today"
+        script.contains(
+            "'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe'"
+        ),
+        "the toast must keep Windows PowerShell's identity, BurntToast's default"
     );
-    assert!(script.contains("New-BurntToastNotification -Text $p.title,$p.message -Silent"));
+    assert!(script.contains("function E($s){[Security.SecurityElement]::Escape([string]$s)}"));
+    // Every payload value reaches the XML only through `E`.
+    for field in ["title", "message", "icon", "launch"] {
+        assert!(
+            script.contains(&format!("(E $p.{field})")),
+            "{field} is not escaped into the XML"
+        );
+    }
+    assert!(
+        !script.contains("+$p."),
+        "a payload value is concatenated unescaped"
+    );
+    assert!(script.is_ascii());
+
+    let hostile = "<b>&amp;\"x\" 'y'</b>";
+    let stdin = serde_json::json!({
+        "tool_name": "Bash",
+        "tool_input": { "command": hostile },
+    })
+    .to_string();
+    let plan = notify::plan(
+        Platform::Windows,
+        "permission",
+        "",
+        &stdin,
+        &NotifyConfig::default(),
+        &full_env(),
+        None,
+    );
+    let Some(Action::Spawn {
+        args,
+        stdin: payload,
+        env_remove,
+        ..
+    }) = plan.first()
+    else {
+        panic!("no toast planned: {plan:?}");
+    };
+    assert_eq!(
+        args,
+        &["-NoProfile", "-NonInteractive", "-Command", script]
+            .map(String::from)
+            .to_vec(),
+        "no policy flag, and `-Command` last before the script"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(payload.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        parsed["message"],
+        format!("Bash: {hostile}"),
+        "the message travels raw"
+    );
+    assert_eq!(env_remove, &["PSModulePath".to_string()]);
+
+    for platform in [Platform::Macos, Platform::Linux] {
+        let plan = notify::plan(
+            platform,
+            "stop",
+            "",
+            "",
+            &NotifyConfig::default(),
+            &full_env(),
+            None,
+        );
+        assert!(!plan.is_empty());
+        for action in &plan {
+            if let Action::Spawn { env_remove, .. } = action {
+                assert!(
+                    env_remove.is_empty(),
+                    "{platform:?} changed a child's environment"
+                );
+            }
+        }
+    }
 }
 
 /// The handler is registered only when the open command names exactly the

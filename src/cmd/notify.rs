@@ -71,13 +71,15 @@ pub const LINUX_CLICK_ACTION: &str = "default=Focus";
 pub enum Action {
     /// Run an external helper. `stdin` is fed to the child; `background` means
     /// the notifier does not wait for it; `click` means the executor waits for
-    /// the toast's click instead and hands the key back.
+    /// the toast's click instead and hands the key back; `env_remove` names
+    /// inherited variables the child must not see.
     Spawn {
         program: String,
         args: Vec<String>,
         stdin: Option<String>,
         background: bool,
         click: Option<ClickWait>,
+        env_remove: Vec<String>,
     },
     /// Windows: play a `.wav` in-process, blocking, as `PlaySync` did.
     PlayWav(PathBuf),
@@ -98,6 +100,10 @@ pub struct Env {
     pub system_root: PathBuf,
     /// Programs resolvable on `PATH`.
     pub programs: BTreeSet<String>,
+    /// macOS: terminal-notifier's absolute path, found in a fixed location
+    /// because `PATH` lacks it. A hit on `PATH` leaves this empty and is
+    /// spawned by its bare name, which is what the captured fixtures record.
+    pub terminal_notifier: Option<PathBuf>,
     /// Files that exist — sound assets and the notification icon.
     pub files: BTreeSet<PathBuf>,
     /// This binary's absolute path, for the macOS `-execute` action.
@@ -202,40 +208,31 @@ const DETAIL_LIMIT: usize = 80;
 ///
 /// Verified on Windows 11 / PowerShell 5.1 on 2026-07-27: six hostile messages
 /// (metacharacters, an embedded newline, `%PATH%`, doubled and escaped quotes,
-/// backslashes) arrived byte-identical, exit 0, empty stderr. That does **not**
-/// cover BurntToast rendering the string; only a live Windows session can.
+/// backslashes) arrived byte-identical, exit 0, empty stderr.
+///
+/// The toast goes through Windows' own notification API, the one the
+/// BurntToast module wrapped, so nothing has to be installed and no module
+/// loads under the stock `Restricted` execution policy. Every value becomes
+/// XML text, so each passes through `E`, which escapes all five of `<>&"'`:
+/// the escaping BurntToast used to do. The notifier is Windows PowerShell's
+/// own app identity, BurntToast's default, so the user's existing
+/// notification settings keep applying. The click is protocol activation with
+/// the stdin JSON's launch URI, when there is one.
 pub const WINDOWS_TOAST_SCRIPT: &str = concat!(
     "$ErrorActionPreference='SilentlyContinue';",
     "$p=[Console]::In.ReadToEnd()|ConvertFrom-Json;",
     "if(-not $p.message){exit 0};",
-    "if(-not (Get-Module -ListAvailable -Name BurntToast)){exit 0};",
-    "Import-Module BurntToast;",
-    "$hasIcon=[bool]($p.icon -and (Test-Path -LiteralPath $p.icon));",
-    "$done=$false;",
-    // The click transport: protocol activation with the stdin JSON's
-    // launch URI. Never `-AppId` — the default identity keeps the toast
-    // rendering as today. Any failure falls through to the cmdlet below.
-    "if($p.launch){",
-    "try{",
-    "$ErrorActionPreference='Stop';",
-    "$t=@((New-BTText -Text $p.title),(New-BTText -Text $p.message));",
-    "if($hasIcon){$b=New-BTBinding -Children $t -AppLogoOverride (New-BTImage -Source $p.icon -AppLogoOverride)}",
-    "else{$b=New-BTBinding -Children $t};",
-    "$v=New-BTVisual -BindingGeneric $b;",
-    "$a=New-BTAudio -Silent;",
-    "$c=New-BTContent -Visual $v -Audio $a -ActivationType Protocol -Launch $p.launch;",
-    "Submit-BTNotification -Content $c;",
-    "$done=$true",
-    "}catch{$done=$false};",
-    "$ErrorActionPreference='SilentlyContinue'",
-    "};",
-    "if(-not $done){",
-    "if($hasIcon){",
-    "New-BurntToastNotification -Text $p.title,$p.message -AppLogo $p.icon -Silent",
-    "}else{",
-    "New-BurntToastNotification -Text $p.title,$p.message -Silent",
-    "}",
-    "}",
+    "$null=[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime];",
+    "$null=[Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom.XmlDocument,ContentType=WindowsRuntime];",
+    "function E($s){[Security.SecurityElement]::Escape([string]$s)};",
+    "$a='';",
+    "if($p.launch){$a=' activationType=''protocol'' launch='''+(E $p.launch)+''''};",
+    "$i='';",
+    "if($p.icon -and (Test-Path -LiteralPath $p.icon)){$i='<image placement=''appLogoOverride'' src='''+(E $p.icon)+'''/>'};",
+    "$x='<toast'+$a+'><visual><binding template=''ToastGeneric''><text>'+(E $p.title)+'</text><text>'+(E $p.message)+'</text>'+$i+'</binding></visual><audio silent=''true''/></toast>';",
+    "$d=[Windows.Data.Xml.Dom.XmlDocument]::new();",
+    "$d.LoadXml($x);",
+    "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($d))",
 );
 
 /// The sound each event plays, per platform. Kept verbatim from the scripts.
@@ -446,6 +443,7 @@ fn unix_sound(platform: Platform, event: &str, env: &Env) -> Option<Action> {
             stdin: None,
             background: true,
             click: None,
+            env_remove: Vec::new(),
         }),
         // Linux does check: the asset's package is often absent, and any of
         // three players might be installed.
@@ -472,6 +470,7 @@ fn unix_sound(platform: Platform, event: &str, env: &Env) -> Option<Action> {
                 stdin: None,
                 background: true,
                 click: None,
+                env_remove: Vec::new(),
             })
         }
         Platform::Windows => None,
@@ -482,9 +481,14 @@ fn unix_visual(platform: Platform, msg: &str, env: &Env, key: Option<&Key>) -> O
     let icon = env.icon(platform);
     match platform {
         Platform::Macos => {
-            if !env.has("terminal-notifier") {
-                return None;
-            }
+            let program = if env.has("terminal-notifier") {
+                "terminal-notifier".to_string()
+            } else {
+                env.terminal_notifier
+                    .as_ref()?
+                    .to_string_lossy()
+                    .into_owned()
+            };
             let mut args = vec![
                 "-title".to_string(),
                 TITLE.to_string(),
@@ -512,11 +516,12 @@ fn unix_visual(platform: Platform, msg: &str, env: &Env, key: Option<&Key>) -> O
                 }
             }
             Some(Action::Spawn {
-                program: "terminal-notifier".to_string(),
+                program,
                 args,
                 stdin: None,
                 background: false,
                 click: None,
+                env_remove: Vec::new(),
             })
         }
         Platform::Linux => {
@@ -547,6 +552,7 @@ fn unix_visual(platform: Platform, msg: &str, env: &Env, key: Option<&Key>) -> O
                 stdin: None,
                 background: false,
                 click,
+                env_remove: Vec::new(),
             })
         }
         Platform::Windows => None,
@@ -563,8 +569,9 @@ fn unix_visual(platform: Platform, msg: &str, env: &Env, key: Option<&Key>) -> O
 /// `-Command` body, so a hostile message is harmless by construction rather
 /// than by escaping: the text is never parsed as code.
 ///
-/// Unlike the shipped handler this does not first probe for BurntToast: the
-/// script checks itself, saving a second interpreter launch.
+/// The child drops an inherited `PSModulePath`: Claude Code started from a
+/// PowerShell 7 prompt hands down 7's module paths, and 5.1 computes its own
+/// only when the variable is absent (`about_PSModulePath`).
 ///
 /// The click key travels the same way, as `launch` in the stdin JSON, and only
 /// when the handler is registered: an unregistered machine gets today's
@@ -594,6 +601,7 @@ fn windows_toast(msg: &str, env: &Env, key: Option<&Key>) -> Action {
         stdin: Some(payload.to_string()),
         background: false,
         click: None,
+        env_remove: vec!["PSModulePath".to_string()],
     }
 }
 

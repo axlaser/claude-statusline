@@ -149,9 +149,19 @@ fn settings_cli(rest: &[&str]) -> i32 {
     let action = match positional.first() {
         Some(a) => *a,
         None => return fail(
-            "usage: settings <apply|remove|has|has-foreign|has-legacy|protocol> --binary <path>",
+            "usage: settings <apply|remove|has|has-foreign|has-legacy|protocol|supports> --binary <path>",
         ),
     };
+    // Answered before `--binary` and settings.json, so an installer can ask the
+    // binary it just placed what it can do. A binary older than the question
+    // fails it with exit 1, which is the answer "no".
+    if action == "supports" {
+        return match positional.get(1).copied() {
+            Some(name) if SUPPORTS.contains(&name) => 0,
+            Some(name) => fail(&format!("does not support {name}")),
+            None => fail("usage: settings supports <name>"),
+        };
+    }
     if binary.is_empty() {
         return fail("--binary is required");
     }
@@ -211,6 +221,10 @@ fn settings_cli(rest: &[&str]) -> i32 {
         other => fail(&format!("unknown settings action: {other}")),
     }
 }
+
+/// What `settings supports <name>` answers yes to. `popup-tools`: the notifier
+/// finds terminal-notifier outside `PATH`, where the installer places it.
+const SUPPORTS: [&str; 1] = ["popup-tools"];
 
 fn fail(message: &str) -> i32 {
     emit(&format!("claude-statusline settings: {message}\n"));

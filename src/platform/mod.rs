@@ -114,6 +114,21 @@ mod imp {
         std::fs::symlink_metadata(path).ok().map(|m| m.uid() as u64)
     }
 
+    pub fn trusted_tool(path: &Path) -> bool {
+        let Ok(real) = std::fs::canonicalize(path) else {
+            return false;
+        };
+        let Some(dir) = real.parent() else {
+            return false;
+        };
+        let mut trusted = trusted_owners();
+        trusted.push(0);
+        [real.as_path(), dir].iter().all(|p| {
+            std::fs::metadata(p)
+                .is_ok_and(|md| super::tool_owner_passes(md.uid() as u64, md.mode(), &trusted))
+        })
+    }
+
     /// Creates the directory at `0700` in a single `mkdir(2)`. A `create_dir`
     /// followed by `set_permissions` would leave it at the process umask for
     /// the width of that gap, and on a shared `/tmp` that is long enough for
@@ -285,6 +300,13 @@ mod imp {
         }
     }
 
+    /// Nothing is resolved from a fixed location on Windows: the toast's
+    /// interpreter is addressed under `%SystemRoot%`, and the click helper
+    /// spawns nothing.
+    pub fn trusted_tool(path: &Path) -> bool {
+        path.is_file()
+    }
+
     pub fn trusted_owners() -> Vec<u64> {
         let mut out = Vec::with_capacity(2);
         out.extend(current_owner());
@@ -423,4 +445,21 @@ pub fn trusted_owners() -> Vec<u64> {
 /// The owner id of `path` itself (not its symlink target), or `None`.
 pub fn file_owner(path: &Path) -> Option<u64> {
     imp::file_owner(path)
+}
+
+/// Whether a tool found in a fixed location, rather than on `PATH`, may be
+/// run: the executable, with symlinks resolved, and the directory holding it
+/// are owned by this user or root and writable by nobody else. So another
+/// account's Homebrew on a shared Mac is never run on every alert. Resolving
+/// first is what lets Homebrew's group-writable `bin` pass: its entries link
+/// into kegs only the owner can write, and a link re-pointed at a foreign
+/// file fails on the target.
+pub fn trusted_tool(path: &Path) -> bool {
+    imp::trusted_tool(path)
+}
+
+/// The tested predicate behind `trusted_tool`: a trusted owner, and no write
+/// bit for group or others.
+pub fn tool_owner_passes(owner: u64, mode: u32, trusted: &[u64]) -> bool {
+    crate::state::owner_check_passes(Some(owner), trusted) && mode & 0o022 == 0
 }

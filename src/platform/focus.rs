@@ -1063,13 +1063,16 @@ pub fn candidate_dirs(platform: Platform) -> Vec<PathBuf> {
 /// The absolute path a tool is spawned by: candidate dirs first, `PATH` last.
 pub fn resolve_tool(platform: Platform, tool: Tool) -> Option<PathBuf> {
     let name = tool.name();
-    for dir in candidate_dirs(platform) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    crate::platform::notify::which(name).filter(|p| p.is_absolute())
+    resolve_in(&candidate_dirs(platform), name)
+        .or_else(|| crate::platform::notify::which(name).filter(|p| p.is_absolute()))
+}
+
+/// The first candidate directory holding `name` that passes the ownership
+/// guard. A failing hit is skipped, not fatal, so a planted copy early in the
+/// list cannot hide the real one later in it or on `PATH`.
+pub fn resolve_in(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
+    let candidates: Vec<PathBuf> = dirs.iter().map(|d| d.join(name)).collect();
+    crate::platform::notify::first_trusted(&candidates)
 }
 
 /// Runs a tool by absolute path with constant verbs and record fields as
