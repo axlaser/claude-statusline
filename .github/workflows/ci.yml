@@ -570,9 +570,22 @@ jobs:
           cat > "$scratch/.claude/settings.json" <<'JSON'
           { "hooks": { "PermissionRequest": [ { "hooks": [ { "type": "command", "command": "~/.claude/notify.sh permission" } ] } ] } }
           JSON
-          # For the record only: a tool the image already has leaves the step
-          # nothing to install, which the next step reports.
-          echo "popup tools on this image before the install:"
+          # The macOS images carry the terminal-notifier Ruby gem, whose stub
+          # on PATH already satisfies the step, and the runtime would use it
+          # too. Its directory comes off PATH for this job, so the step has
+          # something to install and the route under test actually runs.
+          if [ "$RUNNER_OS" = macOS ]; then
+            kept=""
+            IFS=: read -ra dirs <<< "$PATH"
+            for d in "${dirs[@]}"; do
+              [ -x "$d/terminal-notifier" ] || kept="${kept:+$kept:}$d"
+            done
+            export PATH="$kept"
+            echo "PATH=$kept" >> "$GITHUB_ENV"
+          fi
+          # A tool still present leaves the step nothing to install, which the
+          # next step reports.
+          echo "popup tools on PATH before the install:"
           for t in terminal-notifier notify-send xdotool wmctrl; do
             printf '  %-18s %s\n' "$t" "$(command -v "$t" || echo absent)"
           done
