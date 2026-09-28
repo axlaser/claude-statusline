@@ -104,6 +104,18 @@ function Format-Size([long]$bytes) {
     return "$bytes B"
 }
 
+# Why a file in the install directory could not be moved: Windows' own message,
+# and any claude-statusline process still running, which is what usually holds
+# a file there. Claude Code may be closed while such a process lives on.
+function Show-MoveFailure($Failure) {
+    Info $Failure.Exception.Message
+    # By name, not by path: a process running from a renamed copy can report
+    # no path at all, and that is exactly the one holding the sidecar.
+    foreach ($p in @(Get-Process -Name 'claude-statusline*' -ErrorAction SilentlyContinue)) {
+        Info "Still running: $($p.ProcessName), PID $($p.Id), since $($p.StartTime). Stop it with: Stop-Process -Id $($p.Id)"
+    }
+}
+
 # Removes the staged download. Called on every path that does not place it
 #: a staged file left behind is an unverified binary sitting in the
 # install directory.
@@ -592,7 +604,8 @@ if (Test-Path $binPath) {
         Move-Item -Path $binPath -Destination $sidecarPath -Force -ErrorAction Stop
     } catch {
         Err "Could not move the existing binary aside"
-        Info "Close Claude Code and re-run."
+        Show-MoveFailure $_
+        Info "Close Claude Code, stop anything listed above, and re-run."
         Remove-Stage
         return
     }

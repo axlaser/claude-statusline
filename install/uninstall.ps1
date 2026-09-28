@@ -90,6 +90,18 @@ function Write-Footer([string]$msg) {
     Write-Host ""
 }
 
+# Why a file in the install directory could not be moved: Windows' own message,
+# and any claude-statusline process still running, which is what usually holds
+# a file there. Claude Code may be closed while such a process lives on.
+function Show-MoveFailure($Failure) {
+    Info $Failure.Exception.Message
+    # By name, not by path: a process running from a renamed copy can report
+    # no path at all, and that is exactly the one holding the sidecar.
+    foreach ($p in @(Get-Process -Name 'claude-statusline*' -ErrorAction SilentlyContinue)) {
+        Info "Still running: $($p.ProcessName), PID $($p.Id), since $($p.StartTime). Stop it with: Stop-Process -Id $($p.Id)"
+    }
+}
+
 # See install.ps1's copy for the full reasoning. $LASTEXITCODE is only written
 # by a process that starts, so an executable that cannot launch leaves the
 # previous command's code in place and a bare check reads it as success. Here
@@ -188,7 +200,8 @@ if (Test-Path $binPath) {
         Move-Item -Path $binPath -Destination $sidecarPath -Force -ErrorAction Stop
         $moved = $true
     } catch {
-        Warn "Could not move $binPath aside - is Claude Code still running?"
+        Warn "Could not move $binPath aside"
+        Show-MoveFailure $_
     }
     if ($moved) {
         Remove-Item $sidecarPath -Force -ErrorAction SilentlyContinue
@@ -212,6 +225,7 @@ if (Test-Path $helperPath) {
         $helperMoved = $true
     } catch {
         Warn "Could not move $helperPath aside"
+        Show-MoveFailure $_
     }
     if ($helperMoved) {
         Remove-Item $helperSidecar -Force -ErrorAction SilentlyContinue
