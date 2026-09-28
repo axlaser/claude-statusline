@@ -1079,7 +1079,7 @@ notification_tools_offer() {
         pkg=$(_pkg_name "$tool")
         case $tool in
             terminal-notifier)
-                what="Shows Claude Code's notifications in macOS Notification Center. If it's missing, you only hear a sound."
+                what="This dependency shows Claude Code's notifications in macOS Notification Center. If it's missing, you only hear a sound."
                 if [[ $(uname -m) == arm64 && $_me != 0 && -x $BREW && $(_stat_owner "$BREW") == "$_me" ]]; then
                     how="Homebrew, no password needed"
                 else
@@ -1088,17 +1088,17 @@ notification_tools_offer() {
                 link="https://github.com/julienXX/terminal-notifier"
                 ;;
             notify-send)
-                what="Shows Claude Code's notifications on your desktop. If it's missing, you only hear a sound."
+                what="This dependency shows Claude Code's notifications on your desktop. If it's missing, you only hear a sound."
                 how="$pm_name package $pkg$with"
                 link="https://gitlab.gnome.org/GNOME/libnotify"
                 ;;
             xdotool)
-                what="Brings your terminal to the front when you click a notification. If it's missing, clicking only closes the notification."
+                what="This dependency brings your terminal to the front when you click a notification. If it's missing, clicking only closes the notification."
                 how="$pm_name package xdotool$with"
                 link="https://github.com/jordansissel/xdotool"
                 ;;
             kdotool)
-                what="Brings your terminal to the front when you click a notification on KDE Wayland. If it's missing, clicking only closes the notification."
+                what="This dependency brings your terminal to the front when you click a notification on KDE Wayland. If it's missing, clicking only closes the notification."
                 how="dnf package kdotool$with"
                 link="https://github.com/jinliu/kdotool"
                 ;;
