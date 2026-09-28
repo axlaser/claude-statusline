@@ -12218,6 +12218,96 @@ fn the_windows_toast_uses_the_built_in_api_and_escapes_every_value() {
     }
 }
 
+/// The toast script run for real through Windows PowerShell, with the planned
+/// argv, stdin and environment, and with its errors surfaced. The shipped
+/// script silences them, so a parse error, a WinRT type that will not load,
+/// or toast XML Windows' own parser rejects would otherwise look exactly like
+/// success. The message is hostile, the icon and the click URI are present, so
+/// every escaped value reaches the XML. Whether a person sees the popup stays
+/// a manual check.
+///
+/// CI only: run on a desktop, this raises a real popup on every `cargo test`.
+#[cfg(windows)]
+#[test]
+fn the_windows_toast_script_runs_through_the_built_in_api() {
+    if std::env::var_os("CI").is_none() {
+        println!("skipped: raises a real popup, so it runs only in CI");
+        return;
+    }
+    let dir = scratch_dir("windows-toast-live");
+    let home = dir.join("home");
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::copy(
+        repo_file("assets/claude-icon.png"),
+        home.join(".claude").join("claude-icon.png"),
+    )
+    .unwrap();
+    let mut env = full_env();
+    env.home = home.clone();
+    env.files.insert(PathBuf::from(format!(
+        "{}\\.claude\\claude-icon.png",
+        home.to_string_lossy()
+    )));
+    env.system_root = PathBuf::from(std::env::var("SystemRoot").unwrap_or("C:\\Windows".into()));
+    let hostile = "<b>&amp; \"quoted\" 'single'</b> $env:PATH %PATH%\nsecond line";
+    let stdin = serde_json::json!({ "tool_name": "Bash", "tool_input": { "command": hostile } })
+        .to_string();
+    let key = Key::parse(&format!("s1.{}", "k".repeat(32))).unwrap();
+    let plan = notify::plan(
+        Platform::Windows,
+        "permission",
+        "",
+        &stdin,
+        &NotifyConfig::default(),
+        &env,
+        Some(&key),
+    );
+    let Some(Action::Spawn {
+        program,
+        args,
+        stdin: Some(payload),
+        env_remove,
+        ..
+    }) = plan.first()
+    else {
+        panic!("no toast planned: {plan:?}");
+    };
+    let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
+    assert!(
+        parsed["icon"].is_string() && parsed["launch"].is_string(),
+        "{parsed}"
+    );
+
+    let mut args = args.clone();
+    let script = args.last_mut().unwrap();
+    assert!(script.starts_with("$ErrorActionPreference='SilentlyContinue';"));
+    *script = script.replacen("'SilentlyContinue'", "'Stop'", 1);
+    let mut command = Command::new(program);
+    command
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in env_remove {
+        command.env_remove(name);
+    }
+    let mut child = command.spawn().expect("Windows PowerShell did not start");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success() && out.stderr.is_empty(),
+        "the toast script failed: exit {:?}\nstdout: {}\nstderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// The handler is registered only when the open command names exactly the
 /// helper beside this binary and that file exists.
 #[test]
