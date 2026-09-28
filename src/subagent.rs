@@ -631,14 +631,6 @@ pub struct AgentReading {
     pub model: String,
 }
 
-impl AgentReading {
-    pub fn used(&self) -> u64 {
-        self.input_tokens
-            .saturating_add(self.cache_write_tokens)
-            .saturating_add(self.cache_read_tokens)
-    }
-}
-
 /// Reads the last assistant entry of an agent transcript. Unparseable lines
 /// are skipped rather than ending the scan: a torn tail is routine in a file
 /// being appended to, and the entry before it is still the best reading.

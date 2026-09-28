@@ -360,7 +360,7 @@ pub fn status(
 ///
 /// Returned rather than counted in a global: `cargo test` runs these in
 /// parallel, and a shared counter would make the one rule this unit can break
-/// silently into a flaky assertion. See [`UPFRONT`] for why that rule matters.
+/// silently into a flaky assertion. See `read_from_git` for why that rule matters.
 pub fn status_observed(
     clock: &dyn Clock,
     temp: &crate::session::StateRoot,
@@ -447,15 +447,14 @@ impl Child {
     }
 }
 
-/// The children spawned before anything is drained.
+/// Runs the git children and returns the row with how many were spawned.
 ///
-/// Both, always, on any tick that reaches `git` at all. They are independent
-/// reads of the same repository and git's `lockfile.h` blocks only writers — a
-/// loser of an `O_CREAT|O_EXCL` race returns `-1` silently rather than creating
-/// a file — so overlapping them is safe and the pair costs `max(a, b)` instead
-/// of `a + b`. Measured 98.0 ms sequential against 57.2 ms concurrent.
-pub const UPFRONT: [Child; 2] = [Child::Status, Child::Diff];
-
+/// `Status` and `Diff` are spawned before anything is drained: both, always,
+/// on any tick that reaches `git` at all. They are independent reads of the
+/// same repository and git's `lockfile.h` blocks only writers — a loser of an
+/// `O_CREAT|O_EXCL` race returns `-1` silently rather than creating a file — so
+/// overlapping them is safe and the pair costs `max(a, b)` instead of `a + b`.
+/// Measured 98.0 ms sequential against 57.2 ms concurrent.
 fn read_from_git(cwd: &Path) -> (GitStatus, usize) {
     // The remote is read regardless of what the subprocess returns: it is a
     // property of the repository, not of the working tree, so it survives a git

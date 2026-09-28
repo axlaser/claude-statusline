@@ -42,17 +42,6 @@ pub fn observe(session: &str) -> Observation {
     }
 }
 
-/// The start time of `pid` as the platform measures it, or `None` when the
-/// process is gone or cannot be asked.
-pub fn process_start(pid: u64) -> Option<u64> {
-    imp::process_start(pid)
-}
-
-/// The boot id start times are measured against, where they are (Linux).
-pub fn boot_id() -> Option<String> {
-    imp::boot_id()
-}
-
 /// Random bytes for a token, straight from the OS. `None` on any failure:
 /// there is no fallback source.
 pub fn random_bytes() -> Option<[u8; TOKEN_BYTES]> {

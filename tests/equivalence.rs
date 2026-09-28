@@ -7959,9 +7959,13 @@ fn an_agent_transcript_reports_its_last_assistant_entry() {
     assert_eq!(reading.stop_reason, "end_turn");
     assert_eq!(reading.model, "claude-sonnet-5");
     assert_eq!(
-        reading.used(),
-        420,
-        "used is input plus both cache buckets, and excludes output"
+        (
+            reading.input_tokens,
+            reading.cache_write_tokens,
+            reading.cache_read_tokens
+        ),
+        (100, 20, 300),
+        "the three input buckets come from the last entry; output is not read"
     );
 
     let empty = subagent::read_agent(b"{\"type\":\"user\"}\n");
