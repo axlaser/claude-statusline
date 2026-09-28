@@ -7496,6 +7496,7 @@ fn a_fast_child_is_reaped_without_waiting_for_a_poll_tick() {
     };
 
     let mut samples = Vec::new();
+    let mut naps = Vec::new();
     let mut woken = 0;
     for _ in 0..9 {
         let (out, wait) = git::run_bounded_observed(fresh(), std::time::Duration::from_secs(5));
@@ -7504,14 +7505,12 @@ fn a_fast_child_is_reaped_without_waiting_for_a_poll_tick() {
             "the child must succeed for this to mean anything"
         );
         assert!(!wait.killed, "a fast child must not reach its deadline");
-        assert!(
-            wait.napped_after_drain < std::time::Duration::from_millis(5),
-            "the reap slept {:?} after EOF",
-            wait.napped_after_drain
-        );
         // Only the probes that actually waited: a child that had already
         // exited by the first `try_wait` never reached the wait under test.
-        samples.extend(wait.eof_to_reap);
+        if let Some(latency) = wait.eof_to_reap {
+            samples.push(latency);
+            naps.push(wait.napped_after_drain);
+        }
         woken += usize::from(wait.woken_by_pipe);
     }
     assert!(
@@ -7521,6 +7520,16 @@ fn a_fast_child_is_reaped_without_waiting_for_a_poll_tick() {
     );
     samples.sort_unstable();
     let median = samples[samples.len() / 2];
+    // The median too, for the same reason: one teardown that outlasts the fine
+    // window costs that probe a whole poll interval, as it did once on the
+    // arm64 Windows runner at 5.2 ms. A reap that naps a poll interval every
+    // time still fails here.
+    naps.sort_unstable();
+    let nap = naps[naps.len() / 2];
+    assert!(
+        nap < std::time::Duration::from_millis(5),
+        "the median reap slept {nap:?} after EOF. All: {naps:?}"
+    );
 
     assert!(
         woken > 0,
@@ -7800,10 +7809,14 @@ fn a_concurrent_pair_costs_the_slower_child_not_both() {
         }
     };
 
-    // Both up first, then both drained against one deadline.
+    // Both up first, then both drained against one deadline. The bound is the
+    // sum itself: two children run one after the other cannot take less, so
+    // anything under it proves overlap however slowly they start. Two seconds
+    // each rather than one, because under Rosetta starting the pair costs up to
+    // a second, which left a one-second pair at 1.8-1.9 s of a 2 s sum.
     let started = std::time::Instant::now();
-    let a = git::spawn_bounded(sleeper("1")).expect("the first child spawns");
-    let b = git::spawn_bounded(sleeper("1")).expect("the second child spawns");
+    let a = git::spawn_bounded(sleeper("2")).expect("the first child spawns");
+    let b = git::spawn_bounded(sleeper("2")).expect("the second child spawns");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     let (first, _) = git::collect_bounded(a, deadline);
     let (second, _) = git::collect_bounded(b, deadline);
@@ -7811,16 +7824,17 @@ fn a_concurrent_pair_costs_the_slower_child_not_both() {
 
     assert!(first.is_some() && second.is_some(), "both children succeed");
     assert!(
-        elapsed < std::time::Duration::from_millis(1800),
-        "two one-second children took {elapsed:?}: that is their sum, so they \
+        elapsed < std::time::Duration::from_secs(4),
+        "two two-second children took {elapsed:?}: that is their sum, so they \
          are not actually overlapping"
     );
 
     // A child past the shared deadline is killed; one that already finished is
-    // still collected, because the loop tries the child before the clock.
+    // still collected, because the loop tries the child before the clock. The
+    // deadline leaves the fast child two seconds, for the same slow start.
     let slow = git::spawn_bounded(sleeper("5")).expect("the slow child spawns");
     let fast = git::spawn_bounded(sleeper("1")).expect("the fast child spawns");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let (slow_out, slow_wait) = git::collect_bounded(slow, deadline);
     let (fast_out, fast_wait) = git::collect_bounded(fast, deadline);
 

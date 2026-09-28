@@ -1241,9 +1241,11 @@ sitting rather than quoting either number.
 Two observables carry it in the suite, because a median never could have been the whole
 case: `Wait::eof_to_reap` measures from the instant the pipe reached EOF, so it prices the
 latency itself rather than whatever the wait is built from, and
-`a_fast_child_is_reaped_without_waiting_for_a_poll_tick` takes the worst of five — one
+`a_fast_child_is_reaped_without_waiting_for_a_poll_tick` takes the median of nine — one
 sample of a 5 ms poll lands under the threshold two times in five. Regressing the wait back
-to sleeping makes it fail at 4.47 ms.
+to sleeping makes it fail at 4.47 ms. The time napped after EOF is judged by its median as
+well (2026-09-28): judged per sample, one slow teardown on the arm64 Windows runner cost a
+probe a full poll interval, 5.2 ms, and failed a release build.
 
 ### The status and diff children overlap — 2026-09-21
 
@@ -1262,6 +1264,11 @@ a file. Both commands pass flags `0`.
 `rev-parse` stays sequential and must. Whether it is needed is known only once status has
 parsed, so hoisting it would make three children the common case — a strict increase on
 every tick.
+
+`a_concurrent_pair_costs_the_slower_child_not_both` bounds the pair by its sum, which two
+children run one after the other cannot beat, with two-second children (2026-09-28).
+Under Rosetta, starting the pair costs up to a second, so the earlier one-second pair
+against a 1.8 s bound failed about one x86_64 macOS release build in five.
 
 **The accepted §2 exception.** In two states the tick goes from one child to two, because
 the gate that used to skip the diff is a function of *drained* status output and overlapping
