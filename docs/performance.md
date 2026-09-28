@@ -988,6 +988,14 @@ is a constant, not a config key: revisit it only with evidence from the real-des
 that two minutes is the wrong window. It costs a sleeping process, no CPU, and nothing on
 any tick.
 
+**Every other helper `notify` waits on is bounded too.** A foreground toast helper
+(terminal-notifier, notify-send without a click, Windows PowerShell) is killed once
+`SPAWN_DEADLINE`, 20 seconds, has passed. Found on a real Windows machine on 2026-09-28: a
+`notify` process that never returned outlived Claude Code for over 25 minutes, and because a
+live process pins its executable on Windows, every later install and uninstall failed to
+move the renamed binary aside. The wait polls every 20 ms, which adds at most that much to
+the hook's exit and nothing to any tick.
+
 **The helper is a second binary, not a second per-tick process.** `claude-statusline-focus`
 runs only when the shell launches it for a click, spawns nothing, and exits within the
 two-second foreground bound.

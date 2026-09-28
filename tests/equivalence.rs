@@ -2661,6 +2661,36 @@ fn terminal_notifier_is_found_only_in_trusted_fixed_locations() {
     assert!(!platform::tool_owner_passes(501, 0o775, &[501, 0]));
 }
 
+/// A helper the notifier waits on is killed once its deadline passes, so a
+/// toast that never returns cannot keep `notify` alive. On Windows a live
+/// process pins its executable, and one such process blocked every later
+/// install and uninstall from moving the binary aside.
+#[cfg(unix)]
+#[test]
+fn a_helper_that_never_returns_is_killed_at_its_deadline() {
+    use claude_statusline::platform::notify::{wait_or_kill, SPAWN_DEADLINE};
+    assert!(SPAWN_DEADLINE <= std::time::Duration::from_secs(30));
+
+    let mut quick = Command::new("true").spawn().expect("true");
+    assert!(wait_or_kill(&mut quick, std::time::Duration::from_secs(5)));
+
+    let started = std::time::Instant::now();
+    let mut stuck = Command::new("sleep").arg("30").spawn().expect("sleep");
+    assert!(!wait_or_kill(
+        &mut stuck,
+        std::time::Duration::from_millis(200)
+    ));
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the wait outlived its deadline: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        stuck.try_wait().unwrap().is_some(),
+        "the helper is still running"
+    );
+}
+
 /// The click handler's tool lookup skips a candidate the guard refuses and
 /// keeps searching, so a planted `osascript` early in the list cannot hide
 /// the real one later in it.

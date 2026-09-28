@@ -385,7 +385,39 @@ fn spawn(
         // achieves — the notification must not wait for audio to finish.
         return;
     }
-    let _ = child.wait();
+    if !wait_or_kill(&mut child, SPAWN_DEADLINE) {
+        let program = program.to_string();
+        debug::log(move || format!("notify: {program} outlived its deadline and was killed"));
+    }
+}
+
+/// How long a helper this process waits on may run. Every one of them posts a
+/// notification and returns within a second or two; Windows PowerShell's cold
+/// start is the slowest.
+pub const SPAWN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Waits for `child` until `deadline` has passed, then kills it. `true` when
+/// it exited on its own.
+///
+/// Bounded because a helper that never returns kept this process alive with
+/// it: a hook outlives Claude Code once Claude Code gives up on it, and on
+/// Windows a live process pins its executable, so a stuck `notify` held the
+/// renamed binary and every later install and uninstall failed to move it.
+pub fn wait_or_kill(child: &mut std::process::Child, deadline: std::time::Duration) -> bool {
+    let end = std::time::Instant::now() + deadline;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) if std::time::Instant::now() < end => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
