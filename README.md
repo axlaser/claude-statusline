@@ -32,7 +32,7 @@ irm https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/i
 
 Then restart Claude Code.
 
-The installer downloads a prebuilt binary, checks its SHA-256, confirms it renders correctly, and registers it in `~/.claude/settings.json`. It asks before replacing an existing status line, and asks whether you want notifications. Nothing else needs installing first. The git segment needs git 2.15 or later; with older git, that segment is left out.
+The installer downloads a prebuilt binary, checks its SHA-256, confirms it renders correctly, and registers it in `~/.claude/settings.json`. It asks before replacing an existing status line, and asks whether you want notifications. If you do, it checks for the tool popups need on macOS and Linux and offers to install it (see [Popups](#popups)). Nothing else needs installing first. The git segment needs git 2.15 or later; with older git, that segment is left out.
 
 **Update:** run the install command again. Your other settings are kept.
 
@@ -45,6 +45,8 @@ curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/in
 ```powershell
 irm https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/uninstall.ps1 | iex
 ```
+
+The uninstaller also offers to remove the popup tools the installer added. It never removes Homebrew, or a library other software uses, and your package manager shows what it will remove and asks first.
 
 Prefer not to pipe into a shell, or want a prerelease? See [Other install options](#other-install-options).
 
@@ -102,20 +104,24 @@ Built-in system sounds, nothing to install.
 | Platform | Needs you | Done | Warning | Player |
 |----------|-----------|------|---------|--------|
 | macOS | Tink | Glass | Sosumi | `afplay` |
-| Linux | freedesktop bell | freedesktop complete | freedesktop dialog-warning | `paplay` / `aplay` |
+| Linux | freedesktop bell | freedesktop complete | freedesktop dialog-warning | `paplay`, `ffplay` or `ogg123` |
 | Windows | System Exclamation | System Asterisk | System Hand | built in |
 
 ### Popups
 
-Popups need one optional tool, which you install yourself. Without it, sounds still work.
+On macOS and Linux, popups need a small third-party tool. With notifications on, the installer checks for it, shows what it is and where it comes from, and installs it if you say yes. If you say no, or it can't install it, it prints the commands instead. Without the tool, sounds still work. Windows needs nothing: popups use Windows' built-in notifications.
 
-| Platform | Tool | Install |
-|----------|------|---------|
-| macOS | [terminal-notifier](https://github.com/julienXX/terminal-notifier) | `brew install terminal-notifier` |
-| Linux | `notify-send` | `sudo apt install libnotify-bin`, `sudo dnf install libnotify`, or `sudo pacman -S libnotify` |
-| Windows | [BurntToast](https://github.com/Windos/BurntToast) | `powershell.exe -Command "Install-Module -Name BurntToast -Scope CurrentUser"` |
+| Platform | Tool | What the installer does | By hand |
+|----------|------|-------------------------|---------|
+| macOS | [terminal-notifier](https://github.com/julienXX/terminal-notifier) | Homebrew on Apple Silicon, if you have it. Otherwise its official release, checksum-checked, into `~/Applications`. No password. | `brew install terminal-notifier` |
+| Linux | `notify-send` ([libnotify](https://gitlab.gnome.org/GNOME/libnotify)) | Your package manager, through `sudo` | `sudo apt install libnotify-bin`, `sudo dnf install libnotify`, or `sudo pacman -S libnotify` |
+| Windows | Nothing | Nothing | Nothing |
 
-On Windows, run that from Windows PowerShell rather than PowerShell 7. Popups are raised through Windows PowerShell 5.1, which may not see a module installed from PowerShell 7.
+On Linux the installer also offers the [click-to-focus](#click-to-focus) helper your desktop uses: [xdotool](https://github.com/jordansissel/xdotool) on X11, or [kdotool](https://github.com/jinliu/kdotool) on KDE Wayland. kdotool is packaged on Fedora; elsewhere it's `cargo install kdotool`. One yes covers them all, and `sudo` may ask for your password. The installer never installs Homebrew, and installs nothing when there's no terminal to answer, or over SSH with no desktop session.
+
+After installing terminal-notifier, the installer sends a test popup, so macOS asks for permission while you're watching. Click **Allow**.
+
+Earlier versions used the BurntToast module on Windows. It isn't used any more, and you can remove it with `Uninstall-Module BurntToast`.
 
 Popups use the Claude icon ([source](https://commons.wikimedia.org/wiki/File:Claude_AI_symbol.svg), public domain), which the installer saves to `~/.claude/claude-icon.png`.
 
@@ -137,7 +143,7 @@ Clicking a popup brings the session's terminal to the front and, where the termi
 Platform notes:
 
 - **macOS:** the first tab selection asks for Automation permission. If you decline, clicks still bring the app forward. Clicks keep working from Notification Center after the session ends.
-- **Linux:** a popup stays clickable for 2 minutes. Raising the window needs `xdotool` or `wmctrl` on X11, or `kdotool` on KDE Wayland. GNOME on Wayland doesn't allow it, but tab and pane selection in tmux, kitty, WezTerm and Konsole still works.
+- **Linux:** a popup stays clickable for 2 minutes. Raising the window needs `xdotool` or `wmctrl` on X11, or `kdotool` on KDE Wayland; the installer offers the one your desktop uses. GNOME on Wayland doesn't allow it, but tab and pane selection in tmux, kitty, WezTerm and Konsole still works.
 - **Windows:** clicks go through a small helper, `claude-statusline-focus.exe`, so no console window flashes. If Windows won't raise the window (for example an elevated terminal), the taskbar button flashes instead.
 
 Once a session has ended, a click brings the app forward but selects no tab.
@@ -198,7 +204,7 @@ They're only available on Claude Pro and Max plans, not API keys, and only after
 - Test it: `~/.claude/bin/claude-statusline notify stop` should play a sound. On Windows: `& "$env:USERPROFILE\.claude\bin\claude-statusline.exe" notify stop`.
 - Check the event isn't set to `"sound": false` in `~/.claude/notify-config.json`.
 - Check `settings.json` has `claude-statusline notify <event>` hooks under `PermissionRequest`, `Stop`, `PreCompact` and `PostCompact`.
-- Linux: `paplay` needs PulseAudio or PipeWire running; otherwise `aplay` needs ALSA.
+- Linux: `paplay` needs PulseAudio or PipeWire running. Without it, `ffplay` or `ogg123` play the sound if one is installed.
 - Restart Claude Code. Hooks load at startup.
 
 </details>
@@ -206,9 +212,11 @@ They're only available on Claude Pro and Max plans, not API keys, and only after
 <details>
 <summary><strong>No popups</strong></summary>
 
+- **Test it:** `~/.claude/bin/claude-statusline notify stop` should show a popup. On Windows: `& "$env:USERPROFILE\.claude\bin\claude-statusline.exe" notify stop`.
+- **Tool missing:** run the installer again. It checks for the tool and offers it, or prints the commands.
 - **macOS:** open **System Settings > Notifications > terminal-notifier** and turn on **Allow Notifications**. If it isn't listed, run `terminal-notifier -title Test -message Hello` once, then look again.
-- **Linux:** test with `notify-send Test Hello`. Your desktop needs a notification service; some Wayland compositors need extra setup.
-- **Windows:** test with `New-BurntToastNotification -Text "Test", "Hello"`, and check notifications are allowed for PowerShell under **Settings > System > Notifications**. If BurntToast was installed from PowerShell 7, reinstall it from Windows PowerShell (see [Popups](#popups)). `powershell.exe -Command "Get-Module -ListAvailable BurntToast"` confirms Windows PowerShell can see it.
+- **Linux:** test with `notify-send Test Hello`. Your desktop needs a notification service; some Wayland compositors need extra setup. Over SSH there's no desktop to show popups in.
+- **Windows:** popups appear under the name Windows PowerShell. Check it's allowed under **Settings > System > Notifications**, and that Do not disturb is off.
 - **Everywhere:** with the debug log on, `notify:` lines show whether the hook ran and whether the popup tool was found.
 
 </details>
@@ -310,6 +318,16 @@ irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/unin
 
 Checksums and attestations are verified the same way on every channel.
 
+### Answer the popup tools question in advance
+
+`CLAUDE_STATUSLINE_DEPS=yes` installs the [popup tools](#popups) without asking, and `CLAUDE_STATUSLINE_DEPS=no` skips them. Any other value is ignored. The uninstaller reads it too, for removing them. The installer prints a line whenever the variable answers, so a forgotten export shows up.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.sh | CLAUDE_STATUSLINE_DEPS=yes bash
+```
+
+With no terminal, `yes` uses `sudo` only where it needs no password; otherwise the commands are printed.
+
 ### From a clone
 
 ```bash
@@ -387,7 +405,7 @@ Every step can be read before you run it.
    ~/.claude/bin/claude-statusline self-check && echo OK
    ```
 
-4. **Notifications (optional).** Install the [popup tool](#popups) for your platform, and save the [default config](#notifications) as `~/.claude/notify-config.json`.
+4. **Notifications (optional).** Install the [popup tool](#popups) for your platform, and save the [default config](#notifications) as `~/.claude/notify-config.json`. terminal-notifier is found on `PATH`, in `~/Applications` or `/Applications`, or in a Homebrew or MacPorts prefix.
 
 5. **Register it.** This edits `~/.claude/settings.json` and leaves everything else in it alone:
 
@@ -495,7 +513,7 @@ Every step can be read before you run it.
    Unblock-File $helper
    ```
 
-4. **Notifications (optional).** Install [BurntToast](#popups), and save the [default config](#notifications) as `%USERPROFILE%\.claude\notify-config.json`.
+4. **Notifications (optional).** Save the [default config](#notifications) as `%USERPROFILE%\.claude\notify-config.json`. Popups need nothing installed.
 
 5. **Register it.** The first command edits `settings.json`. The second registers the `claude-statusline:` link handler that makes popups clickable; it only touches its own key under `HKCU\Software\Classes`, and leaves the scheme alone if another program owns it.
 

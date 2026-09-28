@@ -3,7 +3,9 @@
 # installer wrote. Covers macOS and Linux from one file.
 #
 # No `set -e` and no bare `exit` -- see install.sh for why both matter when the
-# published one-liner pipes this into the user's live shell.
+# published one-liner pipes this into the user's live shell. One brace group,
+# closed on the last line, for the same reason as install.sh's.
+{
 
 CLAUDE_DIR="$HOME/.claude"
 BIN_DIR="$CLAUDE_DIR/bin"
@@ -14,24 +16,145 @@ ICON_PATH="$CLAUDE_DIR/claude-icon.png"
 MODEL_WINDOWS_PATH="$CLAUDE_DIR/statusline-model-windows.json"
 STAGE_PREFIX=".claude-statusline.stage."
 
-RESET=$'\033[0m'
-BOLD=$'\033[1m'
-DIM=$'\033[2m'
-CYAN=$'\033[36m'
-GREEN=$'\033[32m'
-YELLOW=$'\033[33m'
-GRAY=$'\033[90m'
+TOOLS_RECORD="$CLAUDE_DIR/statusline-installed-tools.txt"
+TN_APP="$HOME/Applications/terminal-notifier.app"
+BREW=/opt/homebrew/bin/brew
+_me=$(id -u 2>/dev/null)
 
-step() { printf "  ${CYAN}${BOLD}>>>${RESET} %s\n" "$1"; }
-ok()   { printf "  ${GREEN}${BOLD} +${RESET} %s\n" "$1"; }
-warn() { printf "  ${YELLOW}${BOLD} !${RESET} %s\n" "$1"; }
-info() { printf "  ${DIM}   %s${RESET}\n" "$1"; }
+# --- Output ---
+# Drawn like the status line itself (src/render.rs, `assemble`): a heavy gray
+# frame, dim seven-wide labels and the status line's glyphs. Decided once,
+# before the first line: plain text with no colour and no frame when stdout is
+# not a terminal, NO_COLOR is set (https://no-color.org) or TERM is dumb, so a
+# log keeps every message on one line a grep can find.
+if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-} != dumb ]]; then
+    PLAIN=false
+    RESET=$'\033[0m'
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    CYAN=$'\033[36m'
+    GREEN=$'\033[32m'
+    YELLOW=$'\033[33m'
+    RED=$'\033[31m'
+    GRAY=$'\033[90m'
+else
+    PLAIN=true
+    RESET="" BOLD="" DIM="" CYAN="" GREEN="" YELLOW="" RED="" GRAY=""
+fi
+# The frame's inner width. Everything drawn inside it is ASCII, so ${#s} counts
+# columns under any locale, and every line stays within 72.
+INNER=60
+_rule=$(printf '%*s' "$INNER" '')
+HEAVY=${_rule// /━}
+_rule=$(printf '%*s' 42 '')
+RULE=${_rule// /━}
 
-echo ""
-printf "\n  ${DIM}claude-statusline uninstaller${RESET}\n"
-printf "  ${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
-echo ""
+step()     { printf "  ${CYAN}●${RESET} ${BOLD}%s${RESET}\n" "$1"; }
+ok()       { printf "    ${GREEN}✓${RESET} %s\n" "$1"; }
+warn()     { printf "    ${YELLOW}!${RESET} %s\n" "$1"; }
+err()      { printf "    ${RED}x${RESET} %s\n" "$1"; }
+info()     { printf "      ${DIM}%s${RESET}\n" "$1"; }
+progress() { printf "    ${GRAY}·${RESET} %s\n" "$1"; }
 
+# header <name> <role>: the title box.
+header() {
+    echo ""
+    if $PLAIN; then
+        printf "  %s - %s\n\n" "$1" "$2"
+        return 0
+    fi
+    printf "  ${GRAY}┏%s┓${RESET}\n" "$HEAVY"
+    printf "  ${GRAY}┃${RESET} ${BOLD}%s${RESET}  ${GRAY}·${RESET}  ${DIM}%s${RESET}%*s ${GRAY}┃${RESET}\n" \
+        "$1" "$2" $(( INNER - 7 - ${#1} - ${#2} )) ""
+    printf "  ${GRAY}┗%s┛${RESET}\n\n" "$HEAVY"
+}
+
+# footer <message>
+footer() {
+    echo ""
+    $PLAIN || printf "  ${GRAY}%s${RESET}\n" "$RULE"
+    printf "  ${GREEN}✓${RESET} ${BOLD}Done.${RESET} %s\n\n" "$1"
+}
+
+# A panel: panel_open, rows with dividers between groups, panel_close. Plain
+# mode prints the same rows unframed, a blank line between groups.
+panel_open()    { $PLAIN || printf "  ${GRAY}┏%s┓${RESET}\n" "$HEAVY"; }
+panel_close()   { $PLAIN || printf "  ${GRAY}┗%s┛${RESET}\n" "$HEAVY"; echo ""; }
+panel_divider() { if $PLAIN; then echo ""; else printf "  ${GRAY}┣%s┫${RESET}\n" "$HEAVY"; fi; }
+# panel_row <label> <text>: the text wraps at word boundaries into the 47
+# columns beside the label, and continuation lines carry no label.
+panel_row() {
+    local label=$1 line="" word
+    local -a words
+    read -r -a words <<<"$2"
+    for word in "${words[@]}"; do
+        if [[ -n $line ]] && (( ${#line} + 1 + ${#word} > 47 )); then
+            _panel_line "$label" "$line"
+            label="" line=$word
+        else
+            line=${line:+$line }$word
+        fi
+    done
+    _panel_line "$label" "$line"
+}
+_panel_line() {
+    if $PLAIN; then
+        printf "  %-7s  %s\n" "$1" "$2"
+    else
+        printf "  ${GRAY}┃${RESET} ${DIM}%-7s${RESET} ${GRAY}│${RESET}  %-47s ${GRAY}┃${RESET}\n" "$1" "$2"
+    fi
+}
+
+# Whether anyone can answer a question. `[ -t 0 ]` is always false under
+# `curl | bash`, and `[ -e /dev/tty ]` is true on CI runners where opening the
+# device fails; only opening it tells.
+has_tty() { ( : </dev/tty ) 2>/dev/null; }
+
+# ask <question>: reads a y/n into $answer from the terminal. With no terminal
+# the answer is empty, which every caller reads as no.
+ask() {
+    answer=""
+    if has_tty; then
+        read -rp "    ${YELLOW}?${RESET} $1 (${GREEN}y${RESET}/${RED}n${RESET}) " answer </dev/tty
+    else
+        printf "    ${YELLOW}?${RESET} %s (y/n) no terminal to answer, so no\n" "$1"
+    fi
+}
+
+header "claude-statusline" "uninstaller"
+
+# --- The popup tools the installer added ---
+# Read before anything is deleted. The record is a hint, not proof: anything
+# running as this user can write it, so only the fixed pairs below are
+# understood, each maps to a fixed command, and nothing from the file ever
+# reaches a command line. Only a regular file this user owns is read.
+_pkg_present() {
+    case $2 in
+        brew) [[ -x $BREW ]] && HOMEBREW_NO_AUTO_UPDATE=1 "$BREW" list --versions "$1" &>/dev/null ;;
+        app) [[ ! -L $TN_APP && -x $TN_APP/Contents/MacOS/terminal-notifier ]] ;;
+        apt) dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'ok installed' ;;
+        dnf | zypper) rpm -q "$1" &>/dev/null ;;
+        pacman) pacman -Q "$1" &>/dev/null ;;
+        apk) apk info -e "$1" &>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+_recorded=()
+if [[ -f $TOOLS_RECORD && ! -L $TOOLS_RECORD && -O $TOOLS_RECORD ]]; then
+    while read -r _t _m _rest; do
+        [[ -z $_rest ]] || continue
+        case "$_t $_m" in
+            "terminal-notifier brew" | "terminal-notifier app" \
+                | "libnotify-bin apt" | "libnotify-tools zypper" \
+                | "libnotify dnf" | "libnotify pacman" | "libnotify apk" \
+                | "xdotool apt" | "xdotool dnf" | "xdotool pacman" | "xdotool zypper" | "xdotool apk" \
+                | "kdotool dnf") ;;
+            *) continue ;;
+        esac
+        [[ " ${_recorded[*]} " == *" $_t $_m "* ]] && continue
+        _pkg_present "$_t" "$_m" && _recorded+=("$_t $_m")
+    done <"$TOOLS_RECORD"
+fi
 # --- settings.json first, while the binary that can edit it still exists ---
 # Order matters: the merge logic lives in the binary, so removing the entries
 # has to happen before removing the tool that removes them. If the binary is
@@ -66,7 +189,7 @@ fi
 
 # Anything an interrupted install left staged, plus the self-check log and
 # quarantined binary a failed install leaves behind for diagnosis.
-rm -f "$BIN_DIR/$STAGE_PREFIX"* \
+rm -rf "$BIN_DIR/$STAGE_PREFIX"* \
     "$BIN_DIR/claude-statusline.self-check.txt" \
     "$BIN_DIR/claude-statusline.failed" 2>/dev/null
 
@@ -120,8 +243,8 @@ echo ""
 
 # --- Notification config and debug log ---
 # Both are removed unconditionally, which is what the script uninstaller did.
-# The uninstaller preserves today's prompts, and today there is none here --
-# adding one would be a UX change smuggled in under a port.
+# The one question this uninstaller asks is about the popup tools below, which
+# the installer, not the user, put on this machine.
 step "Removing notification configuration"
 if [[ -f $NOTIFY_CONFIG_PATH ]]; then
     rm -f "$NOTIFY_CONFIG_PATH" && ok "Deleted $NOTIFY_CONFIG_PATH"
@@ -133,7 +256,161 @@ if [[ -f "$CLAUDE_DIR/statusline-debug.log" ]]; then
     rm -f "$CLAUDE_DIR/statusline-debug.log" && ok "Deleted $CLAUDE_DIR/statusline-debug.log"
 fi
 
-echo ""
-printf "  ${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
-printf "  ${GREEN}${BOLD}Done!${RESET} Restart Claude Code to apply.\n"
-echo ""
+# --- Popup tools ---
+# Offered with one question, and only what the installer recorded and is still
+# here. Homebrew is never removed, and neither is a shared library: on dnf,
+# pacman and apk notify-send ships inside libnotify itself. A package that
+# other installed software depends on is not offered, because apt, dnf and
+# zypper would remove those dependents with it. The package manager shows its
+# own transaction and asks its own confirmation.
+
+# Whether removing the package would remove that package alone.
+_leaf() {
+    case $2 in
+        apt) [[ $(apt-get -s remove "$1" 2>/dev/null | grep -c '^Remv ') == 1 ]] ;;
+        dnf | zypper) ! rpm -q --whatrequires "$1" &>/dev/null ;;
+        pacman) pacman -Qi "$1" 2>/dev/null | grep -q '^Required By *: None' ;;
+        apk) [[ -z $(apk info -r "$1" 2>/dev/null | sed 1d | grep -v '^[[:space:]]*$') ]] ;;
+        *) return 0 ;;
+    esac
+}
+
+# The command that removes a recorded tool, into _cmd, without sudo. `assume`
+# adds the manager's yes flag, which only the override with no terminal passes.
+_removal() {
+    local assume=$3
+    _cmd=()
+    case $2 in
+        brew) _cmd=(env HOMEBREW_NO_AUTO_UPDATE=1 "$BREW" uninstall "$1") ;;
+        apt) _cmd=(apt-get remove ${assume:+-y} "$1") ;;
+        dnf) _cmd=(dnf remove ${assume:+-y} "$1") ;;
+        zypper) _cmd=(zypper ${assume:+--non-interactive} remove "$1") ;;
+        pacman) _cmd=(pacman -R ${assume:+--noconfirm} "$1") ;;
+        apk) _cmd=(apk del "$1") ;;
+    esac
+}
+
+popup_tools_removal() {
+    local entry t m offer=() kept=() override="" go=false tty=false sudo_cached=false sudo_asked=false
+    local first=true added remove s=""
+    _interrupted=false
+    _sudo=()
+    [[ $_me == 0 ]] || s="sudo "
+    echo ""
+    step "Popup tools"
+    printf "\n    The installer added these for notification popups:\n\n"
+    panel_open
+    for entry in "${_recorded[@]}"; do
+        t=${entry% *}
+        m=${entry#* }
+        case $m in
+            brew) added="Homebrew formula $t"; remove="brew uninstall $t. Homebrew itself stays." ;;
+            app) added="The app bundle ~/Applications/terminal-notifier.app"; remove="Deletes that bundle" ;;
+            *) added="The $m package $t"; remove="${s}$( [[ $m == apt ]] && echo apt-get || echo "$m") remove $t, which asks you first" ;;
+        esac
+        if [[ $t == libnotify && $m != apt ]]; then
+            remove="Kept: other software uses this shared library"
+        elif ! _leaf "$t" "$m"; then
+            remove="Kept: other installed software depends on it"
+            kept+=("$entry")
+        else
+            offer+=("$entry")
+        fi
+        $first || panel_divider
+        first=false
+        panel_row "tool" "$t"
+        panel_row "added" "$added"
+        panel_row "remove" "$remove"
+    done
+    panel_close
+
+    if (( ${#offer[@]} > 0 )); then
+        case ${CLAUDE_STATUSLINE_DEPS:-} in
+            yes | no) override=$CLAUDE_STATUSLINE_DEPS ;;
+        esac
+        has_tty && tty=true
+        if [[ -n $override ]]; then
+            progress "CLAUDE_STATUSLINE_DEPS=$override answers this step"
+            [[ $override == yes ]] && go=true
+        else
+            if (( ${#offer[@]} > 1 )); then ask "Remove them too?"; else ask "Remove it too?"; fi
+            if [[ $answer =~ ^[Yy]$ ]]; then go=true; else progress "Kept them"; fi
+        fi
+    fi
+
+    # Trapped rather than ignored, as in install.sh: Ctrl-C stops the child and
+    # skips the rest of this step, never the uninstaller.
+    trap '_interrupted=true' INT
+    for entry in "${offer[@]}"; do
+        $go || break
+        $_interrupted && break
+        t=${entry% *}
+        m=${entry#* }
+        # sudo only for a package manager, and asked for once.
+        if [[ $m != brew && $m != app && $_me != 0 && ${#_sudo[@]} -eq 0 ]]; then
+            if $tty; then
+                sudo -n true 2>/dev/null && sudo_cached=true
+                sudo_asked=true
+                if ! sudo -v </dev/tty || $_interrupted; then
+                    warn "sudo did not grant administrator rights, so nothing was removed"
+                    break
+                fi
+                _sudo=(sudo)
+            else
+                _sudo=(sudo -n)
+            fi
+        fi
+        progress "Removing $t..."
+        if [[ $m == app ]]; then
+            [[ -L $TN_APP ]] || rm -rf "$TN_APP"
+        elif $tty; then
+            # From the terminal: under `curl | bash` stdin is the drained script,
+            # and a manager reading its own confirmation from it would cancel.
+            _removal "$t" "$m" ""
+            "${_sudo[@]}" "${_cmd[@]}" </dev/tty
+        else
+            _removal "$t" "$m" yes
+            "${_sudo[@]}" "${_cmd[@]}" </dev/null
+        fi
+        if _pkg_present "$t" "$m"; then
+            err "$t was kept"
+        else
+            ok "$t removed"
+        fi
+    done
+    if $sudo_asked && ! $sudo_cached; then
+        sudo -k 2>/dev/null
+    fi
+    trap - INT
+
+    # Everything offered and not removed, and everything kept for its
+    # dependents, gets its command, so the choice stays the user's.
+    for entry in "${offer[@]}"; do
+        _pkg_present "${entry% *}" "${entry#* }" && [[ " ${kept[*]} " != *" $entry "* ]] && kept+=("$entry")
+    done
+    if (( ${#kept[@]} > 0 )); then
+        echo ""
+        progress "To remove by hand:"
+        echo ""
+        for entry in "${kept[@]}"; do
+            case ${entry#* } in
+                app) printf '        %s\n' "rm -rf ~/Applications/terminal-notifier.app" ;;
+                brew) printf '        %s\n' "brew uninstall ${entry% *}" ;;
+                *)
+                    _removal "${entry% *}" "${entry#* }" ""
+                    printf '        %s%s\n' "$s" "${_cmd[*]}"
+                    ;;
+            esac
+        done
+    fi
+}
+
+if (( ${#_recorded[@]} > 0 )); then
+    popup_tools_removal
+fi
+# The record goes whatever the answer, when it is ours to delete.
+if [[ -f $TOOLS_RECORD && ! -L $TOOLS_RECORD && -O $TOOLS_RECORD ]]; then
+    rm -f "$TOOLS_RECORD"
+fi
+footer "Restart Claude Code to apply."
+}

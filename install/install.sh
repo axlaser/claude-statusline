@@ -11,6 +11,11 @@
 # and exits only when that fails, i.e. when running as a subshell. Every abort
 # below uses it, and every one of them lives at top level: `return` inside a
 # function would unwind the function and carry on.
+#
+# The whole script is one brace group, closed on the last line. Bash parses a
+# group completely before running any of it, so the published pipe cannot cut
+# the script short when Ctrl-C at a password prompt also stops curl.
+{
 
 REPO_SLUG="axlaser/claude-statusline"
 SIGNER_WORKFLOW="$REPO_SLUG/.github/workflows/release.yml"
@@ -26,21 +31,105 @@ NOTIFY_CONFIG_PATH="$CLAUDE_DIR/notify-config.json"
 ICON_PATH="$CLAUDE_DIR/claude-icon.png"
 STAGE_PREFIX=".claude-statusline.stage."
 
-# --- Colors & output helpers ---
-RESET=$'\033[0m'
-BOLD=$'\033[1m'
-DIM=$'\033[2m'
-CYAN=$'\033[36m'
-GREEN=$'\033[32m'
-YELLOW=$'\033[33m'
-RED=$'\033[31m'
-GRAY=$'\033[90m'
+# --- Output ---
+# Drawn like the status line itself (src/render.rs, `assemble`): a heavy gray
+# frame, dim seven-wide labels and the status line's glyphs. Decided once,
+# before the first line: plain text with no colour and no frame when stdout is
+# not a terminal, NO_COLOR is set (https://no-color.org) or TERM is dumb, so a
+# log keeps every message on one line a grep can find.
+if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-} != dumb ]]; then
+    PLAIN=false
+    RESET=$'\033[0m'
+    BOLD=$'\033[1m'
+    DIM=$'\033[2m'
+    CYAN=$'\033[36m'
+    GREEN=$'\033[32m'
+    YELLOW=$'\033[33m'
+    RED=$'\033[31m'
+    GRAY=$'\033[90m'
+else
+    PLAIN=true
+    RESET="" BOLD="" DIM="" CYAN="" GREEN="" YELLOW="" RED="" GRAY=""
+fi
+# The frame's inner width. Everything drawn inside it is ASCII, so ${#s} counts
+# columns under any locale, and every line stays within 72.
+INNER=60
+_rule=$(printf '%*s' "$INNER" '')
+HEAVY=${_rule// /━}
+_rule=$(printf '%*s' 42 '')
+RULE=${_rule// /━}
 
-step() { printf "  ${CYAN}${BOLD}>>>${RESET} %s\n" "$1"; }
-ok()   { printf "  ${GREEN}${BOLD} +${RESET} %s\n" "$1"; }
-warn() { printf "  ${YELLOW}${BOLD} !${RESET} %s\n" "$1"; }
-err()  { printf "  ${RED}${BOLD} x${RESET} %s\n" "$1"; }
-info() { printf "  ${DIM}   %s${RESET}\n" "$1"; }
+step()     { printf "  ${CYAN}●${RESET} ${BOLD}%s${RESET}\n" "$1"; }
+ok()       { printf "    ${GREEN}✓${RESET} %s\n" "$1"; }
+warn()     { printf "    ${YELLOW}!${RESET} %s\n" "$1"; }
+err()      { printf "    ${RED}x${RESET} %s\n" "$1"; }
+info()     { printf "      ${DIM}%s${RESET}\n" "$1"; }
+progress() { printf "    ${GRAY}·${RESET} %s\n" "$1"; }
+
+# header <name> <role>: the title box.
+header() {
+    echo ""
+    if $PLAIN; then
+        printf "  %s - %s\n\n" "$1" "$2"
+        return 0
+    fi
+    printf "  ${GRAY}┏%s┓${RESET}\n" "$HEAVY"
+    printf "  ${GRAY}┃${RESET} ${BOLD}%s${RESET}  ${GRAY}·${RESET}  ${DIM}%s${RESET}%*s ${GRAY}┃${RESET}\n" \
+        "$1" "$2" $(( INNER - 7 - ${#1} - ${#2} )) ""
+    printf "  ${GRAY}┗%s┛${RESET}\n\n" "$HEAVY"
+}
+
+# footer <message>
+footer() {
+    echo ""
+    $PLAIN || printf "  ${GRAY}%s${RESET}\n" "$RULE"
+    printf "  ${GREEN}✓${RESET} ${BOLD}Done.${RESET} %s\n\n" "$1"
+}
+
+# A panel: panel_open, rows with dividers between groups, panel_close. Plain
+# mode prints the same rows unframed, a blank line between groups.
+panel_open()    { $PLAIN || printf "  ${GRAY}┏%s┓${RESET}\n" "$HEAVY"; }
+panel_close()   { $PLAIN || printf "  ${GRAY}┗%s┛${RESET}\n" "$HEAVY"; echo ""; }
+panel_divider() { if $PLAIN; then echo ""; else printf "  ${GRAY}┣%s┫${RESET}\n" "$HEAVY"; fi; }
+# panel_row <label> <text>: the text wraps at word boundaries into the 47
+# columns beside the label, and continuation lines carry no label.
+panel_row() {
+    local label=$1 line="" word
+    local -a words
+    read -r -a words <<<"$2"
+    for word in "${words[@]}"; do
+        if [[ -n $line ]] && (( ${#line} + 1 + ${#word} > 47 )); then
+            _panel_line "$label" "$line"
+            label="" line=$word
+        else
+            line=${line:+$line }$word
+        fi
+    done
+    _panel_line "$label" "$line"
+}
+_panel_line() {
+    if $PLAIN; then
+        printf "  %-7s  %s\n" "$1" "$2"
+    else
+        printf "  ${GRAY}┃${RESET} ${DIM}%-7s${RESET} ${GRAY}│${RESET}  %-47s ${GRAY}┃${RESET}\n" "$1" "$2"
+    fi
+}
+
+# Whether anyone can answer a question. `[ -t 0 ]` is always false under
+# `curl | bash`, and `[ -e /dev/tty ]` is true on CI runners where opening the
+# device fails; only opening it tells.
+has_tty() { ( : </dev/tty ) 2>/dev/null; }
+
+# ask <question>: reads a y/n into $answer from the terminal. With no terminal
+# the answer is empty, which every caller reads as no.
+ask() {
+    answer=""
+    if has_tty; then
+        read -rp "    ${YELLOW}?${RESET} $1 (${GREEN}y${RESET}/${RED}n${RESET}) " answer </dev/tty
+    else
+        printf "    ${YELLOW}?${RESET} %s (y/n) no terminal to answer, so no\n" "$1"
+    fi
+}
 
 file_bytes() { wc -c < "$1" | tr -d ' '; }
 human_size() {
@@ -139,10 +228,7 @@ for _arg in "$@"; do
 done
 
 # --- Header ---
-echo ""
-printf "\n  ${DIM}claude-statusline installer${RESET}\n"
-printf "  ${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
-echo ""
+header "claude-statusline" "installer"
 
 # --- Platform detection ---
 # First, and before anything is created, removed, or written: an unsupported
@@ -342,8 +428,9 @@ if [[ ! -e $BIN_PATH ]]; then
         break
     done
 fi
-# Sweep anything a previous interrupted run left behind before adding one.
-rm -f "$BIN_DIR/$STAGE_PREFIX"* 2>/dev/null
+# Sweep anything a previous interrupted run left behind before adding one,
+# including the directory the popup tools step unpacks into.
+rm -rf "$BIN_DIR/$STAGE_PREFIX"* 2>/dev/null
 
 # Staged inside the destination directory, never in a shared world-writable
 # temp: /tmp staging would let another user swap the file between verification
@@ -538,7 +625,7 @@ _apply_flags=()
 
 if "$BIN_PATH" settings has-foreign --binary "$BIN_PATH" statusline &>/dev/null; then
     echo ""
-    read -rp "  ${YELLOW}${BOLD} ?${RESET} Existing statusLine config found. Overwrite? (${GREEN}y${RESET}/${RED}n${RESET}) " answer </dev/tty
+    ask "Existing statusLine config found. Overwrite?"
     if [[ "$answer" =~ ^[Yy]$ ]]; then
         _apply_flags+=(--statusline)
     else
@@ -552,7 +639,7 @@ fi
 
 if "$BIN_PATH" settings has-foreign --binary "$BIN_PATH" subagent &>/dev/null; then
     echo ""
-    read -rp "  ${YELLOW}${BOLD} ?${RESET} Existing subagentStatusLine config found. Overwrite? (${GREEN}y${RESET}/${RED}n${RESET}) " answer </dev/tty
+    ask "Existing subagentStatusLine config found. Overwrite?"
     [[ "$answer" =~ ^[Yy]$ ]] && _apply_flags+=(--subagent) || warn "Skipped subagentStatusLine update"
     echo ""
 else
@@ -597,7 +684,7 @@ if "$BIN_PATH" settings has --binary "$BIN_PATH" notify &>/dev/null \
     _apply_flags+=(--notify)
 else
     echo ""
-    read -rp "  ${YELLOW}${BOLD} ?${RESET} Enable notifications? (${GREEN}y${RESET}/${RED}n${RESET}) " answer </dev/tty
+    ask "Enable notifications?"
     if [[ "$answer" =~ ^[Yy]$ ]]; then
         _apply_flags+=(--notify)
     else
@@ -657,8 +744,454 @@ if (( ${#_legacy_found[@]} > 0 )); then
     info "Your notification settings were kept."
 fi
 
+# --- Popup tools ---
+# Popups need a third-party tool: terminal-notifier on macOS, and on Linux
+# notify-send plus the helper that brings the terminal forward when a popup is
+# clicked. This step finds which are missing the way the binary looks for them
+# at runtime, explains each one, and installs them with one yes, recording what
+# it installed for the uninstaller. It runs last, once settings.json and the
+# legacy scripts are settled, so a declined password, a held package lock or
+# Ctrl-C costs only this step. It never stops the installer: whatever it does
+# not install, it prints the commands for.
+TOOLS_RECORD="$CLAUDE_DIR/statusline-installed-tools.txt"
+TN_VERSION="3.1.0"
+TN_URL="https://github.com/julienXX/terminal-notifier/releases/download/$TN_VERSION/terminal-notifier-$TN_VERSION.zip"
+# Checked against the release asset on 2026-09-28. The archive holds
+# terminal-notifier.app and a README beside it.
+TN_SHA256="e969d4ae20287da1ba55495ae31dcedd8e9069deb8ce4eed24f6561a5fc3e4d5"
+TN_APP="$HOME/Applications/terminal-notifier.app"
+BREW=/opt/homebrew/bin/brew
+
+# Owner and mode through a symlink: the runtime resolves links before its
+# ownership guard (platform::trusted_tool), so this asks about the same file.
+_stat_owner_l() {
+    case $_STAT_DIALECT in
+        gnu) stat -L -c %u "$1" 2>/dev/null ;;
+        bsd) stat -L -f %u "$1" 2>/dev/null ;;
+    esac
+}
+_stat_mode_l() {
+    case $_STAT_DIALECT in
+        gnu) stat -L -c %a "$1" 2>/dev/null ;;
+        bsd) stat -L -f %Lp "$1" 2>/dev/null ;;
+    esac
+}
+
+# Whether the runtime would run the tool found at this fixed location: an
+# executable owned by this user or root that nobody else can write.
+_trusted_at() {
+    local o m
+    [[ -f $1 && -x $1 ]] || return 1
+    o=$(_stat_owner_l "$1")
+    m=$(_stat_mode_l "$1")
+    [[ $o =~ ^[0-9]+$ && $m =~ ^[0-7]+$ ]] || return 1
+    [[ $o == "$_me" || $o == 0 ]] && (( (8#$m & 8#022) == 0 ))
+}
+
+# Where the binary finds terminal-notifier: PATH, then the fixed locations in
+# src/platform/notify.rs. Sets _tn_path to what it found.
+_tn_present() {
+    _tn_path=$(command -v terminal-notifier 2>/dev/null) && return 0
+    for _tn_path in "$TN_APP/Contents/MacOS/terminal-notifier" \
+        /Applications/terminal-notifier.app/Contents/MacOS/terminal-notifier \
+        /opt/homebrew/bin/terminal-notifier \
+        /usr/local/bin/terminal-notifier \
+        /opt/local/bin/terminal-notifier; do
+        _trusted_at "$_tn_path" && return 0
+    done
+    _tn_path=""
+    return 1
+}
+
+# Where the click handler finds a Linux tool: the candidate directories in
+# src/platform/focus.rs, then PATH. notify-send is looked up on PATH alone.
+_linux_tool_present() {
+    local d
+    [[ $1 == notify-send ]] && { command -v notify-send >/dev/null 2>&1; return; }
+    for d in /usr/bin /usr/local/bin /bin "$HOME/.local/bin" "$HOME/.cargo/bin" /snap/bin; do
+        _trusted_at "$d/$1" && return 0
+    done
+    command -v "$1" >/dev/null 2>&1
+}
+
+# The last line a failed command printed, made safe to show.
+_last_line() {
+    printf '%s\n' "$1" | grep -v '^[[:space:]]*$' | tail -n 1 | LC_ALL=C tr -cd '[:print:]' | cut -c 1-160
+}
+
+# Appends "<tool> <method>" to the record the uninstaller reads, once. Only
+# through a regular file this user owns: anything else is left alone.
+_record() {
+    if [[ -e $TOOLS_RECORD || -L $TOOLS_RECORD ]]; then
+        [[ -f $TOOLS_RECORD && ! -L $TOOLS_RECORD && -O $TOOLS_RECORD ]] || return 0
+        grep -qxF "$1 $2" "$TOOLS_RECORD" 2>/dev/null && return 0
+    fi
+    printf '%s %s\n' "$1" "$2" >>"$TOOLS_RECORD"
+}
+
+# Prints commands below the frame, indented and without a glyph, so they copy
+# cleanly.
+_print_commands() {
+    local line
+    echo ""
+    progress "To install by hand:"
+    echo ""
+    for line in "$@"; do
+        printf '        %s\n' "$line"
+    done
+}
+
+# The macOS route, picked from the machine rather than asked: Homebrew when it
+# is already here on Apple Silicon and belongs to this user, otherwise the
+# official release unpacked into ~/Applications, which is also the fallback
+# when brew fails, since the user has already said yes. Neither needs a
+# password, and Homebrew is never installed. Sets _tn_method on success.
+_tn_install() {
+    local zip="$BIN_DIR/${STAGE_PREFIX}$$.tn.zip" dir="$BIN_DIR/${STAGE_PREFIX}$$.tn" sum
+    if [[ $(uname -m) == arm64 && $_me != 0 && -x $BREW && $(_stat_owner "$BREW") == "$_me" ]]; then
+        progress "Installing terminal-notifier with Homebrew..."
+        if _pm_out=$(HOMEBREW_NO_AUTO_UPDATE=1 "$BREW" install terminal-notifier </dev/null 2>&1) && _tn_present; then
+            _tn_method=brew
+            return 0
+        fi
+        warn "Homebrew could not install it: $(_last_line "$_pm_out")"
+        info "Using the official release instead."
+    fi
+    progress "Downloading terminal-notifier $TN_VERSION..."
+    rm -rf "$zip" "$dir"
+    if ! curl -fsSL "$TN_URL" -o "$zip"; then
+        _pm_out="the download failed: $TN_URL"
+        rm -f "$zip"
+        return 1
+    fi
+    if command -v shasum &>/dev/null; then
+        sum=$(shasum -a 256 "$zip" 2>/dev/null | awk '{print $1}')
+    else
+        sum=$(sha256sum "$zip" 2>/dev/null | awk '{print $1}')
+    fi
+    if [[ $sum != "$TN_SHA256" ]]; then
+        _pm_out="the download did not match its pinned checksum"
+        rm -f "$zip"
+        return 1
+    fi
+    # Unpacked beside the zip first, so only the app reaches ~/Applications
+    # and a symlink planted at its destination is refused rather than followed.
+    if ! (umask 022 && mkdir "$dir" && ditto -x -k "$zip" "$dir") 2>/dev/null \
+        || [[ -L $dir/terminal-notifier.app || ! -f $dir/terminal-notifier.app/Contents/MacOS/terminal-notifier ]]; then
+        _pm_out="the archive did not unpack to terminal-notifier.app"
+        rm -rf "$zip" "$dir"
+        return 1
+    fi
+    if [[ -L $TN_APP || -L $HOME/Applications ]]; then
+        _pm_out="$TN_APP or its folder is a symlink, so nothing was placed there"
+        rm -rf "$zip" "$dir"
+        return 1
+    fi
+    # A bundle already here is one the lookup refused: its executable missing
+    # after an interrupted unpack, or writable by someone else. Replaced whole.
+    (umask 022 && mkdir -p "$HOME/Applications") 2>/dev/null
+    [[ -e $TN_APP ]] && rm -rf "$TN_APP"
+    if ! mv "$dir/terminal-notifier.app" "$TN_APP" 2>/dev/null; then
+        _pm_out="could not move it into $HOME/Applications"
+        rm -rf "$zip" "$dir"
+        return 1
+    fi
+    rm -rf "$zip" "$dir"
+    _tn_present || { _pm_out="it was placed but is not usable"; return 1; }
+    _tn_method=app
+}
+
+# Runs one package manager command with a readable umask and no stdin, as root
+# or through sudo, keeping its output for the error line. The manager goes to
+# sudo by bare name, so sudo's secure_path resolves it rather than PATH.
+_pm_run() {
+    _pm_out=$( (umask 022 && "${_sudo[@]}" "$@" </dev/null) 2>&1 )
+}
+
+# One package per transaction, so a click helper the repositories lack never
+# costs the popup itself. Branches on status codes only: sudo-rs and the
+# managers word their messages differently from release to release.
+_pkg_install() {
+    case $_pm in
+        apt-get) _pm_run env DEBIAN_FRONTEND=noninteractive apt-get -qq -o DPkg::Lock::Timeout=60 install -y "$1" ;;
+        dnf)     _pm_run dnf install -y "$1" ;;
+        pacman)  _pm_run pacman -S --needed --noconfirm "$1" ;;
+        zypper)  _pm_run zypper --non-interactive install "$1" ;;
+        apk)     _pm_run apk add "$1" ;;
+    esac
+}
+
+# The package that provides a Linux tool under this package manager.
+_pkg_name() {
+    case $1:$_pm in
+        notify-send:apt-get) echo libnotify-bin ;;
+        notify-send:zypper)  echo libnotify-tools ;;
+        notify-send:*)       echo libnotify ;;
+        *)                   echo "$1" ;;
+    esac
+}
+
+# Whether this installer can put the tool in place on this machine. kdotool is
+# packaged only on Fedora; image-based systems and WSL get instructions.
+_installable() {
+    [[ $_kernel == Darwin ]] && return 0
+    [[ -n $_pm && -z $_image ]] || return 1
+    [[ $1 != kdotool || ( $_pm == dnf && $_os_id == fedora ) ]] || return 1
+    [[ $_me == 0 ]] || command -v sudo &>/dev/null
+}
+
+_present() {
+    if [[ $_kernel == Darwin ]]; then _tn_present; else _linux_tool_present "$1"; fi
+}
+
+# The commands that install the given tools by hand, into _cmds.
+_commands_for() {
+    local t s="" pkgs=()
+    _cmds=()
+    [[ $_me == 0 ]] || s="sudo "
+    for t in "$@"; do
+        case $t in
+            terminal-notifier)
+                if [[ -x $BREW ]]; then
+                    _cmds+=("brew install terminal-notifier")
+                else
+                    _cmds+=("curl -fsSLO $TN_URL"
+                        "shasum -a 256 terminal-notifier-$TN_VERSION.zip  # expect $TN_SHA256"
+                        "mkdir -p ~/Applications && unzip -q terminal-notifier-$TN_VERSION.zip 'terminal-notifier.app/*' -d ~/Applications")
+                fi
+                ;;
+            kdotool)
+                if [[ $_pm == dnf && $_os_id == fedora ]]; then pkgs+=(kdotool); else _cmds+=("cargo install kdotool"); fi
+                ;;
+            *) pkgs+=("$(_pkg_name "$t")") ;;
+        esac
+    done
+    (( ${#pkgs[@]} > 0 )) || return 0
+    case $_image:$_pm in
+        rpm-ostree:*) _cmds+=("${s}rpm-ostree install ${pkgs[*]}") ;;
+        nixos:*|steamos:*) _cmds+=("# add through this system's own configuration: ${pkgs[*]}") ;;
+        *:apt-get)    _cmds+=("${s}apt-get install ${pkgs[*]}") ;;
+        *:dnf)        _cmds+=("${s}dnf install ${pkgs[*]}") ;;
+        *:pacman)     _cmds+=("${s}pacman -Syu --needed ${pkgs[*]}") ;;
+        *:zypper)     _cmds+=("${s}zypper install ${pkgs[*]}") ;;
+        *:apk)        _cmds+=("${s}apk add ${pkgs[*]}") ;;
+        *)            _cmds+=("# with your package manager: ${pkgs[*]}") ;;
+    esac
+}
+
+popup_tools_offer() {
+    local tools=() installable=() left=() tool pkg what why how link first=true
+    local override="" go=false sudo_cached=false sudo_asked=false pm_name updated=false method
+    local desktop=true kde=false
+    _popup_missing=false
+    _interrupted=false
+    echo ""
+    step "Popup tools"
+    # A binary older than this installer finds terminal-notifier only on PATH,
+    # so a tool placed elsewhere would install and still show nothing.
+    if ! "$BIN_PATH" settings supports popup-tools &>/dev/null; then
+        info "This release cannot use installed popup tools yet, so none were checked."
+        return 0
+    fi
+
+    _kernel=$(uname -s)
+    _pm="" _os_id="" _image=""
+    if [[ $_kernel == Darwin ]]; then
+        _tn_present || tools=(terminal-notifier)
+    else
+        case ":${XDG_CURRENT_DESKTOP:-}:" in
+            *[Kk][Dd][Ee]*) kde=true ;;
+        esac
+        [[ -z ${DISPLAY:-} && -z ${WAYLAND_DISPLAY:-} ]] && desktop=false
+        _linux_tool_present notify-send || tools+=(notify-send)
+        # The click rule in src/cmd/focus.rs: Wayland raises windows only on
+        # KDE, through kdotool; anything else is X11, where wmctrl will do in
+        # place of xdotool.
+        if [[ ${XDG_SESSION_TYPE:-} == wayland ]]; then
+            if $kde && ! _linux_tool_present kdotool; then tools+=(kdotool); fi
+        elif ! _linux_tool_present xdotool && ! _linux_tool_present wmctrl; then
+            tools+=(xdotool)
+        fi
+        for method in apt-get dnf pacman zypper apk; do
+            command -v "$method" &>/dev/null && { _pm=$method; break; }
+        done
+        _os_id=$( (. /etc/os-release && printf '%s' "${ID:-}") 2>/dev/null)
+        if [[ -e /run/ostree-booted ]]; then
+            _image=rpm-ostree
+        elif [[ $_os_id == nixos || $_os_id == steamos ]]; then
+            _image=$_os_id
+        elif uname -r 2>/dev/null | grep -qi microsoft; then
+            _image=wsl
+        fi
+    fi
+
+    if (( ${#tools[@]} == 0 )); then
+        ok "Everything popups need is installed"
+        return 0
+    fi
+
+    if (( ${#tools[@]} == 1 )); then
+        printf "\n    Popups need a tool that is not installed yet:\n\n"
+    else
+        printf "\n    Popups need %d tools that are not installed yet:\n\n" "${#tools[@]}"
+    fi
+    pm_name=${_pm%-get}
+    panel_open
+    for tool in "${tools[@]}"; do
+        pkg=$(_pkg_name "$tool")
+        why="Without it, notifications are sound only"
+        case $tool in
+            terminal-notifier)
+                what="Shows macOS notification popups for Claude Code events"
+                if [[ $(uname -m) == arm64 && $_me != 0 && -x $BREW && $(_stat_owner "$BREW") == "$_me" ]]; then
+                    how="Homebrew: brew install terminal-notifier. No password needed."
+                else
+                    how="Its official $TN_VERSION release from GitHub, 400 KB, checksum-checked, unpacked into ~/Applications. No password needed."
+                fi
+                link="https://github.com/julienXX/terminal-notifier"
+                ;;
+            notify-send)
+                what="Shows desktop notification popups for Claude Code events"
+                how="The $pm_name package $pkg"
+                link="https://gitlab.gnome.org/GNOME/libnotify"
+                ;;
+            xdotool)
+                what="Brings your terminal forward when you click a popup"
+                why="Without it, a click only dismisses the popup"
+                how="The $pm_name package xdotool"
+                link="https://github.com/jordansissel/xdotool"
+                ;;
+            kdotool)
+                what="Brings your terminal forward when you click a popup on KDE Wayland"
+                why="Without it, a click only dismisses the popup"
+                how="The dnf package kdotool"
+                link="https://github.com/jinliu/kdotool"
+                ;;
+        esac
+        if _installable "$tool"; then
+            installable+=("$tool")
+        elif [[ $tool == kdotool ]]; then
+            how="Not packaged here: cargo install kdotool, or the AUR package on Arch"
+        else
+            how="Not installed automatically on this system; the commands follow"
+        fi
+        $first || panel_divider
+        first=false
+        panel_row "tool" "$tool"
+        panel_row "what" "$what"
+        panel_row "why" "$why"
+        panel_row "how" "$how"
+        panel_row "link" "$link"
+    done
+    panel_close
+
+    case ${CLAUDE_STATUSLINE_DEPS:-} in
+        yes | no) override=$CLAUDE_STATUSLINE_DEPS ;;
+    esac
+    if (( ${#installable[@]} > 0 )) && [[ $_kernel != Darwin ]] && ! $desktop && [[ $override != yes ]]; then
+        # Over SSH, or on a server: popups appear only inside a desktop
+        # session, so installing here would change the machine for nothing.
+        info "Popups appear only when Claude Code runs in a desktop session, and this"
+        info "shell has none (no DISPLAY or WAYLAND_DISPLAY), so nothing was installed."
+    elif (( ${#installable[@]} > 0 )); then
+        if [[ $_kernel != Darwin && $_me != 0 ]]; then
+            warn "Installing packages needs administrator rights, so sudo may ask for"
+            info "your password. Nothing else on the system is changed."
+            echo ""
+        fi
+        # The override answers in advance, and says so, so a forgotten export
+        # shows in the log. Anything but exactly yes or no counts as unset.
+        if [[ -n $override ]]; then
+            progress "CLAUDE_STATUSLINE_DEPS=$override answers this step"
+            [[ $override == yes ]] && go=true
+        else
+            if (( ${#installable[@]} > 1 )); then ask "Install them now?"; else ask "Install it now?"; fi
+            if [[ $answer =~ ^[Yy]$ ]]; then go=true; else progress "Skipped"; fi
+        fi
+    fi
+
+    # Trapped rather than ignored, so a child such as sudo still dies on Ctrl-C
+    # while the installer carries on without this step.
+    trap '_interrupted=true' INT
+    _sudo=()
+    if $go && [[ $_kernel != Darwin && $_me != 0 ]]; then
+        if has_tty; then
+            # Noted without prompting, so only a credential this step creates
+            # is dropped afterwards.
+            sudo -n true 2>/dev/null && sudo_cached=true
+            sudo_asked=true
+            if sudo -v </dev/tty && ! $_interrupted; then
+                _sudo=(sudo)
+            else
+                go=false
+                warn "sudo did not grant administrator rights, so nothing was installed"
+            fi
+        else
+            # No terminal, only the override: sudo may run, but never ask.
+            _sudo=(sudo -n)
+        fi
+    fi
+
+    if $go; then
+        for tool in "${installable[@]}"; do
+            $_interrupted && break
+            _pm_out=""
+            method=""
+            if [[ $_kernel == Darwin ]]; then
+                _tn_install && method=$_tn_method
+                pkg=terminal-notifier
+            else
+                pkg=$(_pkg_name "$tool")
+                progress "Installing $tool..."
+                if [[ $_pm == apt-get && $updated == false ]]; then
+                    _pm_run apt-get -qq -o DPkg::Lock::Timeout=60 update
+                    updated=true
+                fi
+                _pkg_install "$pkg" && method=$pm_name
+            fi
+            # Recorded when it was missing before and the runtime's own lookup
+            # finds it now, whatever the installer's status said.
+            if [[ -n $method ]] && _present "$tool"; then
+                ok "$tool installed"
+                _record "$pkg" "$method"
+            else
+                err "$tool was not installed"
+                [[ -n $_pm_out ]] && info "$(_last_line "$_pm_out")"
+            fi
+        done
+    fi
+    # On every path, success, failure and Ctrl-C alike, so the terminal is not
+    # left with passwordless root it did not have before.
+    if $sudo_asked && ! $sudo_cached; then
+        sudo -k 2>/dev/null
+    fi
+    trap - INT
+
+    for tool in "${tools[@]}"; do
+        _present "$tool" || left+=("$tool")
+    done
+    if (( ${#left[@]} > 0 )); then
+        _popup_missing=true
+        $_interrupted && warn "Interrupted, so the rest were not installed"
+        _commands_for "${left[@]}"
+        _print_commands "${_cmds[@]}"
+    elif [[ $_kernel == Darwin && -n ${_tn_path:-} && -z ${SSH_CONNECTION:-} ]] && has_tty; then
+        # macOS asks once whether terminal-notifier may notify. A test now puts
+        # that question in front of the user while they are watching.
+        "$_tn_path" -title "Claude Code" -message "Popups are on. This is a test." >/dev/null 2>&1 &
+        info "macOS may ask whether terminal-notifier can send notifications: click Allow."
+        info "Missed it? Allow it in System Settings > Notifications > terminal-notifier."
+    fi
+}
+
+if [[ " ${_apply_flags[*]} " == *" --notify "* ]]; then
+    popup_tools_offer
+fi
+
 # --- Done ---
-echo ""
-printf "  ${GRAY}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
-printf "  ${GREEN}${BOLD}Done!${RESET} Restart Claude Code to activate.\n"
-echo ""
+if [[ ${_popup_missing:-false} == true ]]; then
+    echo ""
+    warn "Popups stay off until the tools above are installed."
+fi
+footer "Restart Claude Code to turn it on."
+}

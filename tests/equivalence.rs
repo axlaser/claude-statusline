@@ -3748,7 +3748,13 @@ fn the_self_check_gates_every_destructive_step() {
         Gate {
             rel: "install/install.sh",
             check: "\"$BIN_PATH\" self-check",
-            after: &["rm -f \"$CLAUDE_DIR/$_script\"", "settings apply --binary"],
+            after: &[
+                "rm -f \"$CLAUDE_DIR/$_script\"",
+                "settings apply --binary",
+                // The popup tools step's call site, which may run sudo and a
+                // package manager: behind the gate like everything else.
+                "\n    popup_tools_offer\n",
+            ],
         },
         Gate {
             rel: "install/install.ps1",
@@ -3791,6 +3797,161 @@ fn the_self_check_gates_every_destructive_step() {
         }
     }
     failures.assert_empty("self-check gating");
+}
+
+/// Every installer decides once whether to draw: plain text when output is not
+/// a terminal or NO_COLOR is set, so CI logs stay greppable and NO_COLOR is
+/// honoured.
+#[test]
+fn installer_output_falls_back_to_plain_text() {
+    let mut failures = Failures::default();
+    for rel in INSTALL_SH {
+        let body = read_repo_file(rel);
+        failures.check(
+            rel,
+            body.contains("if [[ -t 1 && -z ${NO_COLOR:-} && ${TERM:-} != dumb ]]"),
+            || "does not decide plain mode from a terminal check, NO_COLOR and TERM".to_string(),
+        );
+    }
+    for rel in INSTALL_PS1 {
+        let body = read_repo_file(rel);
+        failures.check(
+            rel,
+            body.contains("$plain = [Console]::IsOutputRedirected -or [bool]$env:NO_COLOR"),
+            || "does not decide plain mode from redirection and NO_COLOR".to_string(),
+        );
+    }
+    failures.assert_empty("plain output");
+}
+
+/// The popup tools step and its removal. Consent comes before anything
+/// privileged, a credential the step created is dropped at its end, the
+/// override is exact and announced, the download is pinned, and nothing read
+/// from the record ever reaches a command line.
+#[test]
+fn the_popup_tools_steps_ask_before_anything_privileged() {
+    let mut failures = Failures::default();
+    let sh = read_repo_file("install/install.sh");
+    let un = read_repo_file("install/uninstall.sh");
+
+    for (rel, body) in [("install/install.sh", &sh), ("install/uninstall.sh", &un)] {
+        let lines: Vec<(usize, &str)> = code_lines(body, '#').collect();
+        let probe = lines.iter().find(|(_, l)| l.contains("( : </dev/tty )"));
+        // A line that runs sudo: `sudo -n`, `sudo -v`, or a command behind
+        // the `_sudo` prefix. `sudo -k` is the drop itself.
+        let sudo: Vec<usize> = lines
+            .iter()
+            .filter(|(_, l)| {
+                (l.contains("sudo -") || l.contains("\"${_sudo[@]}\"")) && !l.contains("sudo -k")
+            })
+            .map(|(n, _)| *n)
+            .collect();
+        let forget = lines.iter().rev().find(|(_, l)| l.contains("sudo -k"));
+        match (probe, sudo.first(), sudo.last(), forget) {
+            (Some((p, _)), Some(first), Some(last), Some((k, _))) => {
+                failures.check(rel, p < first, || {
+                    "the terminal probe comes after sudo".to_string()
+                });
+                failures.check(rel, last < k, || {
+                    "sudo runs after the credential is dropped".to_string()
+                });
+            }
+            _ => failures.check(rel, false, || {
+                "the probe, sudo or sudo -k is missing".to_string()
+            }),
+        }
+        failures.check(
+            rel,
+            body.contains("        yes | no) override=$CLAUDE_STATUSLINE_DEPS ;;"),
+            || "the override must take exactly yes or no".to_string(),
+        );
+        failures.check(
+            rel,
+            body.contains("progress \"CLAUDE_STATUSLINE_DEPS=$override answers this step\""),
+            || "an answering override must say so in the log".to_string(),
+        );
+        failures.check(
+            rel,
+            body.contains("trap '_interrupted=true' INT") && body.contains("trap - INT"),
+            || "Ctrl-C at the password prompt must skip only the step".to_string(),
+        );
+        for (n, line) in code_lines(body, '#') {
+            failures.check(
+                &format!("{rel}:{n}"),
+                !line.contains("eval ") && !line.contains("sh -c"),
+                || format!("nothing may evaluate text at runtime: {line}"),
+            );
+        }
+        failures.check(
+            rel,
+            body.contains("[[ -f $TOOLS_RECORD && ! -L $TOOLS_RECORD && -O $TOOLS_RECORD ]]"),
+            || "the record must be a regular file this user owns".to_string(),
+        );
+    }
+
+    failures.check("install.sh", sh.contains("TN_VERSION=\"3.1.0\""), || {
+        "unpinned version".to_string()
+    });
+    failures.check(
+        "install.sh",
+        sh.contains(
+            "TN_SHA256=\"e969d4ae20287da1ba55495ae31dcedd8e9069deb8ce4eed24f6561a5fc3e4d5\"",
+        ) && sh.contains("[[ $sum != \"$TN_SHA256\" ]]"),
+        || "the terminal-notifier download is not checked against its pinned hash".to_string(),
+    );
+    failures.check(
+        "install.sh",
+        sh.contains("releases/download/$TN_VERSION/terminal-notifier-$TN_VERSION.zip"),
+        || "the download is not the official release asset".to_string(),
+    );
+    failures.check(
+        "install.sh",
+        sh.contains("if ! \"$BIN_PATH\" settings supports popup-tools &>/dev/null; then"),
+        || "the step must ask the placed binary before installing anything".to_string(),
+    );
+    // Homebrew is used, never installed or removed.
+    for body in [&sh, &un] {
+        failures.check(
+            "homebrew",
+            !body.contains("Homebrew/install") && !body.contains("uninstall.sh)\""),
+            || "Homebrew must never be installed or removed".to_string(),
+        );
+    }
+
+    // Assume-yes only through the override's `assume` argument, and every
+    // interactive removal reads the terminal so the manager's own
+    // confirmation reaches the user under `curl | bash`.
+    for (n, line) in code_lines(&un, '#') {
+        let bare_yes = (line.contains(" -y ")
+            || line.contains("--noconfirm")
+            || line.contains("--non-interactive"))
+            && !line.contains("${assume:+");
+        failures.check(&format!("install/uninstall.sh:{n}"), !bare_yes, || {
+            format!("a removal passes assume-yes outside the override path: {line}")
+        });
+    }
+    failures.check(
+        "uninstall.sh",
+        un.contains("\"${_sudo[@]}\" \"${_cmd[@]}\" </dev/tty"),
+        || "an interactive removal must read the terminal".to_string(),
+    );
+    for pair in [
+        "\"terminal-notifier brew\"",
+        "\"terminal-notifier app\"",
+        "\"libnotify-bin apt\"",
+        "\"xdotool apt\"",
+        "\"kdotool dnf\"",
+    ] {
+        failures.check("uninstall.sh", un.contains(pair), || {
+            format!("the allowlist lacks {pair}")
+        });
+    }
+    failures.check(
+        "uninstall.sh",
+        un.contains("remove=\"Kept: other software uses this shared library\""),
+        || "a shared libnotify must never be removed".to_string(),
+    );
+    failures.assert_empty("popup tools steps");
 }
 
 /// An upgrade from a script installation has to leave nothing
@@ -12708,10 +12869,23 @@ fn the_installers_place_register_and_remove_the_click_helper_in_order() {
         uninstall.contains(r#"$command -like '*\claude-statusline-focus.exe"*'"#),
         || "the cmdlet fallback must be guarded on the command naming our helper".to_string(),
     );
+    // Cleared through Windows' own API in a Windows PowerShell child, which
+    // needs no module and also clears toasts BurntToast raised for earlier
+    // versions; and before `settings remove`, while the scheme's owner exists.
+    let history = pos(&uninstall, "ToastNotificationManager]::History.Clear(");
+    failures.check("toast-history", history.is_some(), || {
+        "a toast left in the Action Center would still carry the scheme".to_string()
+    });
+    if let (Some(h), Some(r)) = (history, remove) {
+        failures.check("history-before-remove", h < r, || {
+            "the history must be cleared before the settings entries go".to_string()
+        });
+    }
     failures.check(
-        "toast-history",
-        uninstall.contains("Remove-BTNotification"),
-        || "a toast left in the Action Center would still carry the scheme".to_string(),
+        "no-burnttoast",
+        !uninstall.contains("Import-Module BurntToast")
+            && uninstall.contains("Invoke-Binary $ps51"),
+        || "the clear must go through a Windows PowerShell child, not BurntToast".to_string(),
     );
     failures.check(
         "helper-removed",

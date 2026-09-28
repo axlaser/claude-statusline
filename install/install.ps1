@@ -32,21 +32,71 @@ $configPath   = "$claudeDir\notify-config.json"
 $iconPath     = "$claudeDir\claude-icon.png"
 $stagePrefix  = ".claude-statusline.stage."
 
-$ESC    = [char]27
-$RESET  = "$ESC[0m"
-$BOLD   = "$ESC[1m"
-$DIM    = "$ESC[2m"
-$CYAN   = "$ESC[36m"
-$GREEN  = "$ESC[32m"
-$YELLOW = "$ESC[33m"
-$RED    = "$ESC[31m"
-$GRAY   = "$ESC[90m"
+# --- Output ---
+# Drawn like the status line itself (src/render.rs, assemble): a gray frame and
+# the status line's glyphs, each built from its code point because this file
+# stays ASCII. Decided once, before the first line: plain text with ASCII
+# glyphs and no frame when output is redirected, NO_COLOR is set
+# (https://no-color.org) or TERM is dumb, so a log keeps each message on one
+# line. The heavy frame and the check mark need Windows Terminal's fonts;
+# conhost's default font lacks them, so outside it the frame is light and the
+# check is a square root sign.
+$plain = [Console]::IsOutputRedirected -or [bool]$env:NO_COLOR -or $env:TERM -eq 'dumb'
+$ESC = [char]27
+if ($plain) {
+    $RESET = ''; $BOLD = ''; $DIM = ''; $CYAN = ''; $GREEN = ''; $YELLOW = ''; $RED = ''; $GRAY = ''
+    $gOk = '+'; $gStep = '*'; $gDot = '-'
+} else {
+    $RESET  = "$ESC[0m"
+    $BOLD   = "$ESC[1m"
+    $DIM    = "$ESC[2m"
+    $CYAN   = "$ESC[36m"
+    $GREEN  = "$ESC[32m"
+    $YELLOW = "$ESC[33m"
+    $RED    = "$ESC[31m"
+    $GRAY   = "$ESC[90m"
+    if ($env:WT_SESSION) { $gOk = [string][char]0x2713 } else { $gOk = [string][char]0x221A }
+    $gStep = [string][char]0x25CF
+    $gDot  = [string][char]0x00B7
+}
+if ($env:WT_SESSION) {
+    $fH = [string][char]0x2501; $fV = [string][char]0x2503
+    $fTL = [string][char]0x250F; $fTR = [string][char]0x2513
+    $fBL = [string][char]0x2517; $fBR = [string][char]0x251B
+} else {
+    $fH = [string][char]0x2500; $fV = [string][char]0x2502
+    $fTL = [string][char]0x250C; $fTR = [string][char]0x2510
+    $fBL = [string][char]0x2514; $fBR = [string][char]0x2518
+}
+# The frame's inner width, as in install.sh: every line stays within 72.
+$inner = 60
+$frame = $fH * $inner
 
-function Step([string]$msg)  { Write-Host "  ${CYAN}${BOLD}>>>${RESET} $msg" }
-function Ok([string]$msg)    { Write-Host "  ${GREEN}${BOLD} +${RESET} $msg" }
-function Warn([string]$msg)  { Write-Host "  ${YELLOW}${BOLD} !${RESET} $msg" }
-function Err([string]$msg)   { Write-Host "  ${RED}${BOLD} x${RESET} $msg" }
-function Info([string]$msg)  { Write-Host "  ${DIM}   $msg${RESET}" }
+function Step([string]$msg)  { Write-Host "  ${CYAN}$gStep${RESET} ${BOLD}$msg${RESET}" }
+function Ok([string]$msg)    { Write-Host "    ${GREEN}$gOk${RESET} $msg" }
+function Warn([string]$msg)  { Write-Host "    ${YELLOW}!${RESET} $msg" }
+function Err([string]$msg)   { Write-Host "    ${RED}x${RESET} $msg" }
+function Info([string]$msg)  { Write-Host "      ${DIM}$msg${RESET}" }
+
+function Write-Header([string]$name, [string]$role) {
+    Write-Host ""
+    if ($plain) {
+        Write-Host "  $name - $role"
+    } else {
+        $pad = ' ' * ($inner - 7 - $name.Length - $role.Length)
+        Write-Host "  ${GRAY}$fTL$frame$fTR${RESET}"
+        Write-Host "  ${GRAY}$fV${RESET} ${BOLD}$name${RESET}  ${GRAY}$gDot${RESET}  ${DIM}$role${RESET}$pad ${GRAY}$fV${RESET}"
+        Write-Host "  ${GRAY}$fBL$frame$fBR${RESET}"
+    }
+    Write-Host ""
+}
+
+function Write-Footer([string]$msg) {
+    Write-Host ""
+    if (-not $plain) { Write-Host "  ${GRAY}$($fH * 42)${RESET}" }
+    Write-Host "  ${GREEN}$gOk${RESET} ${BOLD}Done.${RESET} $msg"
+    Write-Host ""
+}
 
 function Format-Size([long]$bytes) {
     if ($bytes -ge 1048576) { return ("{0:N1} MB" -f ($bytes / 1048576)) }
@@ -163,10 +213,7 @@ foreach ($a in $args) {
     elseif ($a -like '--version=*')     { $pinnedVersion = $a.Substring(10) }
 }
 
-Write-Host ""
-Write-Host "  ${DIM}claude-statusline installer${RESET}"
-Write-Host "  ${GRAY}-----------------------------------------${RESET}"
-Write-Host ""
+Write-Header "claude-statusline" "installer"
 
 # --- Platform detection ---
 # Before anything is created, removed, or written: an unsupported platform must
@@ -768,7 +815,7 @@ $applyFlags = @()
 $foreignStatusline = Invoke-Binary $binPath @('settings', 'has-foreign', '--binary', $binPath, 'statusline')
 if ($foreignStatusline.Ran -and $foreignStatusline.Code -eq 0) {
     Write-Host ""
-    $answer = Read-Host "  ${YELLOW}${BOLD} ?${RESET} Existing statusLine config found. Overwrite? (${GREEN}y${RESET}/${RED}n${RESET})"
+    $answer = Read-Host "    ${YELLOW}?${RESET} Existing statusLine config found. Overwrite? (${GREEN}y${RESET}/${RED}n${RESET})"
     if ($answer -match '^[Yy]$') { $applyFlags += '--statusline' }
     else { Warn "Skipped statusLine update"; Info "Continuing with hook and notification setup..." }
     Write-Host ""
@@ -779,7 +826,7 @@ if ($foreignStatusline.Ran -and $foreignStatusline.Code -eq 0) {
 $foreignSubagent = Invoke-Binary $binPath @('settings', 'has-foreign', '--binary', $binPath, 'subagent')
 if ($foreignSubagent.Ran -and $foreignSubagent.Code -eq 0) {
     Write-Host ""
-    $answer = Read-Host "  ${YELLOW}${BOLD} ?${RESET} Existing subagentStatusLine config found. Overwrite? (${GREEN}y${RESET}/${RED}n${RESET})"
+    $answer = Read-Host "    ${YELLOW}?${RESET} Existing subagentStatusLine config found. Overwrite? (${GREEN}y${RESET}/${RED}n${RESET})"
     if ($answer -match '^[Yy]$') { $applyFlags += '--subagent' } else { Warn "Skipped subagentStatusLine update" }
     Write-Host ""
 } else {
@@ -815,6 +862,7 @@ if (Test-Path $configPath) {
 Write-Host ""
 Step "Notifications"
 Info "Plays a sound and shows a popup when Claude needs attention."
+Info "Popups use Windows' built-in notifications, so nothing else is installed."
 # The legacy check is what carries the choice across an upgrade: someone
 # who enabled notifications under the scripts has hooks pointing at notify.ps1,
 # which `has` does not recognise, and re-prompting them would turn a silent
@@ -834,7 +882,7 @@ if ($notifyConfigured) {
     $applyFlags += '--notify'
 } else {
     Write-Host ""
-    $answer = Read-Host "  ${YELLOW}${BOLD} ?${RESET} Enable notifications? (${GREEN}y${RESET}/${RED}n${RESET})"
+    $answer = Read-Host "    ${YELLOW}?${RESET} Enable notifications? (${GREEN}y${RESET}/${RED}n${RESET})"
     if ($answer -match '^[Yy]$') { $applyFlags += '--notify' }
     else { Info "Skipped - run the installer again to enable later" }
 }
@@ -908,7 +956,4 @@ if ($legacyFound.Count -gt 0) {
     Info "Your notification settings were kept."
 }
 
-Write-Host ""
-Write-Host "  ${GRAY}-----------------------------------------${RESET}"
-Write-Host "  ${GREEN}${BOLD}Done!${RESET} Restart Claude Code to activate."
-Write-Host ""
+Write-Footer "Restart Claude Code to turn it on."

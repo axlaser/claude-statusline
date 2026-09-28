@@ -496,3 +496,124 @@ jobs:
           "$PROBE/.claude/bin/claude-statusline" self-check \
             || { echo "::error::the upgraded binary fails its own self-check"; exit 1; }
           echo "upgraded: scripts removed, binary wired in, user settings intact"
+
+      # The popup tools step where installing would be possible: passwordless
+      # sudo, a desktop variable set, notifications on from the legacy hook,
+      # and no terminal to ask. The terminal probe is what has to refuse, so
+      # nothing is installed and the commands are printed instead. DISPLAY is
+      # only read, so no X server is needed. --dev because the step runs only
+      # against a binary that answers `settings supports popup-tools`.
+      - name: Without a terminal, the popup tools step installs nothing
+        run: |
+          log="$RUNNER_TEMP/popup-step.log"
+          DISPLAY=:99 bash install/install.sh --dev < /dev/null > "$log" 2>&1
+          cat "$log"
+          grep -q 'Popup tools' "$log" \
+            || { echo "::error::the popup tools step never ran"; exit 1; }
+          grep -q 'no terminal to answer, so no' "$log" \
+            || { echo "::error::the step did not stop at the missing terminal"; exit 1; }
+          grep -q 'To install by hand' "$log" \
+            || { echo "::error::the step printed no commands"; exit 1; }
+          if command -v xdotool >/dev/null; then
+            echo "::error::xdotool was installed without anyone saying yes"; exit 1
+          fi
+          test ! -e "$PROBE/.claude/statusline-installed-tools.txt" \
+            || { echo "::error::a record was written with nothing installed"; exit 1; }
+          echo "no terminal, no install: the commands were printed instead"
+
+  # The popup tools step's install routes, end to end: detect, install, record,
+  # then uninstall and remove. They install real packages outside the scratch
+  # profile, so they run only on disposable runners. CLAUDE_STATUSLINE_DEPS
+  # answers the question a terminal would, and --dev is the build that carries
+  # the binary's popup-tools capability until a release does.
+  popup-tools:
+    name: popup tools ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    needs: gates
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            name: linux
+            record: "libnotify-bin apt|xdotool apt"
+            gone: "! command -v notify-send >/dev/null && ! command -v xdotool >/dev/null"
+          # Apple Silicon with Homebrew: the brew route.
+          - os: macos-15
+            name: macos-homebrew
+            record: "terminal-notifier brew"
+            gone: "! /opt/homebrew/bin/brew list terminal-notifier >/dev/null 2>&1"
+          # Intel: the official release unpacked into ~/Applications.
+          - os: macos-15-intel
+            name: macos-release
+            record: "terminal-notifier app"
+            gone: "test ! -e \"$PROBE/Applications/terminal-notifier.app\""
+
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Stage a profile with notifications on
+        run: |
+          scratch="${RUNNER_TEMP}/popup-probe"
+          mkdir -p "$scratch/.claude"
+          echo "HOME=$scratch" >> "$GITHUB_ENV"
+          echo "PROBE=$scratch" >> "$GITHUB_ENV"
+          # A legacy notify hook, as the upgrade job stages: notifications
+          # count as on, so the step runs with nobody to answer the first
+          # question.
+          cat > "$scratch/.claude/settings.json" <<'JSON'
+          { "hooks": { "PermissionRequest": [ { "hooks": [ { "type": "command", "command": "~/.claude/notify.sh permission" } ] } ] } }
+          JSON
+          if command -v terminal-notifier >/dev/null || command -v xdotool >/dev/null; then
+            echo "::error::the runner image already has a popup tool, so this leg would install nothing"
+            exit 1
+          fi
+
+      - name: Install with CLAUDE_STATUSLINE_DEPS=yes
+        run: |
+          log="$RUNNER_TEMP/install.log"
+          CLAUDE_STATUSLINE_DEPS=yes bash install/install.sh --dev < /dev/null > "$log" 2>&1
+          cat "$log"
+          # Greps for the step's own output, so a binary that skips the step
+          # fails the leg rather than passing it with nothing done.
+          grep -q 'CLAUDE_STATUSLINE_DEPS=yes answers this step' "$log" \
+            || { echo "::error::the popup tools step did not install anything"; exit 1; }
+
+      - name: The tools are installed and recorded
+        run: |
+          record="$PROBE/.claude/statusline-installed-tools.txt"
+          cat "$record" || { echo "::error::no record was written"; exit 1; }
+          IFS='|' read -ra want <<< "${{ matrix.record }}"
+          for line in "${want[@]}"; do
+            grep -qxF "$line" "$record" \
+              || { echo "::error::the record lacks '$line'"; exit 1; }
+          done
+          # The step's own detection, which is the runtime's lookup, now finds
+          # everything, and a second run changes nothing.
+          before=$(cksum < "$record")
+          log="$RUNNER_TEMP/reinstall.log"
+          bash install/install.sh --dev < /dev/null > "$log" 2>&1
+          grep -q 'Everything popups need is installed' "$log" \
+            || { cat "$log"; echo "::error::the installed tools are not found"; exit 1; }
+          test "$before" = "$(cksum < "$record")" \
+            || { echo "::error::a second run changed the record"; exit 1; }
+          echo "installed, recorded, and found the way the binary finds them"
+
+      - name: Uninstall with CLAUDE_STATUSLINE_DEPS=yes removes them
+        run: |
+          log="$RUNNER_TEMP/uninstall.log"
+          CLAUDE_STATUSLINE_DEPS=yes bash install/uninstall.sh < /dev/null > "$log" 2>&1
+          cat "$log"
+          grep -q 'CLAUDE_STATUSLINE_DEPS=yes answers this step' "$log" \
+            || { echo "::error::the uninstaller offered nothing to remove"; exit 1; }
+          ${{ matrix.gone }} \
+            || { echo "::error::a recorded tool survived the uninstall"; exit 1; }
+          test ! -e "$PROBE/.claude/statusline-installed-tools.txt" \
+            || { echo "::error::the record survived the uninstall"; exit 1; }
+          echo "uninstall removed the recorded tools and the record"

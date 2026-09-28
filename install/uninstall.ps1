@@ -24,19 +24,71 @@ $iconPath     = "$claudeDir\claude-icon.png"
 $modelWindows = "$claudeDir\statusline-model-windows.json"
 $stagePrefix  = ".claude-statusline.stage."
 
-$ESC    = [char]27
-$RESET  = "$ESC[0m"
-$BOLD   = "$ESC[1m"
-$DIM    = "$ESC[2m"
-$CYAN   = "$ESC[36m"
-$GREEN  = "$ESC[32m"
-$YELLOW = "$ESC[33m"
-$GRAY   = "$ESC[90m"
+# --- Output ---
+# Drawn like the status line itself (src/render.rs, assemble): a gray frame and
+# the status line's glyphs, each built from its code point because this file
+# stays ASCII. Decided once, before the first line: plain text with ASCII
+# glyphs and no frame when output is redirected, NO_COLOR is set
+# (https://no-color.org) or TERM is dumb, so a log keeps each message on one
+# line. The heavy frame and the check mark need Windows Terminal's fonts;
+# conhost's default font lacks them, so outside it the frame is light and the
+# check is a square root sign.
+$plain = [Console]::IsOutputRedirected -or [bool]$env:NO_COLOR -or $env:TERM -eq 'dumb'
+$ESC = [char]27
+if ($plain) {
+    $RESET = ''; $BOLD = ''; $DIM = ''; $CYAN = ''; $GREEN = ''; $YELLOW = ''; $RED = ''; $GRAY = ''
+    $gOk = '+'; $gStep = '*'; $gDot = '-'
+} else {
+    $RESET  = "$ESC[0m"
+    $BOLD   = "$ESC[1m"
+    $DIM    = "$ESC[2m"
+    $CYAN   = "$ESC[36m"
+    $GREEN  = "$ESC[32m"
+    $YELLOW = "$ESC[33m"
+    $RED    = "$ESC[31m"
+    $GRAY   = "$ESC[90m"
+    if ($env:WT_SESSION) { $gOk = [string][char]0x2713 } else { $gOk = [string][char]0x221A }
+    $gStep = [string][char]0x25CF
+    $gDot  = [string][char]0x00B7
+}
+if ($env:WT_SESSION) {
+    $fH = [string][char]0x2501; $fV = [string][char]0x2503
+    $fTL = [string][char]0x250F; $fTR = [string][char]0x2513
+    $fBL = [string][char]0x2517; $fBR = [string][char]0x251B
+} else {
+    $fH = [string][char]0x2500; $fV = [string][char]0x2502
+    $fTL = [string][char]0x250C; $fTR = [string][char]0x2510
+    $fBL = [string][char]0x2514; $fBR = [string][char]0x2518
+}
+# The frame's inner width, as in install.sh: every line stays within 72.
+$inner = 60
+$frame = $fH * $inner
 
-function Step([string]$msg)  { Write-Host "  ${CYAN}${BOLD}>>>${RESET} $msg" }
-function Ok([string]$msg)    { Write-Host "  ${GREEN}${BOLD} +${RESET} $msg" }
-function Warn([string]$msg)  { Write-Host "  ${YELLOW}${BOLD} !${RESET} $msg" }
-function Info([string]$msg)  { Write-Host "  ${DIM}   $msg${RESET}" }
+function Step([string]$msg)  { Write-Host "  ${CYAN}$gStep${RESET} ${BOLD}$msg${RESET}" }
+function Ok([string]$msg)    { Write-Host "    ${GREEN}$gOk${RESET} $msg" }
+function Warn([string]$msg)  { Write-Host "    ${YELLOW}!${RESET} $msg" }
+function Err([string]$msg)   { Write-Host "    ${RED}x${RESET} $msg" }
+function Info([string]$msg)  { Write-Host "      ${DIM}$msg${RESET}" }
+
+function Write-Header([string]$name, [string]$role) {
+    Write-Host ""
+    if ($plain) {
+        Write-Host "  $name - $role"
+    } else {
+        $pad = ' ' * ($inner - 7 - $name.Length - $role.Length)
+        Write-Host "  ${GRAY}$fTL$frame$fTR${RESET}"
+        Write-Host "  ${GRAY}$fV${RESET} ${BOLD}$name${RESET}  ${GRAY}$gDot${RESET}  ${DIM}$role${RESET}$pad ${GRAY}$fV${RESET}"
+        Write-Host "  ${GRAY}$fBL$frame$fBR${RESET}"
+    }
+    Write-Host ""
+}
+
+function Write-Footer([string]$msg) {
+    Write-Host ""
+    if (-not $plain) { Write-Host "  ${GRAY}$($fH * 42)${RESET}" }
+    Write-Host "  ${GREEN}$gOk${RESET} ${BOLD}Done.${RESET} $msg"
+    Write-Host ""
+}
 
 # See install.ps1's copy for the full reasoning. $LASTEXITCODE is only written
 # by a process that starts, so an executable that cannot launch leaves the
@@ -57,15 +109,12 @@ function Invoke-Binary {
     return [PSCustomObject]@{ Ran = $true; Code = $LASTEXITCODE; Output = $output }
 }
 
-Write-Host ""
-Write-Host "  ${DIM}claude-statusline uninstaller${RESET}"
-Write-Host "  ${GRAY}-----------------------------------------${RESET}"
-Write-Host ""
+Write-Header "claude-statusline" "uninstaller"
 
 # --- The URI handler first, while the binary that owns it still exists ---
 # A toast left in the Action Center carries the claude-statusline: scheme; once
 # the handler is gone a click on it would open the shell's open-with dialog, so
-# the notification history is cleared too when BurntToast is present.
+# the notification history is cleared too.
 Step "Unregistering the click handler"
 $unregistered = $false
 if (Test-Path $binPath) {
@@ -95,13 +144,14 @@ if ($unregistered -or -not (Test-Path $protocolKey)) {
     Warn "Could not remove the claude-statusline: URI handler"
     Info "Remove HKCU:\Software\Classes\claude-statusline by hand if it names claude-statusline-focus.exe"
 }
-if (Get-Module -ListAvailable -Name BurntToast -ErrorAction SilentlyContinue) {
-    try {
-        Import-Module BurntToast -ErrorAction Stop
-        Remove-BTNotification -ErrorAction Stop
-        Info "Cleared the notification history"
-    } catch {}
-}
+# Through Windows' own notification API, under Windows PowerShell's identity,
+# which is the one every toast this tool raised used: the built-in ones now and
+# BurntToast's before them, so both are cleared. In a Windows PowerShell child,
+# because PowerShell 7 cannot load WinRT types, and it needs nothing installed.
+$ps51 = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+$clear = Invoke-Binary $ps51 @('-NoProfile', '-NonInteractive', '-Command',
+    "`$null=[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]; [Windows.UI.Notifications.ToastNotificationManager]::History.Clear('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe')")
+if ($clear.Ran -and $clear.Code -eq 0) { Info "Cleared the notification history" }
 Write-Host ""
 
 # --- settings.json next, while the binary that can edit it still exists ---
@@ -249,8 +299,8 @@ Write-Host ""
 
 # --- Notification config and debug log ---
 # Both are removed unconditionally, which is what the script uninstaller did.
-# The uninstaller preserves today's prompts, and today there is none here --
-# adding one would be a UX change smuggled in under a port.
+# Windows asks nothing here: popups use Windows' built-in notifications, so the
+# installer never put a tool on this machine for this uninstaller to offer back.
 Step "Removing notification configuration"
 if (Test-Path $configPath) {
     Remove-Item $configPath -Force -ErrorAction SilentlyContinue
@@ -265,7 +315,4 @@ if (Test-Path $debugLog) {
     Ok "Deleted $debugLog"
 }
 
-Write-Host ""
-Write-Host "  ${GRAY}-----------------------------------------${RESET}"
-Write-Host "  ${GREEN}${BOLD}Done!${RESET} Restart Claude Code to apply."
-Write-Host ""
+Write-Footer "Restart Claude Code to apply."
