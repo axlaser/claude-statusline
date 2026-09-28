@@ -6,3 +6,6 @@
 # Rust build output. Cargo.lock is committed deliberately — this crate ships as
 # a binary, so reproducible dependency resolution is wanted.
 /target
+
+# Claude Code worktrees: separate checkouts of this repo, never content.
+/.claude/worktrees/
