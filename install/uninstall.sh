@@ -101,13 +101,13 @@ card_blank() { $PLAIN || printf "  ${GRAY}│${RESET}%*s${GRAY}│${RESET}\n" "$
 card_text() { _card_wrap "" "$1" ""; }
 card_row() { _card_wrap "$1" "$2" "${3:-}"; }
 _card_wrap() {
-    local label=$1 colour=$3 width=56 line="" word
+    local label=$1 colour=$3 width=$(( INNER - 4 )) line="" word
     local -a words
     if $PLAIN; then
-        if [[ -n $label ]]; then printf "      %-10s  %s\n" "$label" "$2"; else printf "      %s\n" "$2"; fi
+        if [[ -n $label ]]; then printf "      %-8s  %s\n" "$label" "$2"; else printf "      %s\n" "$2"; fi
         return 0
     fi
-    [[ -n $label ]] && width=44
+    [[ -n $label ]] && width=$(( INNER - 14 ))
     read -r -a words <<<"$2"
     for word in "${words[@]}"; do
         if [[ -n $line ]] && (( ${#line} + 1 + ${#word} > width )); then
@@ -122,9 +122,9 @@ _card_wrap() {
 }
 _card_line() {
     if [[ -z $1 ]]; then
-        printf "  ${GRAY}│${RESET}  %-56s  ${GRAY}│${RESET}\n" "$2"
+        printf "  ${GRAY}│${RESET}  %-*s  ${GRAY}│${RESET}\n" $(( INNER - 4 )) "$2"
     else
-        printf "  ${GRAY}│${RESET}  ${DIM}%-10s${RESET}  %s%-44s${RESET}  ${GRAY}│${RESET}\n" "$1" "$3" "$2"
+        printf "  ${GRAY}│${RESET}  ${DIM}%-8s${RESET}  %s%-*s${RESET}  ${GRAY}│${RESET}\n" "$1" "$3" $(( INNER - 14 )) "$2"
     fi
 }
 
@@ -326,14 +326,14 @@ notification_tools_removal() {
         t=${entry% *}
         m=${entry#* }
         case $m in
-            brew) added="Homebrew formula $t"; remove="brew uninstall $t; Homebrew itself stays" ;;
-            app) added="app bundle ~/Applications/terminal-notifier.app"; remove="deletes that bundle" ;;
-            *) added="$m package $t"; remove="${s}$( [[ $m == apt ]] && echo apt-get || echo "$m") remove $t, which asks you first" ;;
+            brew) added="Homebrew formula $t"; remove="brew uninstall $t. Homebrew itself stays." ;;
+            app) added="The app in ~/Applications/terminal-notifier.app"; remove="Deletes that app." ;;
+            *) added="$m package $t"; remove="${s}$( [[ $m == apt ]] && echo apt-get || echo "$m") remove $t, which asks you first." ;;
         esac
         if [[ $t == libnotify && $m != apt ]]; then
-            remove="kept: other software uses this shared library"
+            remove="Kept, since other software shares it."
         elif ! _leaf "$t" "$m"; then
-            remove="kept: other installed software depends on it"
+            remove="Kept, since other software needs it."
             kept+=("$entry")
         else
             offer+=("$entry")
@@ -341,6 +341,7 @@ notification_tools_removal() {
         card_open "$t"
         card_blank
         card_row "Added" "$added"
+        card_blank
         card_row "Removal" "$remove"
         card_blank
         card_close

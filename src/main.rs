@@ -224,9 +224,8 @@ fn settings_cli(rest: &[&str]) -> i32 {
 
 /// What `settings supports <name>` answers yes to. `notification-tools`: the
 /// notifier finds terminal-notifier outside `PATH`, where the installer places
-/// it. `popup-tools` is its earlier name, answered only until the installer
-/// that asks for it is off the dev channel.
-const SUPPORTS: [&str; 2] = ["notification-tools", "popup-tools"];
+/// it.
+const SUPPORTS: [&str; 1] = ["notification-tools"];
 
 fn fail(message: &str) -> i32 {
     emit(&format!("claude-statusline settings: {message}\n"));

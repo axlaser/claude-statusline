@@ -111,13 +111,13 @@ card_blank() { $PLAIN || printf "  ${GRAY}│${RESET}%*s${GRAY}│${RESET}\n" "$
 card_text() { _card_wrap "" "$1" ""; }
 card_row() { _card_wrap "$1" "$2" "${3:-}"; }
 _card_wrap() {
-    local label=$1 colour=$3 width=56 line="" word
+    local label=$1 colour=$3 width=$(( INNER - 4 )) line="" word
     local -a words
     if $PLAIN; then
-        if [[ -n $label ]]; then printf "      %-10s  %s\n" "$label" "$2"; else printf "      %s\n" "$2"; fi
+        if [[ -n $label ]]; then printf "      %-8s  %s\n" "$label" "$2"; else printf "      %s\n" "$2"; fi
         return 0
     fi
-    [[ -n $label ]] && width=44
+    [[ -n $label ]] && width=$(( INNER - 14 ))
     read -r -a words <<<"$2"
     for word in "${words[@]}"; do
         if [[ -n $line ]] && (( ${#line} + 1 + ${#word} > width )); then
@@ -132,9 +132,9 @@ _card_wrap() {
 }
 _card_line() {
     if [[ -z $1 ]]; then
-        printf "  ${GRAY}│${RESET}  %-56s  ${GRAY}│${RESET}\n" "$2"
+        printf "  ${GRAY}│${RESET}  %-*s  ${GRAY}│${RESET}\n" $(( INNER - 4 )) "$2"
     else
-        printf "  ${GRAY}│${RESET}  ${DIM}%-10s${RESET}  %s%-44s${RESET}  ${GRAY}│${RESET}\n" "$1" "$3" "$2"
+        printf "  ${GRAY}│${RESET}  ${DIM}%-8s${RESET}  %s%-*s${RESET}  ${GRAY}│${RESET}\n" "$1" "$3" $(( INNER - 14 )) "$2"
     fi
 }
 
@@ -1011,7 +1011,7 @@ _commands_for() {
 }
 
 notification_tools_offer() {
-    local tools=() installable=() left=() tool pkg what why how link with
+    local tools=() installable=() left=() tool pkg what how link with
     local override="" go=false sudo_cached=false sudo_asked=false pm_name updated=false method
     local desktop=true kde=false subject
     _notify_missing=""
@@ -1020,7 +1020,7 @@ notification_tools_offer() {
     step "Notification tools"
     # A binary older than this installer finds terminal-notifier only on PATH,
     # so a tool placed elsewhere would install and still show nothing.
-    if ! "$BIN_PATH" settings supports popup-tools &>/dev/null; then
+    if ! "$BIN_PATH" settings supports notification-tools &>/dev/null; then
         info "This release cannot use installed notification tools yet, so none were checked."
         return 0
     fi
@@ -1073,35 +1073,32 @@ notification_tools_offer() {
         printf "\n    %s %d tools that aren't installed yet:\n\n" "$subject" "${#tools[@]}"
     fi
     pm_name=${_pm%-get}
-    with=", with sudo"
+    with=", using sudo"
     [[ $_me == 0 ]] && with=""
     for tool in "${tools[@]}"; do
         pkg=$(_pkg_name "$tool")
-        why="notifications are sound only"
         case $tool in
             terminal-notifier)
-                what="Shows Claude Code's notifications in macOS Notification Center."
+                what="Shows Claude Code's notifications in macOS Notification Center. If it's missing, you only hear a sound."
                 if [[ $(uname -m) == arm64 && $_me != 0 && -x $BREW && $(_stat_owner "$BREW") == "$_me" ]]; then
-                    how="brew install terminal-notifier, no password needed"
+                    how="Homebrew, no password needed"
                 else
-                    how="its official $TN_VERSION release from GitHub (400 KB, checksum-checked) into ~/Applications, no password needed"
+                    how="The official $TN_VERSION release from GitHub, checksum-verified, into ~/Applications. No password needed."
                 fi
                 link="https://github.com/julienXX/terminal-notifier"
                 ;;
             notify-send)
-                what="Shows Claude Code's notifications on your desktop."
+                what="Shows Claude Code's notifications on your desktop. If it's missing, you only hear a sound."
                 how="$pm_name package $pkg$with"
                 link="https://gitlab.gnome.org/GNOME/libnotify"
                 ;;
             xdotool)
-                what="Brings your terminal forward when you click a notification."
-                why="a click only dismisses the notification"
+                what="Brings your terminal to the front when you click a notification. If it's missing, clicking only closes the notification."
                 how="$pm_name package xdotool$with"
                 link="https://github.com/jordansissel/xdotool"
                 ;;
             kdotool)
-                what="Brings your terminal forward when you click a notification on KDE Wayland."
-                why="a click only dismisses the notification"
+                what="Brings your terminal to the front when you click a notification on KDE Wayland. If it's missing, clicking only closes the notification."
                 how="dnf package kdotool$with"
                 link="https://github.com/jinliu/kdotool"
                 ;;
@@ -1109,16 +1106,16 @@ notification_tools_offer() {
         if _installable "$tool"; then
             installable+=("$tool")
         elif [[ $tool == kdotool ]]; then
-            how="not packaged here: cargo install kdotool, or the AUR package on Arch"
+            how="Not packaged here. Use cargo install kdotool, or the AUR on Arch."
         else
-            how="not automatically on this system; the commands follow"
+            how="Not automatically on this system. The commands are below."
         fi
         card_open "$tool"
         card_blank
         card_text "$what"
         card_blank
-        card_row "Without it" "$why"
         card_row "Installs" "$how"
+        card_blank
         card_row "Website" "$link" "$CYAN"
         card_blank
         card_close

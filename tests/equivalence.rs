@@ -3906,7 +3906,7 @@ fn the_notification_tools_steps_ask_before_anything_privileged() {
     );
     failures.check(
         "install.sh",
-        sh.contains("if ! \"$BIN_PATH\" settings supports popup-tools &>/dev/null; then"),
+        sh.contains("if ! \"$BIN_PATH\" settings supports notification-tools &>/dev/null; then"),
         || "the step must ask the placed binary before installing anything".to_string(),
     );
     // Homebrew is used, never installed or removed.
@@ -3948,7 +3948,7 @@ fn the_notification_tools_steps_ask_before_anything_privileged() {
     }
     failures.check(
         "uninstall.sh",
-        un.contains("remove=\"kept: other software uses this shared library\""),
+        un.contains("remove=\"Kept, since other software shares it.\""),
         || "a shared libnotify must never be removed".to_string(),
     );
     failures.assert_empty("notification tools steps");
