@@ -777,15 +777,23 @@ _stat_mode_l() {
     esac
 }
 
-# Whether the runtime would run the tool found at this fixed location: an
-# executable owned by this user or root that nobody else can write.
+# Whether the runtime would run the tool found at this fixed location: the
+# executable, with links followed, and the directory holding it are owned by
+# this user or root and nobody else can write them.
 _trusted_at() {
-    local o m
-    [[ -f $1 && -x $1 ]] || return 1
-    o=$(_stat_owner_l "$1")
-    m=$(_stat_mode_l "$1")
-    [[ $o =~ ^[0-9]+$ && $m =~ ^[0-7]+$ ]] || return 1
-    [[ $o == "$_me" || $o == 0 ]] && (( (8#$m & 8#022) == 0 ))
+    local p=$1 t n=0 o m
+    [[ -f $p && -x $p ]] || return 1
+    while [[ -L $p ]] && (( n++ < 40 )); do
+        t=$(readlink "$p") || return 1
+        [[ $t == /* ]] || t=$(dirname "$p")/$t
+        p=$t
+    done
+    for t in "$p" "$(dirname "$p")"; do
+        o=$(_stat_owner_l "$t")
+        m=$(_stat_mode_l "$t")
+        [[ $o =~ ^[0-9]+$ && $m =~ ^[0-7]+$ ]] || return 1
+        [[ $o == "$_me" || $o == 0 ]] && (( (8#$m & 8#022) == 0 )) || return 1
+    done
 }
 
 # Where the binary finds terminal-notifier: PATH, then the fixed locations in

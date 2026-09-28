@@ -570,10 +570,12 @@ jobs:
           cat > "$scratch/.claude/settings.json" <<'JSON'
           { "hooks": { "PermissionRequest": [ { "hooks": [ { "type": "command", "command": "~/.claude/notify.sh permission" } ] } ] } }
           JSON
-          if command -v terminal-notifier >/dev/null || command -v xdotool >/dev/null; then
-            echo "::error::the runner image already has a popup tool, so this leg would install nothing"
-            exit 1
-          fi
+          # For the record only: a tool the image already has leaves the step
+          # nothing to install, which the next step reports.
+          echo "popup tools on this image before the install:"
+          for t in terminal-notifier notify-send xdotool wmctrl; do
+            printf '  %-18s %s\n' "$t" "$(command -v "$t" || echo absent)"
+          done
 
       - name: Install with CLAUDE_STATUSLINE_DEPS=yes
         run: |
@@ -583,7 +585,7 @@ jobs:
           # Greps for the step's own output, so a binary that skips the step
           # fails the leg rather than passing it with nothing done.
           grep -q 'CLAUDE_STATUSLINE_DEPS=yes answers this step' "$log" \
-            || { echo "::error::the popup tools step did not install anything"; exit 1; }
+            || { echo "::error::the popup tools step installed nothing: skipped, or nothing was missing"; exit 1; }
 
       - name: The tools are installed and recorded
         run: |
