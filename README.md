@@ -2,796 +2,87 @@
 
 # claude-statusline
 
-**A rich, color-coded custom status line for [Claude Code](https://claude.ai/code) showing context usage, git state, costs, rate limits, and more**
+**A color-coded status line for [Claude Code](https://claude.ai/code).**<br>
+Context, git, tokens, cost and rate limits in one box.
 
-[![macOS](https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white)](#macos)
-[![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](#linux)
-[![Windows](https://img.shields.io/badge/Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white)](#windows)
-[![Rust](https://img.shields.io/badge/Rust-000000?style=for-the-badge&logo=rust&logoColor=white)](#installation)
-[![No runtime dependencies](https://img.shields.io/badge/runtime_deps-none-success?style=for-the-badge)](#installation)
+[![macOS](https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white)](#install)
+[![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)](#install)
+[![Windows](https://img.shields.io/badge/Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white)](#install)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](#license)
-
----
-
-Replaces Claude Code's default status bar with a detailed, color-coded dashboard
-showing context usage, git state, costs, rate limits, and more — all inside a clean box frame.
 
 ![screenshot](assets/screenshot.png)
 
+[Install](#install) · [What it shows](#what-it-shows) · [Notifications](#notifications) · [Configuration](#configuration) · [Troubleshooting](#troubleshooting) · [Other install options](#other-install-options)
+
 </div>
 
-## Features
+## Install
 
-| Row | What it shows |
-|-----|---------------|
-| **repo** | Working directory (shortened relative to `$HOME`) and git branch with `↑ahead` / `↓behind` remote tracking, `+insertions` / `-deletions` / `~untracked`, and `⊟ stash` count |
-| **agent** | Agent name with compact context % and in/out tokens (when running with `--agent` flag); each active subagent also gets its own `agent` row with context bar, `used/window` tokens, model, reasoning effort (only when explicitly set), task title, and `○ working` / `✓ done` status |
-| **model** | Color-coded context bar with percentage and `used/window` token count (green < 60%, yellow < 85%, red 85%+), then the active model (e.g. `Opus 5`), reasoning effort level, ready/working indicator, and the Claude Code version you're running |
-| **tokens** | Cumulative session breakdown — `in` (fresh input), `cache↑` (cache writes), `cache↓` (cache reads), `out` (output) |
-| **cost** | Session cost in USD, message count, wall-clock duration, and 5-hour/7-day rate limit usage with burn-rate arrows (`⇡` over pace / `⇣` under pace) and time until reset |
-| **notifications** | Sound alerts and native OS toast popups for permission requests, task completion, context compaction, rate limit warnings, and context window warnings (enable during install) |
-
-All rows are dynamic — empty rows are automatically hidden.
-
----
-
-## Highlights
-
-### Context awareness at a glance
-The context bar changes color as your conversation grows — **green** when you have plenty of room, **yellow** as you approach 85%, and **red** when you're close to the limit. No more surprise context resets mid-task.
-
-### Burn-rate arrows on rate limits
-The rate-limit segments on the cost row don't just show usage — they show **pace**. An `⇡` arrow means you're burning tokens faster than the reset rate (slow down), while `⇣` means you're under pace with time until reset. Plan your session around real data instead of guessing.
-
-### Live working indicator
-The model row shows a real-time status — `● ready` when idle, or `○ working` while Claude is generating. You always know if the model is still thinking or waiting for you.
-
-### Claude Code version, and a nudge when it's stale
-The model row ends with the version you're running — `v2.1.278`. When a newer one exists it turns yellow and flags it with an arrow: `v2.1.278 ↑`. The arrow says there is an update; the segment is a link to the changelog in both states, which is where what-changed actually lives, so the row spends two columns on the news instead of ten. That's read from the changelog Claude Code already caches at `~/.claude/cache/changelog.md`, so it costs no network call and no extra process — and because the cache is refreshed by Claude Code rather than by the status line, a long gap between sessions means the row stays quiet rather than claiming an update that isn't there. The version segment is absent on a Claude Code too old to report one.
-
-### A model name, not a spec sheet
-`Opus 5 (1M context)` renders as `Opus 5`. The trailing parenthetical is dropped by shape rather than by matching a list of known models, so a model that hasn't shipped yet shortens the same way with no update to this tool — and you lose nothing, because the `/1M` beside the bar reads the window Claude Code actually reports.
-
-### Compact agent view
-When running with `--agent`, the agent row shows context usage as a percentage and cumulative in/out tokens in a compact inline format — all the essentials without taking up extra rows.
-
-### Per-subagent context tracking
-Every active subagent gets its own row — context bar, `used/window` tokens, model, the task's title (e.g. `Apply README review fixes`; the agent type shows when no title is available), and live status (`○ working` while active, `✓ done` for 30 seconds after completion, then the row disappears). Long titles are truncated to 39 characters plus an ellipsis. Percentages are measured against each subagent's **real** context window — fed live by Claude Code or learned per model — so a 1M-window subagent isn't judged against a 200K bar.
-
-**Reasoning effort** shows on a subagent row only when that agent was dispatched with an explicit effort — from an agent definition's `effort:` frontmatter, for example. It uses the same wording and colours as the model row, so `low effort` on an agent row reads the same as it does above. An agent that set no effort of its own shows **no** effort segment, and that's deliberate: Claude Code reports the field only when there's an override, so absence means "this agent set nothing of its own" rather than "unknown". What it actually runs at is Claude Code's business — the status line never displays a level it wasn't told, and never guesses one.
-
-Absence is not proof the agent set nothing, though. The segment is also missing when the live feed has gone stale and the row is rebuilt from the subagent transcript, which carries no effort — so a still-running agent can lose its segment. The **Upgrading** note below covers one more case.
-
-> **Upgrading:** the status line and the subagent feed handler are subcommands of the same binary, so re-running the install command picks up both at once — there is no longer a partial-upgrade state where a new status line pairs with a stale handler and the row silently looks like the no-override case.
-
-### Never miss a prompt
-Sound alerts and native OS toast notifications fire on permission requests, task completion, context compaction, and rate limit warnings. Each event and channel (sound vs. visual) is independently toggleable — get pinged when Claude needs you, stay quiet when it doesn't.
-
----
-
-## Installation
-
-> **Note:** The installer will ask before overwriting any existing `statusLine` or `subagentStatusLine` configuration.
-> Restart Claude Code after installing or updating.
->
-> The git status segment requires git >= 2.15 (2017, when `git status --show-stash` and its porcelain `# stash` header were added). On older git the status line still works — it just renders no git segment.
-
----
-
-<h3 id="macos"><img src="https://img.shields.io/badge/macOS-000000?style=for-the-badge&logo=apple&logoColor=white" alt="macOS" height="40"></h3>
-
-**Install:**
+**macOS and Linux**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.sh | bash
 ```
 
-Downloads a prebuilt, checksum-verified binary. No `jq`, no Bash version floor — nothing to install first.
-
-**Update:**
-
-Re-run the install command above — your other settings are preserved.
-
-**Uninstall:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/uninstall.sh | bash
-```
-
-<details>
-<summary><strong>Manual install</strong></summary>
-
-Nothing here pipes a download into a shell — every step is one you can inspect before running.
-
-1. **Download the binary** for your architecture, plus its checksum file:
-   ```bash
-   mkdir -p ~/.claude/bin
-   # Apple Silicon
-   TARGET=aarch64-apple-darwin
-   # Intel: TARGET=x86_64-apple-darwin
-   BASE=https://github.com/axlaser/claude-statusline/releases/latest/download
-   curl -fsSL "$BASE/claude-statusline-$TARGET" -o ~/.claude/bin/claude-statusline
-   curl -fsSL "$BASE/checksums.txt" -o /tmp/claude-statusline-checksums.txt
-   curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/assets/claude-icon.png -o ~/.claude/claude-icon.png
-   ```
-
-2. **Verify the checksum before you run it**, then make it executable:
-   ```bash
-   shasum -a 256 ~/.claude/bin/claude-statusline
-   grep "claude-statusline-$TARGET\$" /tmp/claude-statusline-checksums.txt
-   # the two hashes must match
-   chmod 700 ~/.claude/bin/claude-statusline
-   ```
-
-   Optionally verify the build provenance as well (needs the [GitHub CLI](https://cli.github.com) 2.56.0 or later):
-   ```bash
-   curl -fsSL "$BASE/claude-statusline-$TARGET.sigstore.json" -o /tmp/claude-statusline.sigstore.json
-   gh attestation verify ~/.claude/bin/claude-statusline \
-     --bundle /tmp/claude-statusline.sigstore.json \
-     --repo axlaser/claude-statusline \
-     --signer-workflow axlaser/claude-statusline/.github/workflows/release.yml
-   ```
-
-3. **Confirm it renders**, which is the same check the installer runs:
-   ```bash
-   ~/.claude/bin/claude-statusline self-check && echo OK
-   ```
-
-   A non-zero exit means the binary launches but renders incorrectly — don't register it.
-
-4. **Install terminal-notifier** (optional — for visual toast notifications):
-   ```bash
-   brew install terminal-notifier
-   ```
-
-5. **Create the notification config** — save as `~/.claude/notify-config.json`:
-   ```json
-   {
-     "permission":        { "sound": true, "visual": true },
-     "stop":              { "sound": true, "visual": true },
-     "rate_limit":        { "sound": true, "visual": true, "threshold": 80 },
-     "context_high":      { "sound": false, "visual": true, "threshold": 70 },
-     "compaction_start":  { "sound": true, "visual": true },
-     "compaction_done":   { "sound": true, "visual": true }
-   }
-   ```
-
-6. **Register it in Claude Code.** The binary edits `~/.claude/settings.json` itself, preserving everything it did not write:
-   ```bash
-   ~/.claude/bin/claude-statusline settings apply \
-     --binary ~/.claude/bin/claude-statusline --all
-   ```
-
-   Or edit `~/.claude/settings.json` by hand — this is exactly what the command above writes:
-   ```json
-   {
-     "statusLine": {
-       "type": "command",
-       "command": "~/.claude/bin/claude-statusline",
-       "refreshInterval": 1
-     },
-     "subagentStatusLine": {
-       "type": "command",
-       "command": "~/.claude/bin/claude-statusline subagent"
-     },
-     "hooks": {
-       "PostToolUse": [
-         {
-           "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline git-refresh", "async": true }]
-         }
-       ],
-       "PermissionRequest": [
-         {
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify permission", "async": true }]
-         }
-       ],
-       "Stop": [
-         {
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify stop", "async": true }]
-         }
-       ],
-       "PreCompact": [
-         {
-           "matcher": "*",
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify compaction_start", "async": true }]
-         }
-       ],
-       "PostCompact": [
-         {
-           "matcher": "*",
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify compaction_done", "async": true }]
-         }
-       ]
-     }
-   }
-   ```
-
-7. **Remove any previous script installation.** If you are coming from a version that installed shell scripts, delete them — nothing points at them any more:
-   ```bash
-   rm -f ~/.claude/statusline.sh ~/.claude/notify.sh ~/.claude/git-refresh.sh ~/.claude/subagent-statusline.sh
-   ```
-
-   Leave `~/.claude/notify-config.json` alone: its format is unchanged and the binary reads it as-is.
-
-8. **Restart Claude Code** — the status line and notifications are now active.
-
-</details>
-
----
-
-<h3 id="linux"><img src="https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black" alt="Linux" height="40"></h3>
-
-**Install:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.sh | bash
-```
-
-Downloads a prebuilt, checksum-verified binary, statically linked against musl — one artifact runs on any distribution, including Alpine and older glibc. No `jq`, no package manager involved.
-
-**Update:**
-
-Re-run the install command above — your other settings are preserved.
-
-**Uninstall:**
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/uninstall.sh | bash
-```
-
-<details>
-<summary><strong>Manual install</strong></summary>
-
-Nothing here pipes a download into a shell — every step is one you can inspect before running.
-
-1. **Download the binary** for your architecture, plus its checksum file. The Linux builds are statically linked against musl, so one artifact runs on any distribution including Alpine:
-   ```bash
-   mkdir -p ~/.claude/bin
-   TARGET=x86_64-unknown-linux-musl
-   # ARM: TARGET=aarch64-unknown-linux-musl
-   BASE=https://github.com/axlaser/claude-statusline/releases/latest/download
-   curl -fsSL "$BASE/claude-statusline-$TARGET" -o ~/.claude/bin/claude-statusline
-   curl -fsSL "$BASE/checksums.txt" -o /tmp/claude-statusline-checksums.txt
-   curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/assets/claude-icon.png -o ~/.claude/claude-icon.png
-   ```
-
-2. **Verify the checksum before you run it**, then make it executable:
-   ```bash
-   sha256sum ~/.claude/bin/claude-statusline
-   grep "claude-statusline-$TARGET\$" /tmp/claude-statusline-checksums.txt
-   # the two hashes must match
-   chmod 700 ~/.claude/bin/claude-statusline
-   ```
-
-   Optionally verify the build provenance as well (needs the [GitHub CLI](https://cli.github.com) 2.56.0 or later):
-   ```bash
-   curl -fsSL "$BASE/claude-statusline-$TARGET.sigstore.json" -o /tmp/claude-statusline.sigstore.json
-   gh attestation verify ~/.claude/bin/claude-statusline \
-     --bundle /tmp/claude-statusline.sigstore.json \
-     --repo axlaser/claude-statusline \
-     --signer-workflow axlaser/claude-statusline/.github/workflows/release.yml
-   ```
-
-3. **Confirm it renders**, which is the same check the installer runs:
-   ```bash
-   ~/.claude/bin/claude-statusline self-check && echo OK
-   ```
-
-   A non-zero exit means the binary launches but renders incorrectly — don't register it.
-
-4. **Install libnotify** (optional — for visual toast notifications):
-   ```bash
-   sudo apt install libnotify-bin    # Debian/Ubuntu
-   sudo dnf install libnotify        # Fedora/RHEL
-   sudo pacman -S libnotify          # Arch
-   ```
-
-   To have a click on the toast raise the terminal window, also install `xdotool` (or `wmctrl`) on X11, or `kdotool` on KDE Wayland. Both are optional; without them the click still selects the tab or pane inside tmux, kitty, WezTerm and Konsole.
-
-5. **Create the notification config** — save as `~/.claude/notify-config.json`:
-   ```json
-   {
-     "permission":        { "sound": true, "visual": true },
-     "stop":              { "sound": true, "visual": true },
-     "rate_limit":        { "sound": true, "visual": true, "threshold": 80 },
-     "context_high":      { "sound": false, "visual": true, "threshold": 70 },
-     "compaction_start":  { "sound": true, "visual": true },
-     "compaction_done":   { "sound": true, "visual": true }
-   }
-   ```
-
-6. **Register it in Claude Code.** The binary edits `~/.claude/settings.json` itself, preserving everything it did not write:
-   ```bash
-   ~/.claude/bin/claude-statusline settings apply \
-     --binary ~/.claude/bin/claude-statusline --all
-   ```
-
-   Or edit `~/.claude/settings.json` by hand — this is exactly what the command above writes:
-   ```json
-   {
-     "statusLine": {
-       "type": "command",
-       "command": "~/.claude/bin/claude-statusline",
-       "refreshInterval": 1
-     },
-     "subagentStatusLine": {
-       "type": "command",
-       "command": "~/.claude/bin/claude-statusline subagent"
-     },
-     "hooks": {
-       "PostToolUse": [
-         {
-           "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline git-refresh", "async": true }]
-         }
-       ],
-       "PermissionRequest": [
-         {
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify permission", "async": true }]
-         }
-       ],
-       "Stop": [
-         {
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify stop", "async": true }]
-         }
-       ],
-       "PreCompact": [
-         {
-           "matcher": "*",
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify compaction_start", "async": true }]
-         }
-       ],
-       "PostCompact": [
-         {
-           "matcher": "*",
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify compaction_done", "async": true }]
-         }
-       ]
-     }
-   }
-   ```
-
-7. **Remove any previous script installation.** If you are coming from a version that installed shell scripts, delete them — nothing points at them any more:
-   ```bash
-   rm -f ~/.claude/statusline.sh ~/.claude/notify.sh ~/.claude/git-refresh.sh ~/.claude/subagent-statusline.sh
-   ```
-
-   Leave `~/.claude/notify-config.json` alone: its format is unchanged and the binary reads it as-is.
-
-8. **Restart Claude Code** — the status line and notifications are now active.
-
-</details>
-
----
-
-<h3 id="windows"><img src="https://img.shields.io/badge/Windows-0078D4?style=for-the-badge&logo=windows&logoColor=white" alt="Windows" height="40"></h3>
-
-**Install:**
+**Windows** (PowerShell)
 
 ```powershell
 irm https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.ps1 | iex
 ```
 
-Downloads a prebuilt, checksum-verified binary. PowerShell is used only to run the installer — the status line itself has no PowerShell dependency and no version floor.
+Then restart Claude Code.
 
-**Update:**
+The installer downloads a prebuilt binary, checks its SHA-256, confirms it renders correctly, and registers it in `~/.claude/settings.json`. It asks before replacing an existing status line, and asks whether you want notifications. Nothing else needs installing first. The git segment needs git 2.15 or later; with older git, that segment is left out.
 
-Re-run the install command above — your other settings are preserved.
+**Update:** run the install command again. Your other settings are kept.
 
 **Uninstall:**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/uninstall.sh | bash
+```
 
 ```powershell
 irm https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/uninstall.ps1 | iex
 ```
 
-<details>
-<summary><strong>Manual install</strong></summary>
-
-Nothing here pipes a download into `iex` — every step is one you can inspect before running.
-
-1. **Download the binary** for your architecture, plus its checksum file:
-   ```powershell
-   New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\bin" | Out-Null
-   $target = "x86_64-pc-windows-msvc"
-   # ARM: $target = "aarch64-pc-windows-msvc"
-   $base = "https://github.com/axlaser/claude-statusline/releases/latest/download"
-   $bin  = "$env:USERPROFILE\.claude\bin\claude-statusline.exe"
-   $helper = "$env:USERPROFILE\.claude\bin\claude-statusline-focus.exe"
-   Invoke-WebRequest -Uri "$base/claude-statusline-$target.exe" -OutFile $bin -UseBasicParsing
-   Invoke-WebRequest -Uri "$base/claude-statusline-focus-$target.exe" -OutFile $helper -UseBasicParsing
-   Invoke-WebRequest -Uri "$base/checksums.txt" -OutFile "$env:TEMP\claude-statusline-checksums.txt" -UseBasicParsing
-   Invoke-WebRequest -Uri "https://raw.githubusercontent.com/axlaser/claude-statusline/master/assets/claude-icon.png" -OutFile "$env:USERPROFILE\.claude\claude-icon.png" -UseBasicParsing
-   ```
-
-2. **Verify the checksum before you run it:**
-   ```powershell
-   (Get-FileHash -Algorithm SHA256 $bin).Hash
-   Select-String -Path "$env:TEMP\claude-statusline-checksums.txt" -Pattern "claude-statusline-$target.exe"
-   (Get-FileHash -Algorithm SHA256 $helper).Hash
-   Select-String -Path "$env:TEMP\claude-statusline-checksums.txt" -Pattern "claude-statusline-focus-$target.exe"
-   # each pair of hashes must match (case aside)
-   ```
-
-   Optionally verify the build provenance as well (needs the [GitHub CLI](https://cli.github.com) 2.56.0 or later):
-   ```powershell
-   Invoke-WebRequest -Uri "$base/claude-statusline-$target.exe.sigstore.json" -OutFile "$env:TEMP\claude-statusline.sigstore.json" -UseBasicParsing
-   gh attestation verify $bin --bundle "$env:TEMP\claude-statusline.sigstore.json" `
-     --repo axlaser/claude-statusline `
-     --signer-workflow axlaser/claude-statusline/.github/workflows/release.yml
-   ```
-
-3. **Confirm it renders**, which is the same check the installer runs:
-   ```powershell
-   & $bin self-check | Out-Null; if ($LASTEXITCODE -eq 0) { "OK" }
-   ```
-
-   A non-zero exit means the binary launches but renders incorrectly — don't register it.
-
-   The click helper is launched by the shell when you click a toast, and a downloaded file carries the Mark of the Web, so clear it now or the first click raises SmartScreen instead of your terminal:
-   ```powershell
-   Unblock-File $helper
-   ```
-
-4. **Install BurntToast** (optional — for visual toast notifications). Run this from **Windows PowerShell** rather than PowerShell 7: the toast is raised through Windows PowerShell 5.1, and a module installed from PowerShell 7 is only visible to it when Claude Code happens to inherit PowerShell 7's module path:
-   ```powershell
-   powershell.exe -Command "Install-Module -Name BurntToast -Scope CurrentUser"
-   ```
-
-5. **Create the notification config** — save as `%USERPROFILE%\.claude\notify-config.json`:
-   ```json
-   {
-     "permission":        { "sound": true, "visual": true },
-     "stop":              { "sound": true, "visual": true },
-     "rate_limit":        { "sound": true, "visual": true, "threshold": 80 },
-     "context_high":      { "sound": false, "visual": true, "threshold": 70 },
-     "compaction_start":  { "sound": true, "visual": true },
-     "compaction_done":   { "sound": true, "visual": true }
-   }
-   ```
-
-6. **Register it in Claude Code.** The binary edits `settings.json` itself, preserving everything it did not write — and it quotes its own path, which is what keeps a profile directory containing a space from breaking the command. The second command registers the `claude-statusline:` URI handler that makes a toast clickable; it writes only its own key under `HKCU\Software\Classes` and leaves the scheme alone if another program owns it:
-   ```powershell
-   & $bin settings apply --binary $bin --all
-   & $bin settings protocol register --binary $bin
-   ```
-
-   Or edit `%USERPROFILE%\.claude\settings.json` by hand. Replace `YOUR_USERNAME` with your Windows username, and keep the inner quotes — this is exactly what the command above writes:
-
-   ```json
-   {
-     "statusLine": {
-       "type": "command",
-       "command": "\"C:/Users/YOUR_USERNAME/.claude/bin/claude-statusline.exe\"",
-       "refreshInterval": 1
-     },
-     "subagentStatusLine": {
-       "type": "command",
-       "command": "\"C:/Users/YOUR_USERNAME/.claude/bin/claude-statusline.exe\" subagent"
-     },
-     "hooks": {
-       "PostToolUse": [
-         {
-           "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-           "hooks": [{ "type": "command", "command": "\"C:/Users/YOUR_USERNAME/.claude/bin/claude-statusline.exe\" git-refresh", "async": true }]
-         }
-       ],
-       "PermissionRequest": [
-         {
-           "hooks": [{ "type": "command", "command": "\"C:/Users/YOUR_USERNAME/.claude/bin/claude-statusline.exe\" notify permission", "async": true }]
-         }
-       ],
-       "Stop": [
-         {
-           "hooks": [{ "type": "command", "command": "\"C:/Users/YOUR_USERNAME/.claude/bin/claude-statusline.exe\" notify stop", "async": true }]
-         }
-       ],
-       "PreCompact": [
-         {
-           "matcher": "*",
-           "hooks": [{ "type": "command", "command": "\"C:/Users/YOUR_USERNAME/.claude/bin/claude-statusline.exe\" notify compaction_start", "async": true }]
-         }
-       ],
-       "PostCompact": [
-         {
-           "matcher": "*",
-           "hooks": [{ "type": "command", "command": "\"C:/Users/YOUR_USERNAME/.claude/bin/claude-statusline.exe\" notify compaction_done", "async": true }]
-         }
-       ]
-     }
-   }
-   ```
-
-7. **Remove any previous script installation.** If you are coming from a version that installed PowerShell scripts, delete them — nothing points at them any more:
-   ```powershell
-   Remove-Item "$env:USERPROFILE\.claude\statusline.ps1", "$env:USERPROFILE\.claude\notify.ps1", `
-     "$env:USERPROFILE\.claude\git-refresh.ps1", "$env:USERPROFILE\.claude\subagent-statusline.ps1" `
-     -Force -ErrorAction SilentlyContinue
-   ```
-
-   Leave `notify-config.json` alone: its format is unchanged and the binary reads it as-is.
-
-8. **Restart Claude Code** — the status line and notifications are now active.
-
-</details>
-
----
-
-### Prereleases
-
-The install commands above always resolve the latest **stable** release, so a
-prerelease is never installed by accident. To opt in, add `--pre`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/install.sh | bash -s -- --pre
-```
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/install.ps1))) --pre
-```
-
-These fetch the installer from `dev` rather than `master`: prereleases are cut
-from the integration branch, so that is where the installer matching them lives.
-The stable commands above stay on `master`.
-
-> The PowerShell form is longer than the plain one-liner because `irm | iex` has
-> no way to pass arguments. If you would rather not read that, download the
-> installer first and run `.\install.ps1 --pre` — see
-> [Without piping to a shell](#without-piping-to-a-shell).
-
-**Uninstall** with the uninstaller from the same branch, which knows about
-everything that installer placed — the stable one may not yet:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.sh | bash
-```
-```powershell
-irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.ps1 | iex
-```
-
-`--pre` installs whatever tagged release is furthest ahead, prereleases included.
-Once a stable release overtakes them you get that stable release instead of an
-older preview, so `--pre` is safe to leave in an update command. Everything else
-is unchanged: the checksum is still verified and refusing to match still stops
-the install. The [dev channel](#dev-channel) is not a tagged release and `--pre`
-never picks it up.
-
-To go back to stable, re-run the install command without `--pre`. To pin one
-exact version instead, set `CLAUDE_STATUSLINE_VERSION` to its tag:
-
-```bash
-CLAUDE_STATUSLINE_VERSION=v1.0.0 bash install.sh
-```
-
----
-
-### Dev channel
-
-Every push to `dev` also publishes a build of that commit, so the integration
-branch can be installed without waiting for a tag. It is not a release: it may be
-broken on any given day, and it changes under you on every push. To opt in, add
-`--dev`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/install.sh | bash -s -- --dev
-```
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/install.ps1))) --dev
-```
-
-From a clone of `dev`, the same thing is `bash install/install.sh --dev` or
-`.\install\install.ps1 --dev`.
-
-There is one dev-channel release, tagged `dev-channel`, and every push replaces
-its assets and notes in place, so the Releases page carries a single entry for it
-rather than one per push. Its title names the commit it was built from. It ships
-with the same `checksums.txt` and Sigstore attestations a release does, so every
-gate the installer runs is unchanged; only the resolution differs. The tag itself
-is an anchor for the release and does not follow the branch — the commit a build
-came from is in the release notes and proven by its attestation. `--dev` outranks
-`--pre` when both are given, and neither the plain install command nor `--pre`
-ever resolves to the dev channel. A commit whose message carries `[skip release]`
-publishes nothing.
-
-To leave the channel, re-run the install command without `--dev`.
-
-**Uninstall** with the uninstaller from `dev`, for the same reason as a
-prerelease: it matches the installer that placed the files. From a clone, that is
-`bash install/uninstall.sh` or `.\install\uninstall.ps1`.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.sh | bash
-```
-```powershell
-irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.ps1 | iex
-```
-
----
-
-### From a cloned repo
-
-```bash
-git clone https://github.com/axlaser/claude-statusline.git
-cd claude-statusline
-bash install/install.sh      # macOS and Linux
-.\install\install.ps1        # Windows
-```
-
-These still download the published binary rather than building one — cloning saves you
-piping a URL into a shell, not the download. Add `--dev` to install the newest build of
-`dev` instead of the latest release (see [Dev channel](#dev-channel)). To update, re-run
-the installer. To uninstall, run `install/uninstall.sh` or `install/uninstall.ps1`.
-
-To build and install from source instead, you need a Rust toolchain:
-
-```bash
-cargo build --release
-cargo test                                     # optional but recommended
-target/release/claude-statusline self-check    # must exit 0
-```
-
-Then place the binary at `~/.claude/bin/claude-statusline` and register it with
-`claude-statusline settings apply --binary <that path> --all`. On Windows, also place
-`claude-statusline-focus.exe` from the same build beside it and run
-`claude-statusline settings protocol register --binary <that path>`, which is what makes
-a toast clickable.
-
-### Without piping to a shell
-
-Piping a URL into `bash` or `iex` runs code you have not read. If you would rather
-not, download the installer first, read it, then run it:
-
-```bash
-curl -fsSL -O https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.sh
-less install.sh          # read it
-bash install.sh
-```
-
-```powershell
-Invoke-WebRequest -UseBasicParsing -OutFile install.ps1 `
-  -Uri https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.ps1
-Get-Content install.ps1  # read it
-.\install.ps1
-```
-
-The installer downloads a prebuilt binary, verifies its SHA-256 against the
-`checksums.txt` published with the release, and only then places it and sets the
-execute bit. A checksum that cannot be fetched or computed stops the install —
-there is no path that skips verification.
-
-If the [GitHub CLI](https://cli.github.com) 2.56.0 or later is installed, the
-installer also verifies the release's build-provenance attestation. That check
-is skipped when `gh` is absent or older — an older `gh` cannot verify these
-attestations at all, which is common with distribution-packaged builds — and
-you can demand it instead:
-
-```bash
-bash install.sh --require-attestation
-```
-
-To verify by hand at any time:
-
-```bash
-gh attestation verify ~/.claude/bin/claude-statusline \
-  --repo axlaser/claude-statusline \
-  --signer-workflow axlaser/claude-statusline/.github/workflows/release.yml
-```
-
-To install a specific release rather than the latest, set
-`CLAUDE_STATUSLINE_VERSION` to its tag.
-
-Both installers take `--pre` and `--dev` here too, selecting the prerelease or the
-dev channel — see [Prereleases](#prereleases) and [Dev channel](#dev-channel).
-
----
-
-## Customization
-
-### Refresh Interval
-
-By default the status line updates after each assistant message. To also refresh on a timer (useful for keeping the clock and git status current), add `refreshInterval` to your settings. The installer sets this to `1` on every platform, and leaves it alone if you have already set your own:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "~/.claude/bin/claude-statusline",
-    "refreshInterval": 1
-  }
-}
-```
-
-This refreshes every second, which is the minimum and is fine on every platform — the old advice to keep Windows at `2` was about PowerShell's ~124 ms startup, and there is no interpreter to start any more. Raise it if you would rather the status line moved less.
-
-Whatever you set here survives upgrades: the installer rewrites only `type` and `command`, so `refreshInterval`, `padding`, and anything else you added to the entry are left as you left them.
-
-### Padding
-
-Add horizontal spacing around the status line:
-
-```json
-{
-  "statusLine": {
-    "type": "command",
-    "command": "~/.claude/bin/claude-statusline",
-    "padding": 2
-  }
-}
-```
-
-### Debug Logging
-
-Logging is **off unless you ask for it**. Set `STATUSLINE_DEBUG=1` in the environment Claude Code launches with, and every subcommand appends to a single log:
-
-| Platform | Log location |
-|----------|-------------|
-| macOS / Linux | `~/.claude/statusline-debug.log` |
-| Windows | `%USERPROFILE%\.claude\statusline-debug.log` |
-
-One log covers the status line, all three hooks and the click handler. Most lines carry a component prefix — `git:`, `transcript:`, `subagents:`, `model-windows:`, `notify:`, `focus:`, `git-refresh:`, `subagent-statusline:` — so you can tell which part wrote them; a few process-level entries have none. The click handler is launched by the OS without your environment, so it logs when the session that raised the toast had the variable set. Unset the variable to stop logging; the file is safe to delete at any time.
-
-### Notifications
-
-The installer can configure both **sound** and **visual** (native OS toast) notifications. Each channel is independently toggleable per event type.
-
-#### Events
-
-| Event | Trigger |
-|-------|---------|
-| Permission request | Claude shows a permission dialog |
-| Task complete | Claude finishes responding |
-| Compaction start | Context compaction begins |
-| Compaction done | Context compaction completes |
-| Context high | Context window usage >= 70% (configurable) |
-| Rate limit | Rate limit usage >= 80% (configurable) |
-
-#### Sound
-
-Platform-native sounds — no additional software needed:
-
-| Platform | Permission / Compaction start | Complete / Compaction done | Warning (rate limit / context) | Player |
-|----------|-------------------------------|----------------------------|-------------------------------|--------|
-| macOS | Tink | Glass | Sosumi | `afplay` |
-| Linux | freedesktop bell | freedesktop complete | freedesktop dialog-warning | `paplay` / `aplay` |
-| Windows | System Exclamation | System Asterisk | System Hand | Built-in (`SystemSounds`) |
-
-#### Visual (toast notifications)
-
-| Platform | Tool | Install |
-|----------|------|---------|
-| macOS | [terminal-notifier](https://github.com/julienXX/terminal-notifier) | `brew install terminal-notifier` |
-| Linux | notify-send | `sudo apt install libnotify-bin` (or equivalent for your distro) |
-| Windows | [BurntToast](https://github.com/Windos/BurntToast) | `Install-Module -Name BurntToast -Scope CurrentUser` |
-
-These are optional and you install them yourself — the installer does not fetch them. If the visual tool is missing, sound notifications still work; visual silently degrades rather than failing.
-
-Toast notifications display the Claude icon ([source](https://commons.wikimedia.org/wiki/File:Claude_AI_symbol.svg), public domain). The installer downloads it to `~/.claude/claude-icon.png` automatically, and the toast simply omits it if the file is absent.
-
-#### Click to focus
-
-Clicking a toast brings the terminal that runs the session to the front, and selects its tab or pane where the terminal can be driven from outside. It is on wherever `visual` is on — there is no separate switch — and nothing focuses without a click.
-
-| Terminal | On click |
-|----------|----------|
-| Terminal.app, iTerm2 | the window comes forward and the session's tab is selected |
-| Ghostty | the session's terminal is focused, matched by tty (or by working directory, when that is unique) |
-| kitty, with `allow_remote_control` on | the window comes forward and the session's kitty window is focused |
-| WezTerm | the session's pane is activated |
-| Konsole | the session's tab is selected; the window is raised on X11 and on KDE Wayland |
-| tmux, GNU screen, zellij | the session's pane is selected inside the multiplexer, on top of the terminal's own raise |
-| Windows Terminal, the classic console, VS Code | the window comes forward (tabs cannot be selected from outside) |
-| GNOME Terminal, Alacritty, Warp, anything else | the window or the application comes forward |
-
-Per platform:
-
-- **macOS** — terminal-notifier stores the click actions with the notification, so a click from Notification Center works after the session has ended too. The first tab selection asks for **Automation** consent (terminal-notifier controlling your terminal, under System Settings > Privacy & Security > Automation); if you deny it, clicks still bring the application forward. `tccutil reset AppleEvents` clears a wrong answer.
-- **Linux** — the toast stays clickable for two minutes after it appears (the `notify` process waits that long, then exits); a later click from the notification list only dismisses it. Raising the window on X11 needs `xdotool` or `wmctrl`, and on KDE Wayland `kdotool`; GNOME on Wayland refuses activation from outside, so there the click dismisses, while tab and pane selection inside tmux, kitty, WezTerm and Konsole still work. GNOME Terminal exposes no window id, so with several GNOME Terminal windows open nothing is raised rather than the wrong one. A libnotify older than 0.7.10 (Ubuntu 22.04) rejects the action flag, and the toast is re-raised without it.
-- **Windows** — a second, console-free executable, `claude-statusline-focus.exe`, handles the click through a per-user `claude-statusline:` URI handler the installer registers. No console, PowerShell or terminal window appears, including for a click from the Action Center after the session has ended. When Windows refuses to bring the window forward — an elevated terminal is the usual case — its taskbar button flashes instead. Until the handler is registered, clicking a toast keeps BurntToast's default behaviour. Window-level focus covers Windows Terminal, the classic console, VS Code and other Electron terminals, Alacritty, WezTerm, mintty and ConEmu.
-
-The session's terminal is recorded when the toast is raised, beside the other session state (`statusline-focus-<session-id>.json` in the state directory). Once the session has ended, a click brings the application or window forward and selects nothing; the record is never used to select another session's tab.
-
-#### Configuration
-
-Notification settings are stored in `~/.claude/notify-config.json`:
+Prefer not to pipe into a shell, or want a prerelease? See [Other install options](#other-install-options).
+
+## What it shows
+
+| Row | Contents |
+|-----|----------|
+| **repo** | Directory (shortened to `~`), branch, `↑ahead` `↓behind`, `+insertions` `-deletions` `~untracked`, and `⊟ stashes`. Labelled **project** outside a git repo. |
+| **agent** | Only with `claude --agent`: the agent's name, context %, and input/output tokens. |
+| **model** | Context bar with %, `used/window` tokens, model name, reasoning effort, `● ready` or `○ working`, and your Claude Code version. |
+| **tokens** | Session totals for `in`, `cache↑` (writes), `cache↓` (reads) and `out`, with the latest change in brackets. |
+| **agent** | One row per running subagent: context bar, `used/window`, model, effort (if set), task title, and `○ working` or `✓ done`. |
+| **cost** | Cost in USD, message count, session length, and 5-hour and 7-day rate-limit usage. |
+
+Rows with nothing to show are hidden.
+
+**Reading it**
+
+- **Context bar:** green below 60%, yellow below 85%, red from 85%.
+- **Rate limits:** `5h 42% ⇡3% (1h)` means 42% used, 3 points ahead of an even pace, resetting in 1 hour. `⇣` means you're under pace. Rate limits only show for Pro and Max plans.
+- **Version:** turns yellow with `↑` when a newer Claude Code is out. Click it to open the changelog. The check reads Claude Code's own cached changelog, so it makes no network call.
+- **Model name:** `Opus 5 (1M context)` shows as `Opus 5`. The window size is already next to the bar.
+- **Subagents:** each is measured against its own context window, so a 1M subagent isn't shown against a 200K bar. A finished subagent shows `✓ done` for 30 seconds, then its row goes away. Titles longer than 39 characters are cut short.
+- **Subagent effort:** shown only when the subagent was launched with an explicit effort, such as `effort:` in an agent definition. It can also go missing when the live feed goes stale and the row is rebuilt from the transcript.
+
+## Notifications
+
+Sound and desktop notifications for the moments you'd otherwise miss. Say yes when the installer asks, or run it again later to turn them on.
+
+| Event | When | Config key |
+|-------|------|------------|
+| Permission request | Claude is waiting for your approval | `permission` |
+| Task complete | Claude finishes responding | `stop` |
+| Compaction start / done | Context compaction begins or ends | `compaction_start`, `compaction_done` |
+| Context high | Context usage reaches 70% | `context_high` |
+| Rate limit | Rate-limit usage reaches 80% | `rate_limit` |
+
+Turn each event's sound or popup on and off in `~/.claude/notify-config.json`. The installer creates it with these defaults:
 
 ```json
 {
@@ -804,109 +95,449 @@ Notification settings are stored in `~/.claude/notify-config.json`:
 }
 ```
 
-Edit this file directly to toggle individual channels or adjust thresholds. The installer creates it with defaults on first run.
+### Sounds
 
-To enable after initial install, re-run the installer and answer **y** to the notification prompts. To disable, run the uninstaller — it removes notification hooks while preserving your other settings.
+Built-in system sounds, nothing to install.
 
----
+| Platform | Needs you | Done | Warning | Player |
+|----------|-----------|------|---------|--------|
+| macOS | Tink | Glass | Sosumi | `afplay` |
+| Linux | freedesktop bell | freedesktop complete | freedesktop dialog-warning | `paplay` / `aplay` |
+| Windows | System Exclamation | System Asterisk | System Hand | built in |
+
+### Popups
+
+Popups need one optional tool, which you install yourself. Without it, sounds still work.
+
+| Platform | Tool | Install |
+|----------|------|---------|
+| macOS | [terminal-notifier](https://github.com/julienXX/terminal-notifier) | `brew install terminal-notifier` |
+| Linux | `notify-send` | `sudo apt install libnotify-bin`, `sudo dnf install libnotify`, or `sudo pacman -S libnotify` |
+| Windows | [BurntToast](https://github.com/Windos/BurntToast) | `powershell.exe -Command "Install-Module -Name BurntToast -Scope CurrentUser"` |
+
+On Windows, run that from Windows PowerShell rather than PowerShell 7. Popups are raised through Windows PowerShell 5.1, which may not see a module installed from PowerShell 7.
+
+Popups use the Claude icon ([source](https://commons.wikimedia.org/wiki/File:Claude_AI_symbol.svg), public domain), which the installer saves to `~/.claude/claude-icon.png`.
+
+### Click to focus
+
+Clicking a popup brings the session's terminal to the front and, where the terminal allows it, selects the right tab or pane. It's on whenever popups are on.
+
+| Terminal | What a click does |
+|----------|-------------------|
+| Terminal.app, iTerm2 | Raises the window and selects the tab |
+| Ghostty | Focuses the session's terminal |
+| kitty (with `allow_remote_control yes`) | Raises the window and focuses the kitty window |
+| WezTerm | Activates the pane |
+| Konsole | Selects the tab and raises the window (X11 and KDE Wayland) |
+| tmux, GNU screen, zellij | Selects the pane, on top of whatever the terminal does |
+| Windows Terminal, classic console, VS Code | Raises the window |
+| Anything else | Raises the window or app |
+
+Platform notes:
+
+- **macOS:** the first tab selection asks for Automation permission. If you decline, clicks still bring the app forward. Clicks keep working from Notification Center after the session ends.
+- **Linux:** a popup stays clickable for 2 minutes. Raising the window needs `xdotool` or `wmctrl` on X11, or `kdotool` on KDE Wayland. GNOME on Wayland doesn't allow it, but tab and pane selection in tmux, kitty, WezTerm and Konsole still works.
+- **Windows:** clicks go through a small helper, `claude-statusline-focus.exe`, so no console window flashes. If Windows won't raise the window (for example an elevated terminal), the taskbar button flashes instead.
+
+Once a session has ended, a click brings the app forward but selects no tab.
+
+## Configuration
+
+These go in the `statusLine` entry of `~/.claude/settings.json`. Upgrades leave them alone.
+
+**Refresh interval.** How often, in seconds, the status line redraws on its own, on top of redrawing after each message. The installer sets `1`, the minimum. Raise it if you'd like less movement.
+
+**Padding.** Horizontal space around the box.
+
+```json
+{
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/bin/claude-statusline",
+    "refreshInterval": 1,
+    "padding": 2
+  }
+}
+```
+
+**Debug log.** Off by default. Set `STATUSLINE_DEBUG=1` in the environment Claude Code starts from, and everything logs to `~/.claude/statusline-debug.log` (`%USERPROFILE%\.claude\statusline-debug.log` on Windows). Lines are prefixed by component (`git:`, `transcript:`, `notify:`, `focus:`, and so on). The file is safe to delete.
 
 ## Troubleshooting
 
+The status line never prints errors, because anything on stderr breaks Claude Code's display. When something's wrong, the [debug log](#configuration) is where to look.
+
 <details>
-<summary><strong>Status line not appearing</strong></summary>
+<summary><strong>The status line doesn't appear</strong></summary>
 
-The status line is designed to fail silently — it never writes to stderr and always exits 0, because anything else breaks Claude Code's UI. So an absent status line gives you no error to read, and these are the things to check by hand:
-
-- Confirm the binary runs and renders: `~/.claude/bin/claude-statusline self-check`. Exit 0 means the renderer is sound; non-zero means the build is bad and you should reinstall.
-- Verify the path in `settings.json` matches where the binary actually is. On Windows the stored command must keep its surrounding quotes, or a profile directory containing a space splits the command.
-- macOS/Linux: confirm it is executable (`chmod +x ~/.claude/bin/claude-statusline`).
-- Apple Silicon: an unsigned binary is killed on sight. Released artifacts are ad-hoc signed; if you built your own, run `codesign --sign - --force target/release/claude-statusline`.
-- Restart Claude Code after changing settings.
-- Set `STATUSLINE_DEBUG=1` and check the debug log.
+1. Run `~/.claude/bin/claude-statusline self-check`. Exit code 0 means the binary works; anything else means reinstall.
+2. Check the `command` path in `settings.json` points at the binary. On Windows, keep the quotes around the path.
+3. On macOS and Linux, check it's executable: `chmod +x ~/.claude/bin/claude-statusline`.
+4. On Apple Silicon, a binary you built yourself must be signed: `codesign --sign - --force target/release/claude-statusline`. Released binaries already are.
+5. Restart Claude Code.
 
 </details>
 
 <details>
-<summary><strong>Context percentage shows 0% on first message</strong></summary>
+<summary><strong>Context shows 0% on the first message</strong></summary>
 
-This is normal. Claude Code doesn't report context usage until after the first API response. The bar will populate on the second refresh.
-
-</details>
-
-<details>
-<summary><strong>Rate limits not showing</strong></summary>
-
-Rate limit data is only available for Claude.ai Pro and Max subscribers. API users (Anthropic Console) won't see rate limit data on the cost row. The data also only appears after the first API response in a session.
+Expected. Claude Code reports context usage only after the first response. The bar fills in on the next refresh.
 
 </details>
 
 <details>
-<summary><strong>Notification sounds not playing</strong></summary>
+<summary><strong>Rate limits don't show</strong></summary>
 
-- Test directly: `~/.claude/bin/claude-statusline notify stop` (should play a sound). On Windows: `& "$env:USERPROFILE\.claude\bin\claude-statusline.exe" notify stop`. From an interactive shell nothing is read from the terminal; when Claude Code runs the hook, the event's JSON arrives on stdin and names the session the toast belongs to
-- Check the event is not muted in `~/.claude/notify-config.json` — `"sound": false` genuinely mutes it
-- Confirm the hooks are registered — `settings.json` should carry `claude-statusline notify <event>` entries under `PermissionRequest`, `Stop`, `PreCompact` and `PostCompact`
-- Linux: ensure PulseAudio/PipeWire is running (`paplay` requires it) or ALSA is available (`aplay`)
-- Restart Claude Code after installation — hooks are loaded at startup
+They're only available on Claude Pro and Max plans, not API keys, and only after the first response in a session.
 
 </details>
 
 <details>
-<summary><strong>Visual toast notifications not appearing</strong></summary>
+<summary><strong>No notification sounds</strong></summary>
 
-**macOS:** terminal-notifier posts notifications under its own bundle ID, which macOS may silence by default. Go to **System Settings > Notifications > terminal-notifier** and enable **Allow Notifications**. If terminal-notifier doesn't appear in the list, run `terminal-notifier -title "Test" -message "Hello"` once to register it, then check again.
-
-**Linux:** Ensure your desktop environment supports notifications (GNOME, KDE, XFCE, etc.). Test with `notify-send "Test" "Hello"`. Wayland compositors may require additional configuration.
-
-**Windows:** BurntToast requires the Windows notification center. Test with `New-BurntToastNotification -Text "Test", "Hello"`. If notifications are suppressed, check **Settings > System > Notifications** and ensure notifications are enabled for PowerShell. The toast is raised through Windows PowerShell 5.1, whose own module paths are `Documents\WindowsPowerShell\Modules` and `Program Files\WindowsPowerShell\Modules`. A BurntToast installed from PowerShell 7 lands under `Documents\PowerShell\Modules`, which Windows PowerShell only sees when Claude Code inherited a PowerShell 7 module path from the terminal that launched it. Installing the module from a Windows PowerShell prompt (`powershell.exe -Command "Install-Module -Name BurntToast -Scope CurrentUser"`) makes it visible however Claude Code was started; `powershell.exe -Command "Get-Module -ListAvailable BurntToast"` confirms it.
-
-**All platforms:** Set `STATUSLINE_DEBUG=1` and check `~/.claude/statusline-debug.log` for `notify:` entries to confirm the hook ran and whether the visual tool was found.
+- Test it: `~/.claude/bin/claude-statusline notify stop` should play a sound. On Windows: `& "$env:USERPROFILE\.claude\bin\claude-statusline.exe" notify stop`.
+- Check the event isn't set to `"sound": false` in `~/.claude/notify-config.json`.
+- Check `settings.json` has `claude-statusline notify <event>` hooks under `PermissionRequest`, `Stop`, `PreCompact` and `PostCompact`.
+- Linux: `paplay` needs PulseAudio or PipeWire running; otherwise `aplay` needs ALSA.
+- Restart Claude Code. Hooks load at startup.
 
 </details>
 
 <details>
-<summary><strong>Clicking a toast does nothing, or brings the wrong thing forward</strong></summary>
+<summary><strong>No popups</strong></summary>
 
-Set `STATUSLINE_DEBUG=1` in the environment Claude Code runs in, raise a toast, click it, and read the `focus:` lines in `~/.claude/statusline-debug.log`: they say whether a record was found, whether the session's process was still alive, and which steps ran.
-
-- **Nothing is recorded:** the toast is raised without click handling when the state directory did not verify (the `state_dir:` line says so) — or, on Windows, when the handler is not registered. `claude-statusline settings protocol has --binary <path to claude-statusline.exe>` exits 0 when it is.
-- **The session had ended:** the application or window comes forward and no tab is selected. That is deliberate; a stale record never selects another session's tab.
-- **macOS, the application comes forward but the tab is not selected:** terminal-notifier needs Automation consent to drive your terminal. Look under System Settings > Privacy & Security > Automation, or run `tccutil reset AppleEvents` and click again. VS Code, Warp and Alacritty have no tab hook; they come forward as an application.
-- **Linux, nothing comes forward:** the click window is two minutes; on X11 install `xdotool` or `wmctrl`, on KDE Wayland `kdotool`; on GNOME Wayland the compositor refuses activation from outside. Several GNOME Terminal windows open means none is raised, because GNOME Terminal exposes no window id.
-- **Linux or macOS, the terminal you were in sets a different `TMPDIR` than your login environment:** the click handler looks for the record under the login environment's temp directory, finds nothing, and dismisses.
-- **kitty:** tab selection needs `allow_remote_control yes` and a unix listen socket (`listen_on unix:/tmp/kitty`).
-- **Windows, the taskbar button flashes instead:** Windows refused to bring the window forward — an elevated terminal, for instance. The flash is the fallback.
+- **macOS:** open **System Settings > Notifications > terminal-notifier** and turn on **Allow Notifications**. If it isn't listed, run `terminal-notifier -title Test -message Hello` once, then look again.
+- **Linux:** test with `notify-send Test Hello`. Your desktop needs a notification service; some Wayland compositors need extra setup.
+- **Windows:** test with `New-BurntToastNotification -Text "Test", "Hello"`, and check notifications are allowed for PowerShell under **Settings > System > Notifications**. If BurntToast was installed from PowerShell 7, reinstall it from Windows PowerShell (see [Popups](#popups)). `powershell.exe -Command "Get-Module -ListAvailable BurntToast"` confirms Windows PowerShell can see it.
+- **Everywhere:** with the debug log on, `notify:` lines show whether the hook ran and whether the popup tool was found.
 
 </details>
 
 <details>
-<summary><strong>Errors in the debug log</strong></summary>
+<summary><strong>Clicking a popup does nothing, or raises the wrong thing</strong></summary>
 
-Set `STATUSLINE_DEBUG=1` and check `~/.claude/statusline-debug.log`. Common causes:
-- Claude Code passed unexpected JSON — a malformed payload renders `[statusline: bad JSON]` rather than an empty bar
-- Permission issues writing to the per-session state files, which live in `claude-statusline-<owner>/` inside the OS temp directory (`$TMPDIR`, or `%TEMP%` on Windows). If that directory exists but is not a plain directory owned by you, the status line falls back to writing directly in the temp root rather than failing — so an unexpected pile of loose `statusline-*` files there is a signal worth checking.
-- A state file rejected by its guard: symlinks and reparse points are refused deliberately, and a foreign-owned file is not written through
+Turn on the debug log, raise a popup, click it, and read the `focus:` lines. They say whether a record was found, whether the session was still running, and what was tried.
 
-Because of the silent-degradation contract, a panic inside the binary is caught and logged rather than printed — so `panic caught in subcommand` in the log is the signal for a genuine bug worth reporting.
+- **Nothing recorded:** the state directory didn't pass its ownership check (a `state_dir:` line says so). On Windows, the click handler may not be registered: `claude-statusline settings protocol has --binary <path to claude-statusline.exe>` exits 0 if it is.
+- **The session had ended:** the app comes forward and no tab is selected. That's intended.
+- **macOS, app comes forward but not the tab:** terminal-notifier needs Automation permission under **System Settings > Privacy & Security > Automation**. `tccutil reset AppleEvents` lets you answer again. VS Code, Warp and Alacritty can't have tabs selected from outside.
+- **Linux, nothing comes forward:** see the [platform notes](#click-to-focus). With several GNOME Terminal windows open, none is raised, because GNOME Terminal doesn't expose which window is which.
+- **`TMPDIR` differs between your terminal and your login session:** the click handler looks in the wrong place and just dismisses the popup.
+- **kitty:** needs `allow_remote_control yes` and a unix socket, such as `listen_on unix:/tmp/kitty`.
 
 </details>
 
----
+<details>
+<summary><strong>Reading the debug log</strong></summary>
 
-## How It Works
+- `[statusline: bad JSON]` in the status line means Claude Code sent something unexpected.
+- Session state lives in `claude-statusline-<owner>/` inside your temp directory (`$TMPDIR`, or `%TEMP%` on Windows). If that directory exists but isn't a plain directory owned by you, files are written straight into the temp directory instead. Loose `statusline-*` files there are worth a look.
+- Symlinked or foreign-owned state files are refused on purpose.
+- `panic caught in subcommand` is a real bug. Please [open an issue](https://github.com/axlaser/claude-statusline/issues).
 
-Claude Code pipes a JSON object to the binary's stdin on each update. The JSON contains session data — model info, context window usage, cost, rate limits, transcript path, and more. The binary parses this data, optionally reads the conversation transcript for additional metrics (message count, token breakdown, idle/working state), and outputs ANSI-colored text that Claude Code renders as the status bar.
+</details>
 
-It is a single multi-call binary: the status line, the notification handler, the git-refresh hook, the subagent feed handler and the click handler are all subcommands of `claude-statusline`, so an install on macOS and Linux is one file plus `settings.json` entries pointing at it. Windows adds a second file, `claude-statusline-focus.exe`: the shell launches it when a toast is clicked, and it is built without a console so the click never opens a window of its own.
+## Other install options
 
-Git status is cached for up to 5 seconds and invalidated as soon as `.git/index` changes (or immediately by the git-refresh hook after file-modifying tools), so it stays effectively real-time without re-running git on every refresh. The transcript is read only when its size or modification time has changed — an unchanged transcript re-displays the stored totals without opening the file, which is what keeps refreshes fast in long sessions.
+### Read before you run
 
-Subagent rows are fed by Claude Code's `subagentStatusLine` feature. The installer registers `claude-statusline subagent` as the handler, which receives the live tasks payload — each subagent's model, context window size, status, token count, and task description — and tees it to a session-scoped state file in the status line's own directory under the OS temp directory (`claude-statusline-<owner>/statusline-tasks-<session-id>.json`). The handler prints nothing, so Claude Code's own agent panel keeps its default rendering. Per-task `model` and `contextWindowSize` require Claude Code >= v2.1.205; on older versions (or before the feed delivers data), the status line falls back to parsing subagent transcripts. Task titles come from the feed's `description` field, so with an older Claude Code, rows gracefully fall back to showing the agent type.
+Piping a URL into a shell runs code you haven't seen. To read the installer first:
 
-On the transcript fallback path, each subagent's context window is resolved by checking the session's own model first, then a learned map, then a seed table, then a 200K default. A subagent running the same model as the session inherits that session's window directly — matched on the base model id, so a variant spelling like `claude-opus-5[1m]` and a bare `claude-opus-5` count as the same model. That makes a newly released model correct on a subagent's first appearance, with no prior observation. Beyond that, the status line records each main session's model → window pair to `~/.claude/statusline-model-windows.json`, so it learns real, plan-accurate context windows automatically — new models are picked up without any repo update. The seed table covers current documented models (1M for Fable 5, Opus 4.6+, Sonnet 5, and Sonnet 4.6; 200K for Haiku 4.5, Sonnet 4.5, and Opus 4.5). The uninstaller removes the handler registration, the binary, and the learned map.
+```bash
+curl -fsSL -O https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.sh
+less install.sh
+bash install.sh
+```
 
----
+```powershell
+Invoke-WebRequest -UseBasicParsing -OutFile install.ps1 `
+  -Uri https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.ps1
+Get-Content install.ps1
+.\install.ps1
+```
+
+The installer always verifies the SHA-256 against the release's `checksums.txt`. If the checksum can't be fetched or doesn't match, it stops. If [GitHub CLI](https://cli.github.com) 2.56.0 or later is installed, it also verifies the build's provenance attestation. To make that check required, pass `--require-attestation`.
+
+To verify an installed binary yourself:
+
+```bash
+gh attestation verify ~/.claude/bin/claude-statusline \
+  --repo axlaser/claude-statusline \
+  --signer-workflow axlaser/claude-statusline/.github/workflows/release.yml
+```
+
+### Pin a version
+
+Set `CLAUDE_STATUSLINE_VERSION` to a release tag:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.sh | CLAUDE_STATUSLINE_VERSION=v1.0.0 bash
+```
+
+```powershell
+$env:CLAUDE_STATUSLINE_VERSION = "v1.0.0"
+irm https://raw.githubusercontent.com/axlaser/claude-statusline/master/install/install.ps1 | iex
+```
+
+### Prerelease and dev builds
+
+The standard command installs the latest stable release. Two opt-in channels:
+
+- `--pre` installs the newest tagged release, prereleases included. When a stable release overtakes it, you get that instead, so it's safe to keep using.
+- `--dev` installs the latest build of the `dev` branch, published on every push. It may be broken. It wins if both flags are given.
+
+Use the installer from the `dev` branch for either:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/install.sh | bash -s -- --pre   # or --dev
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/install.ps1))) --pre   # or --dev
+```
+
+PowerShell needs the longer form because `irm | iex` can't pass arguments.
+
+To go back to stable, run the standard install command. To uninstall, use the `dev` uninstaller, since it knows about everything the `dev` installer placed:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.sh | bash
+```
+
+```powershell
+irm https://raw.githubusercontent.com/axlaser/claude-statusline/dev/install/uninstall.ps1 | iex
+```
+
+Checksums and attestations are verified the same way on every channel.
+
+### From a clone
+
+```bash
+git clone https://github.com/axlaser/claude-statusline.git
+cd claude-statusline
+bash install/install.sh      # macOS and Linux
+.\install\install.ps1        # Windows
+```
+
+This still downloads the published binary. It accepts the same `--pre`, `--dev` and `--require-attestation` flags. Uninstall with `install/uninstall.sh` or `install/uninstall.ps1`.
+
+### Build from source
+
+Needs a Rust toolchain.
+
+```bash
+cargo build --release
+cargo test                                    # optional
+target/release/claude-statusline self-check   # must exit 0
+```
+
+Copy the binary to `~/.claude/bin/claude-statusline` and register it:
+
+```bash
+~/.claude/bin/claude-statusline settings apply --binary ~/.claude/bin/claude-statusline --all
+```
+
+On Windows, also copy `claude-statusline-focus.exe` from the same build next to it, then run `claude-statusline.exe settings protocol register --binary <path to claude-statusline.exe>` so popups are clickable.
+
+### Manual install: macOS and Linux
+
+Every step can be read before you run it.
+
+1. **Download** the binary, the checksums and the popup icon. Pick your target:
+
+   | Machine | `TARGET` |
+   |---------|----------|
+   | Apple Silicon Mac | `aarch64-apple-darwin` |
+   | Intel Mac | `x86_64-apple-darwin` |
+   | Linux x86-64 | `x86_64-unknown-linux-musl` |
+   | Linux ARM64 | `aarch64-unknown-linux-musl` |
+
+   The Linux builds are statically linked, so they run on any distribution, Alpine included.
+
+   ```bash
+   TARGET=aarch64-apple-darwin
+   BASE=https://github.com/axlaser/claude-statusline/releases/latest/download
+   mkdir -p ~/.claude/bin
+   curl -fsSL "$BASE/claude-statusline-$TARGET" -o ~/.claude/bin/claude-statusline
+   curl -fsSL "$BASE/checksums.txt" -o /tmp/claude-statusline-checksums.txt
+   curl -fsSL https://raw.githubusercontent.com/axlaser/claude-statusline/master/assets/claude-icon.png -o ~/.claude/claude-icon.png
+   ```
+
+2. **Verify** the checksum. The two hashes must match. Use `shasum -a 256` on macOS, `sha256sum` on Linux.
+
+   ```bash
+   shasum -a 256 ~/.claude/bin/claude-statusline
+   grep "claude-statusline-$TARGET\$" /tmp/claude-statusline-checksums.txt
+   chmod 700 ~/.claude/bin/claude-statusline
+   ```
+
+   Optionally verify provenance too (GitHub CLI 2.56.0+):
+
+   ```bash
+   curl -fsSL "$BASE/claude-statusline-$TARGET.sigstore.json" -o /tmp/claude-statusline.sigstore.json
+   gh attestation verify ~/.claude/bin/claude-statusline \
+     --bundle /tmp/claude-statusline.sigstore.json \
+     --repo axlaser/claude-statusline \
+     --signer-workflow axlaser/claude-statusline/.github/workflows/release.yml
+   ```
+
+3. **Self-check.** This is the same test the installer runs. If it fails, stop here.
+
+   ```bash
+   ~/.claude/bin/claude-statusline self-check && echo OK
+   ```
+
+4. **Notifications (optional).** Install the [popup tool](#popups) for your platform, and save the [default config](#notifications) as `~/.claude/notify-config.json`.
+
+5. **Register it.** This edits `~/.claude/settings.json` and leaves everything else in it alone:
+
+   ```bash
+   ~/.claude/bin/claude-statusline settings apply --binary ~/.claude/bin/claude-statusline --all
+   ```
+
+   <details>
+   <summary>Or edit <code>settings.json</code> by hand</summary>
+
+   This is exactly what the command writes:
+
+   ```json
+   {
+     "statusLine": {
+       "type": "command",
+       "command": "~/.claude/bin/claude-statusline",
+       "refreshInterval": 1
+     },
+     "subagentStatusLine": {
+       "type": "command",
+       "command": "~/.claude/bin/claude-statusline subagent"
+     },
+     "hooks": {
+       "PostToolUse": [
+         {
+           "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline git-refresh", "async": true }]
+         }
+       ],
+       "PermissionRequest": [
+         {
+           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify permission", "async": true }]
+         }
+       ],
+       "Stop": [
+         {
+           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify stop", "async": true }]
+         }
+       ],
+       "PreCompact": [
+         {
+           "matcher": "*",
+           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify compaction_start", "async": true }]
+         }
+       ],
+       "PostCompact": [
+         {
+           "matcher": "*",
+           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify compaction_done", "async": true }]
+         }
+       ]
+     }
+   }
+   ```
+
+   </details>
+
+6. **Upgrading from the old shell-script version?** Delete the scripts. Keep `notify-config.json`; its format hasn't changed.
+
+   ```bash
+   rm -f ~/.claude/statusline.sh ~/.claude/notify.sh ~/.claude/git-refresh.sh ~/.claude/subagent-statusline.sh
+   ```
+
+7. **Restart Claude Code.**
+
+### Manual install: Windows
+
+1. **Download** the binary, the click helper, the checksums and the popup icon. On ARM, use `aarch64-pc-windows-msvc`.
+
+   ```powershell
+   $target = "x86_64-pc-windows-msvc"
+   $base   = "https://github.com/axlaser/claude-statusline/releases/latest/download"
+   $bin    = "$env:USERPROFILE\.claude\bin\claude-statusline.exe"
+   $helper = "$env:USERPROFILE\.claude\bin\claude-statusline-focus.exe"
+   New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\bin" | Out-Null
+   Invoke-WebRequest -Uri "$base/claude-statusline-$target.exe" -OutFile $bin -UseBasicParsing
+   Invoke-WebRequest -Uri "$base/claude-statusline-focus-$target.exe" -OutFile $helper -UseBasicParsing
+   Invoke-WebRequest -Uri "$base/checksums.txt" -OutFile "$env:TEMP\claude-statusline-checksums.txt" -UseBasicParsing
+   Invoke-WebRequest -Uri "https://raw.githubusercontent.com/axlaser/claude-statusline/master/assets/claude-icon.png" -OutFile "$env:USERPROFILE\.claude\claude-icon.png" -UseBasicParsing
+   ```
+
+2. **Verify** the checksums. Each pair must match (ignoring case).
+
+   ```powershell
+   (Get-FileHash -Algorithm SHA256 $bin).Hash
+   Select-String -Path "$env:TEMP\claude-statusline-checksums.txt" -Pattern "claude-statusline-$target.exe"
+   (Get-FileHash -Algorithm SHA256 $helper).Hash
+   Select-String -Path "$env:TEMP\claude-statusline-checksums.txt" -Pattern "claude-statusline-focus-$target.exe"
+   ```
+
+   Optionally verify provenance too (GitHub CLI 2.56.0+):
+
+   ```powershell
+   Invoke-WebRequest -Uri "$base/claude-statusline-$target.exe.sigstore.json" -OutFile "$env:TEMP\claude-statusline.sigstore.json" -UseBasicParsing
+   gh attestation verify $bin --bundle "$env:TEMP\claude-statusline.sigstore.json" `
+     --repo axlaser/claude-statusline `
+     --signer-workflow axlaser/claude-statusline/.github/workflows/release.yml
+   ```
+
+3. **Self-check**, then unblock the click helper. Downloaded files are marked as coming from the internet, and without this the first popup click opens a SmartScreen prompt instead of your terminal.
+
+   ```powershell
+   & $bin self-check | Out-Null; if ($LASTEXITCODE -eq 0) { "OK" }
+   Unblock-File $helper
+   ```
+
+4. **Notifications (optional).** Install [BurntToast](#popups), and save the [default config](#notifications) as `%USERPROFILE%\.claude\notify-config.json`.
+
+5. **Register it.** The first command edits `settings.json`. The second registers the `claude-statusline:` link handler that makes popups clickable; it only touches its own key under `HKCU\Software\Classes`, and leaves the scheme alone if another program owns it.
+
+   ```powershell
+   & $bin settings apply --binary $bin --all
+   & $bin settings protocol register --binary $bin
+   ```
+
+   To edit `settings.json` by hand instead, use the [macOS and Linux JSON](#manual-install-macos-and-linux) with every command pointing at the full, quoted path. The quotes stop a space in your profile path from breaking the command:
+
+   ```json
+   "command": "\"C:/Users/YOUR_USERNAME/.claude/bin/claude-statusline.exe\" subagent"
+   ```
+
+6. **Upgrading from the old PowerShell-script version?** Delete the scripts. Keep `notify-config.json`.
+
+   ```powershell
+   Remove-Item "$env:USERPROFILE\.claude\statusline.ps1", "$env:USERPROFILE\.claude\notify.ps1", `
+     "$env:USERPROFILE\.claude\git-refresh.ps1", "$env:USERPROFILE\.claude\subagent-statusline.ps1" `
+     -Force -ErrorAction SilentlyContinue
+   ```
+
+7. **Restart Claude Code.**
+
+## How it works
+
+On each refresh, Claude Code pipes a JSON description of the session to the binary, which prints the box. The same binary also handles the hooks, as subcommands:
+
+| Subcommand | Registered as | Does |
+|------------|---------------|------|
+| *(none)* | `statusLine` | Draws the box |
+| `subagent` | `subagentStatusLine` | Saves Claude Code's live subagent feed for the box to read. Prints nothing, so Claude Code's own agent panel is unchanged. |
+| `git-refresh` | `PostToolUse` hook | Clears the cached git status after a file edit |
+| `notify <event>` | `PermissionRequest`, `Stop`, `PreCompact`, `PostCompact` hooks | Plays sounds and shows popups |
+| `focus` | A popup's click action | Brings the session's terminal forward |
+
+On Windows, clicks go to `claude-statusline-focus.exe`, a second program built without a console so no window flashes.
+
+It stays fast in long sessions because it skips repeat work. Git status is cached for up to 5 seconds and cleared as soon as `.git/index` changes. The transcript is only read again when its size or modified time changes.
+
+**Subagent context windows.** Claude Code 2.1.205 and later reports each subagent's model and window directly. On older versions, the window is worked out in this order: the session's own model, a map learned from your past sessions (`~/.claude/statusline-model-windows.json`), a built-in table of current models, a `[1m]` marker in the model ID, and finally 200K. Task titles also come from the feed, so older versions show the agent type instead.
 
 ## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT. See [LICENSE](LICENSE).
