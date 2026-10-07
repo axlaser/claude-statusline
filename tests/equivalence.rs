@@ -4125,9 +4125,13 @@ fn powershell_installers_never_read_a_stale_exit_code() {
                 });
             }
             // `& $exe` outside the helper bypasses the clear, so the next
-            // reader inherits whatever this one left behind.
+            // reader inherits whatever this one left behind. The helper's own
+            // call is the one exemption: it pipes in an empty input, so a
+            // child that drains stdin cannot hang on an installer whose own
+            // stdin is a pipe left open.
             let calls_native = line.trim_start().starts_with("& $") || line.contains("| & $");
-            if calls_native && !line.contains("Invoke-Binary") {
+            let is_helper_call = line.contains("& $Exe @BinArgs");
+            if calls_native && !line.contains("Invoke-Binary") && !is_helper_call {
                 failures.check(&format!("{rel}:{n}"), false, || {
                     format!("invokes a native command outside Invoke-Binary: {line}")
                 });
@@ -4605,6 +4609,9 @@ fn the_self_check_gates_every_destructive_step() {
                 // URI handler pointing beside it.
                 "Move-Item -Path $script:helperStage -Destination $helperPath",
                 "'settings', 'protocol', 'register'",
+                // The reclaim terminates processes, so only a binary that has
+                // proved it renders correctly may run it.
+                "Invoke-Binary $binPath @('housekeep')",
             ],
         },
     ];
@@ -4630,6 +4637,60 @@ fn the_self_check_gates_every_destructive_step() {
         }
     }
     failures.assert_empty("self-check gating");
+}
+
+/// A refresh Claude Code abandons can leave a `claude-statusline.exe` alive
+/// long after, mapping the binary or its `.old` sidecar. Windows will neither
+/// delete nor overwrite a mapped image, only rename it, so a locked sidecar
+/// used to abort every upgrade at "Could not move the existing binary aside".
+/// The installer renames a locked sidecar out of the way first, and reclaims
+/// stranded processes before its last sidecar sweep; the uninstaller reclaims
+/// them while the binary that does it still exists.
+#[test]
+fn the_powershell_installers_reclaim_stranded_processes_before_removing_files() {
+    let reclaim = "Invoke-Binary $binPath @('housekeep')";
+    let sweep = "-Filter 'claude-statusline.exe.old*'";
+    let move_aside = "Move-Item -Path $binPath -Destination $sidecarPath";
+    let mut failures = Failures::default();
+
+    let install = read_repo_file("install/install.ps1");
+    let reclaimed = install.find(reclaim);
+    failures.check("install-reclaims", reclaimed.is_some(), || {
+        "install.ps1 never reclaims stranded processes".to_string()
+    });
+    if let (Some(h), Some(s)) = (reclaimed, install.rfind(sweep)) {
+        failures.check("install-reclaim-before-sweep", h < s, || {
+            "the last sidecar sweep runs before the reclaim, so a mapped sidecar survives"
+                .to_string()
+        });
+    }
+    let renamed = install.find("Move-Item -Path $sidecarPath -Destination \"$sidecarPath.");
+    match (renamed, install.find(move_aside)) {
+        (Some(r), Some(m)) => failures.check("install-rename-before-move", r < m, || {
+            "a locked sidecar is renamed only after the move-aside has failed on it".to_string()
+        }),
+        _ => failures.check("install-rename-before-move", false, || {
+            "install.ps1 never renames a locked sidecar out of the move-aside's way".to_string()
+        }),
+    }
+
+    let uninstall = read_repo_file("install/uninstall.ps1");
+    let reclaimed = uninstall.find(reclaim);
+    failures.check("uninstall-reclaims", reclaimed.is_some(), || {
+        "uninstall.ps1 never reclaims stranded processes".to_string()
+    });
+    let remove = uninstall.find("'settings', 'remove', '--binary'");
+    let moved = uninstall.find(move_aside);
+    if let (Some(h), Some(r), Some(m)) = (reclaimed, remove, moved) {
+        failures.check("uninstall-reclaim-first", h < r && h < m, || {
+            "the reclaim must run before `settings remove`, while the binary still exists"
+                .to_string()
+        });
+    }
+    failures.check("uninstall-sweeps", uninstall.contains(sweep), || {
+        "uninstall.ps1 leaves renamed sidecars behind".to_string()
+    });
+    failures.assert_empty("stranded-process reclaim in the PowerShell installers");
 }
 
 /// Every installer decides once whether to draw: plain text when output is not

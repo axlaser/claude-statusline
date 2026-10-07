@@ -106,7 +106,8 @@ function Format-Size([long]$bytes) {
 
 # Why a file in the install directory could not be moved: Windows' own message,
 # and any claude-statusline process still running, which is what usually holds
-# a file there. Claude Code may be closed while such a process lives on.
+# a file there. A refresh Claude Code abandoned can strand such a process, and
+# it outlives Claude Code: closing Claude Code does not end it.
 function Show-MoveFailure($Failure) {
     Info $Failure.Exception.Message
     # By name, not by path: a process running from a renamed copy can report
@@ -114,6 +115,8 @@ function Show-MoveFailure($Failure) {
     foreach ($p in @(Get-Process -Name 'claude-statusline*' -ErrorAction SilentlyContinue)) {
         Info "Still running: $($p.ProcessName), PID $($p.Id), since $($p.StartTime). Stop it with: Stop-Process -Id $($p.Id)"
     }
+    Info "Stranded processes survive closing Claude Code. Stopping the"
+    Info "processes listed above, or rebooting, clears them."
 }
 
 # Removes the staged download. Called on every path that does not place it
@@ -164,7 +167,11 @@ function Invoke-Binary {
     $global:LASTEXITCODE = $null
     $output = $null
     try {
-        $output = & $Exe @BinArgs 2>&1
+        # An empty pipeline in, so the child's stdin closes at once. Bare, it
+        # inherits this session's, and `housekeep` drains stdin: under a parent
+        # that left this session's stdin an open pipe, it hung there (measured
+        # with Windows PowerShell 5.1).
+        $output = @() | & $Exe @BinArgs 2>&1
     } catch {
         return [PSCustomObject]@{ Ran = $false; Code = $null; Output = $_.Exception.Message }
     }
@@ -453,13 +460,18 @@ if ((Test-Path $sidecarPath) -and -not (Test-Path $binPath)) {
     }
 }
 # Every run clears both what an interrupted download staged and what a previous
-# replace renamed aside.
+# replace renamed aside, under the sidecar name or a unique one given below.
+# A failed delete is tolerated on purpose: a stranded process may still map the
+# old binary, and it will be swept on the next run instead.
 Get-ChildItem -Path $binDir -Filter "$stagePrefix*" -Force -ErrorAction SilentlyContinue |
     Remove-Item -Force -ErrorAction SilentlyContinue
+Get-ChildItem -Path $binDir -Filter 'claude-statusline.exe.old*' -Force -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+# A sidecar still here is mapped by a live process. Windows will neither delete
+# nor overwrite it, so the move-aside below would fail on it and abort the
+# upgrade -- but it will rename it, which frees the name.
 if (Test-Path $sidecarPath) {
-    # A failed delete here is tolerated on purpose: the old binary may still be
-    # running, and it will be swept on the next run instead.
-    Remove-Item $sidecarPath -Force -ErrorAction SilentlyContinue
+    Move-Item -Path $sidecarPath -Destination "$sidecarPath.$([guid]::NewGuid().ToString('N'))" -ErrorAction SilentlyContinue
 }
 
 # --- Stage the download ---
@@ -605,7 +617,7 @@ if (Test-Path $binPath) {
     } catch {
         Err "Could not move the existing binary aside"
         Show-MoveFailure $_
-        Info "Close Claude Code, stop anything listed above, and re-run."
+        Info "Then re-run the installer."
         Remove-Stage
         return
     }
@@ -702,9 +714,16 @@ if (-not $check.Ran -or $check.Code -ne 0) {
 # report. This is the only place they are removed -- see the naming note above.
 Remove-Item $checkLog -Force -ErrorAction SilentlyContinue
 Remove-Item (Join-Path $binDir "claude-statusline.failed") -Force -ErrorAction SilentlyContinue
-# Tolerated failure by design: the old binary may still be running, and the next
-# run sweeps whatever is left.
-if (Test-Path $sidecarPath) { Remove-Item $sidecarPath -Force -ErrorAction SilentlyContinue }
+# Stranded processes may still map the superseded binary, and Windows will not
+# delete a mapped image. The new binary reclaims them and waits for their
+# images to unmap -- only now, because terminating processes is not a job for a
+# binary that has not proved itself. Its outcome never blocks the install: an
+# older binary has no such subcommand and does nothing.
+$null = Invoke-Binary $binPath @('housekeep')
+# Tolerated failure by design: a live process may still map a sidecar, and the
+# next run sweeps whatever is left.
+Get-ChildItem -Path $binDir -Filter 'claude-statusline.exe.old*' -Force -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 Ok "Renders correctly"
 Write-Host ""
 

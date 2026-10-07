@@ -92,7 +92,8 @@ function Write-Footer([string]$msg) {
 
 # Why a file in the install directory could not be moved: Windows' own message,
 # and any claude-statusline process still running, which is what usually holds
-# a file there. Claude Code may be closed while such a process lives on.
+# a file there. A refresh Claude Code abandoned can strand such a process, and
+# it outlives Claude Code: closing Claude Code does not end it.
 function Show-MoveFailure($Failure) {
     Info $Failure.Exception.Message
     # By name, not by path: a process running from a renamed copy can report
@@ -100,6 +101,8 @@ function Show-MoveFailure($Failure) {
     foreach ($p in @(Get-Process -Name 'claude-statusline*' -ErrorAction SilentlyContinue)) {
         Info "Still running: $($p.ProcessName), PID $($p.Id), since $($p.StartTime). Stop it with: Stop-Process -Id $($p.Id)"
     }
+    Info "Stranded processes survive closing Claude Code. Stopping the"
+    Info "processes listed above, or rebooting, clears them."
 }
 
 # See install.ps1's copy for the full reasoning. $LASTEXITCODE is only written
@@ -111,7 +114,9 @@ function Invoke-Binary {
     $global:LASTEXITCODE = $null
     $output = $null
     try {
-        $output = & $Exe @BinArgs 2>&1
+        # An empty pipeline in, so `housekeep`, which drains stdin, cannot hang
+        # on this session's stdin; see install.ps1's copy.
+        $output = @() | & $Exe @BinArgs 2>&1
     } catch {
         return [PSCustomObject]@{ Ran = $false; Code = $null; Output = $_.Exception.Message }
     }
@@ -166,6 +171,13 @@ $clear = Invoke-Binary $ps51 @('-NoProfile', '-NonInteractive', '-Command',
 if ($clear.Ran -and $clear.Code -eq 0) { Info "Cleared the notification history" }
 Write-Host ""
 
+# --- Stranded processes, while the binary that reclaims them still exists ---
+# A refresh Claude Code abandoned can leave a claude-statusline process alive
+# long after, mapping the binary so it cannot be deleted. The binary's own pass
+# terminates them and waits for their images to unmap. Its outcome never blocks
+# the uninstall: whatever it leaves is reported when the binary is removed.
+if (Test-Path $binPath) { $null = Invoke-Binary $binPath @('housekeep') }
+
 # --- settings.json next, while the binary that can edit it still exists ---
 # Order matters: the merge logic lives in the binary, so removing the entries
 # has to happen before removing the tool that removes them.
@@ -194,6 +206,11 @@ Write-Host ""
 # rename-aside is what makes uninstall work while Claude Code is open. A failed
 # delete of the sidecar is tolerated; the next install sweeps it.
 Step "Removing the binary"
+# Sidecars earlier upgrades left go with it, under the sidecar name or the
+# unique one the installer gives a locked sidecar. Now that the pass above has
+# reclaimed what mapped them, they can be deleted.
+Get-ChildItem -Path $binDir -Filter 'claude-statusline.exe.old*' -Force -ErrorAction SilentlyContinue |
+    Remove-Item -Force -ErrorAction SilentlyContinue
 if (Test-Path $binPath) {
     $moved = $false
     try {
