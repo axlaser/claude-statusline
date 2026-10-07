@@ -4,8 +4,8 @@
 //! load-bearing would drift. [`silence`] runs before anything else,
 //! [`guarded`] wraps a subcommand, and the final exit stays in each `main`:
 //! `std::process::exit` is the one call a library must not make on a caller's
-//! behalf. The fd 2 redirect goes through `platform::redirect_stderr_to_null`,
-//! so this file does not join the confinement list.
+//! behalf. The fd 2 redirect and the handle-inheritance fix go through
+//! `platform`, so this file does not join the confinement list.
 
 use std::io::Write;
 
@@ -15,8 +15,14 @@ use crate::{debug, platform};
 ///
 /// Call this first, before argv is read. A stack overflow or an allocation
 /// failure bypasses the hook and writes straight to the descriptor, which is
-/// why the redirect comes first and is not optional.
+/// why the redirect precedes anything that can fail and is not optional.
 pub fn silence() {
+    // Before layer 1, because the redirect orphans the original stderr where
+    // this can no longer reach it: a child must not inherit the pipes Claude
+    // Code reads, or the refresh waits until that child exits. It writes
+    // nothing, so running it ahead of the redirect exposes nothing on fd 2.
+    platform::make_std_handles_uninheritable();
+
     // Layer 1: take fd 2 away before any code can write to it.
     platform::redirect_stderr_to_null();
 

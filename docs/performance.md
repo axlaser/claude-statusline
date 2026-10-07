@@ -1483,3 +1483,45 @@ polling" above.
 
 End to end, `eb56345` against the current tree on the git-TTL-expired row, 21 interleaved
 pairs: **116.46 ms → 60.35 ms, −56.11 ms (−48.2%)**.
+
+### A detached child held the tick's output pipes — fixed 2026-10-07
+
+**The defect.** `CreateProcess` hands a child every inheritable handle in its parent, not
+only the stdio it was assigned, and Rust's `Command` always asks for inheritance. The stdout
+and stderr pipes Claude Code gives a tick arrive inheritable, so the `notify` child a
+crossing tick spawns — null stdio, never waited on — held both open until it exited, and
+Claude Code, which reads to EOF, waited with it. Unix never had this: `exec` replaces fds
+0–2 and std opens everything else close-on-exec.
+
+Measured on the installed release build (2026-09-28), maintainer machine, isolated
+`HOME`/`TEMP`, `SystemRoot` pointed at a scratch directory whose `powershell.exe` sleeps 5 s,
+sound off. A non-alert tick reached EOF on both streams at process exit (120–340 ms). An
+alert-crossing tick exited at 210–285 ms and reached EOF at **5,379–5,518 ms** — the
+sleeper's lifetime. A release build of `8eb14bb` reproduced it: exit at 112–117 ms,
+EOF at 5,240–5,454 ms. With a real toast the stall is the toast's PowerShell instead.
+
+**The fix.** `platform::make_std_handles_uninheritable` clears `HANDLE_FLAG_INHERIT` on the
+three standard handles at entry. Spawns are unaffected, because std duplicates an
+inheritable copy of every handle a child asks for. Same probe after it: EOF within 17 ms of
+process exit on every run, alert or not, which is the probe's polling granularity.
+
+**It runs before the stderr redirect, not after.** `redirect_stderr_to_null` swaps the
+standard slot and leaves the original stderr open and still inheritable, where
+`GetStdHandle` can no longer reach it. Measured: with the clear moved after the redirect,
+`a_background_child_does_not_hold_the_ticks_output_pipe` still fails — the child holds the
+stderr pipe — and with it first, it passes. The call writes nothing, so layer 1 loses
+nothing by going second.
+
+**Cost: inside noise, so §6 is unchanged.** Six syscalls at entry. Release builds with LTO,
+rustc 1.99.0, maintainer machine (Windows 11 26200), interleaved fresh-process pairs with an
+identical-binary control in the same sitting:
+
+| Tick shape | Pairs | Control deltas | Before → after deltas |
+|---|---|---|---|
+| Warm (`measure-pair.ps1 -Mode warm`) | 21, twice | +0.57, −0.02 ms | −0.66, +0.77 ms |
+| Floor — malformed input | 21 twice, 41 twice | −0.95, −0.58, −1.53, −0.31 ms | +2.06, −0.78, +0.31, −0.46 ms |
+
+Absolute medians sat at 36–41 ms for both shapes in this sitting, about twice §6's rows,
+which is the host floor drifting (§3), not the binary. The malformed floor is not a
+`measure-pair` mode — its proof of work asserts a rendered box — so it was taken by the
+same method with a throwaway driver.

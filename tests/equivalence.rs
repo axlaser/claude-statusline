@@ -274,6 +274,133 @@ fn self_check_reports_failure_with_nonzero_exit() {
     );
 }
 
+/// Which part this test binary plays when it re-executes itself below. Unset
+/// is the test proper; the entry layers cannot run in this shared process,
+/// where they would silence every other test's panic message.
+const PIPE_ROLE: &str = "STATUSLINE_TEST_PIPE_ROLE";
+const PIPE_DIR: &str = "STATUSLINE_TEST_PIPE_DIR";
+const PIPE_TEST: &str = "a_background_child_does_not_hold_the_ticks_output_pipe";
+
+/// This test binary, re-run as exactly this test in `role`.
+fn pipe_role(role: &str) -> Command {
+    let mut command = Command::new(std::env::current_exe().expect("current_exe"));
+    command.args(["--exact", PIPE_TEST]).env(PIPE_ROLE, role);
+    command
+}
+
+/// A child a tick starts and never waits on — the `notify` spawn — must not
+/// keep the tick's stdout or stderr open: Claude Code reads both to EOF, so a
+/// child that inherited either stalls the refresh for as long as the child
+/// lives. On Windows every inheritable handle reaches a child, whatever stdio
+/// it was given, so the entry layers have to clear the flag on the handles the
+/// parent passed in.
+///
+/// Three processes: this one owns the pipe; a "tick" runs the real
+/// `entry::silence()` and spawns a "child" with null stdio, then exits; the
+/// child lives until told to stop. EOF must arrive while it is still alive.
+#[test]
+fn a_background_child_does_not_hold_the_ticks_output_pipe() {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    let role = std::env::var(PIPE_ROLE).unwrap_or_default();
+    if role == "tick" {
+        let dir = PathBuf::from(std::env::var_os(PIPE_DIR).expect("pipe dir"));
+        claude_statusline::entry::silence();
+        let inheritable = std_handles_inheritable();
+        let mut child = pipe_role("child");
+        child
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // The production spawn's flag, so the shape under test is the shipped one.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            child.creation_flags(0x0800_0000);
+        }
+        let spawned = child.spawn().is_ok();
+        let report = format!("spawned={spawned} inheritable={inheritable:?}");
+        std::fs::write(dir.join("report"), report).expect("report");
+        return;
+    }
+    if role == "child" {
+        let dir = PathBuf::from(std::env::var_os(PIPE_DIR).expect("pipe dir"));
+        let give_up = Instant::now() + Duration::from_secs(60);
+        while !dir.join("stop").exists() && Instant::now() < give_up {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        let _ = std::fs::write(dir.join("exited"), "");
+        return;
+    }
+
+    let dir = scratch_dir("pipe-leak");
+    let (mut reader, writer) = std::io::pipe().expect("pipe");
+    // Both streams on one pipe, as a caller reading stdout and stderr sees
+    // them; the `Command` temporary drops this process's write ends.
+    let mut tick = pipe_role("tick")
+        .env(PIPE_DIR, &dir)
+        .stdin(Stdio::null())
+        .stdout(writer.try_clone().expect("clone"))
+        .stderr(writer)
+        .spawn()
+        .expect("spawn the tick role");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut sink = Vec::new();
+        let _ = reader.read_to_end(&mut sink);
+        let _ = tx.send(());
+    });
+    let tick_ok = tick.wait().expect("wait for the tick").success();
+    // Generous: without the leak EOF follows the tick's exit at once.
+    let eof = rx.recv_timeout(Duration::from_secs(5)).is_ok();
+    let alive_at_eof = !dir.join("exited").exists();
+
+    // Release the child before asserting, and prove it was running: it
+    // writes `exited` only once it sees `stop`.
+    std::fs::write(dir.join("stop"), "").expect("stop");
+    let give_up = Instant::now() + Duration::from_secs(20);
+    while !dir.join("exited").exists() && Instant::now() < give_up {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let child_ran = dir.join("exited").exists();
+    let report = std::fs::read_to_string(dir.join("report")).unwrap_or_default();
+
+    assert!(tick_ok, "the tick role failed: {report:?}");
+    assert!(report.starts_with("spawned=true"), "no child: {report:?}");
+    assert!(child_ran, "the child never ran, so EOF proves nothing");
+    assert!(
+        eof && alive_at_eof,
+        "the tick exited but its stdout/stderr pipe stayed open while its \
+         background child lived: the child inherited the tick's handles"
+    );
+    assert!(
+        report.ends_with("inheritable=[false, false, false]"),
+        "a standard handle is still inheritable after the entry layers: {report:?}"
+    );
+}
+
+/// Whether stdin, stdout and stderr carry `HANDLE_FLAG_INHERIT`.
+#[cfg(windows)]
+fn std_handles_inheritable() -> [bool; 3] {
+    use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].map(|which| unsafe {
+        let mut flags = 0;
+        GetHandleInformation(GetStdHandle(which), &mut flags) != 0
+            && flags & HANDLE_FLAG_INHERIT != 0
+    })
+}
+
+/// Unix has no inherit flag to clear: `exec` replaces fds 0-2 and std opens
+/// everything else close-on-exec.
+#[cfg(unix)]
+fn std_handles_inheritable() -> [bool; 3] {
+    [false; 3]
+}
+
 // ---------------------------------------------------------------------------
 // Clock
 // ---------------------------------------------------------------------------

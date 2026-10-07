@@ -84,6 +84,10 @@ mod imp {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
 
+    /// Nothing to clear: `exec` replaces fds 0-2 with whatever the child was
+    /// given, and std opens every other descriptor close-on-exec.
+    pub fn make_std_handles_uninheritable() {}
+
     /// Layer 1 of silent degradation. A stack overflow or allocation failure
     /// writes straight to fd 2 from the runtime, below the panic hook, so the
     /// descriptor is redirected before anything runs.
@@ -176,7 +180,10 @@ mod imp {
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, SetHandleInformation, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE,
+    };
     use windows_sys::Win32::Security::Authorization::{
         GetNamedSecurityInfoW, GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
     };
@@ -191,7 +198,9 @@ mod imp {
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
         FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
-    use windows_sys::Win32::System::Console::{SetStdHandle, STD_ERROR_HANDLE};
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     fn wide(s: &Path) -> Vec<u16> {
@@ -199,6 +208,27 @@ mod imp {
             .encode_wide()
             .chain(std::iter::once(0))
             .collect()
+    }
+
+    /// Takes the inherit flag off the three standard handles this process was
+    /// given. `CreateProcess` hands a child every inheritable handle in the
+    /// parent, whatever stdio the child was assigned, so without this the
+    /// detached `notify` child holds Claude Code's stdout and stderr pipes
+    /// open until it exits, and the refresh waits on it. Spawns are unaffected:
+    /// std duplicates an inheritable copy of each handle a child asks for.
+    ///
+    /// Must run before `redirect_stderr_to_null`, which leaves the original
+    /// stderr open but unreachable. The click helper starts with no standard
+    /// handles at all; those slots are skipped.
+    pub fn make_std_handles_uninheritable() {
+        for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+            unsafe {
+                let h = GetStdHandle(which);
+                if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                    SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
     }
 
     /// Layer 1, Windows form: swap the standard error handle for one on `NUL`.
@@ -429,7 +459,7 @@ mod imp {
     }
 }
 
-pub use imp::redirect_stderr_to_null;
+pub use imp::{make_std_handles_uninheritable, redirect_stderr_to_null};
 
 /// The current user's comparable owner id, or `None` when it cannot be read.
 pub fn current_owner() -> Option<u64> {
