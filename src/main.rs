@@ -25,9 +25,10 @@ fn read_stdin() -> String {
 /// arrives whole; a runaway stream cannot exhaust memory.
 const HOOK_STDIN_CAP: u64 = 32 * 1024 * 1024;
 
-/// The hook payload for `notify`: read when stdin is not a terminal, capped.
+/// The hook payload for `notify` and `housekeep`: read when stdin is not a
+/// terminal, capped. `housekeep` only drains it.
 ///
-/// Every event reads it: the session id is what a toast's click
+/// Every `notify` event reads it: the session id is what a toast's click
 /// resolves. A terminal is skipped so `notify stop` typed at a prompt stays
 /// usable; the tick-spawned child's null stdin returns end-of-file at once.
 fn read_hook_stdin() -> String {

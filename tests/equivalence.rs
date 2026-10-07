@@ -4982,6 +4982,24 @@ fn expected_hook(
     serde_json::to_string(&entry).unwrap()
 }
 
+/// Checks every `ALL_HOOKS` event in `root` against `expected_hook` in `form`,
+/// each failure labelled `<label> <event>`.
+fn check_all_hooks(
+    failures: &mut Failures,
+    label: &str,
+    root: &serde_json::Value,
+    form: settings::HookForm,
+    bare: &str,
+) {
+    for (event, matcher, tokens) in ALL_HOOKS {
+        let expected = expected_hook(matcher, form, bare, WIN_BINARY, tokens);
+        let actual = serde_json::to_string(&root["hooks"][event]).unwrap();
+        failures.check(&format!("{label} {event}"), actual == expected, || {
+            format!("expected {expected}\n      got {actual}")
+        });
+    }
+}
+
 /// Exec form puts the bare path in `command` and the subcommand in `args`, so
 /// Claude Code spawns the binary with no shell; shell form is what every
 /// earlier install wrote, byte for byte. The status-line entries have no
@@ -4998,13 +5016,7 @@ fn hooks_are_written_in_the_hook_form_asked_for() {
         };
         settings::apply(&mut root, bare, &spec);
 
-        for (event, matcher, tokens) in ALL_HOOKS {
-            let expected = expected_hook(matcher, form, bare, WIN_BINARY, tokens);
-            let actual = serde_json::to_string(&root["hooks"][event]).unwrap();
-            failures.check(&format!("{form:?} {event}"), actual == expected, || {
-                format!("expected {expected}\n      got {actual}")
-            });
-        }
+        check_all_hooks(&mut failures, &format!("{form:?}"), &root, form, bare);
         for (key, expected) in [
             ("statusLine", WIN_BINARY.to_string()),
             ("subagentStatusLine", format!("{WIN_BINARY} subagent")),
@@ -5037,13 +5049,7 @@ fn switching_hook_form_leaves_one_entry_per_event() {
             ..all_quoted()
         };
         settings::apply(&mut root, bare, &spec);
-        for (event, matcher, tokens) in ALL_HOOKS {
-            let expected = expected_hook(matcher, form, bare, WIN_BINARY, tokens);
-            let actual = serde_json::to_string(&root["hooks"][event]).unwrap();
-            failures.check(&format!("to {form:?} {event}"), actual == expected, || {
-                format!("expected {expected}\n      got {actual}")
-            });
-        }
+        check_all_hooks(&mut failures, &format!("to {form:?}"), &root, form, bare);
     }
     failures.assert_empty("hook form switch");
 }

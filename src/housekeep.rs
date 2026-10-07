@@ -116,10 +116,10 @@ pub fn judge(f: &ProcessFacts, cx: &Context) -> Verdict {
     if f.pid == cx.own_pid {
         return skip(Own);
     }
-    let tick = f.name.eq_ignore_ascii_case(TICK_IMAGE);
-    if !tick && !f.name.eq_ignore_ascii_case(HELPER_IMAGE) {
+    if !covers(&f.name) {
         return skip(Name);
     }
+    let tick = f.name.eq_ignore_ascii_case(TICK_IMAGE);
     let (Some(image), Some(created), Some(owner), Some(me)) =
         (&f.image, f.created, f.owner, cx.owner)
     else {
@@ -168,6 +168,11 @@ pub fn judge(f: &ProcessFacts, cx: &Context) -> Verdict {
         return skip(Foreign);
     }
     Verdict::Terminate
+}
+
+/// Whether a rule covers an image of this Toolhelp name.
+fn covers(name: &str) -> bool {
+    name.eq_ignore_ascii_case(TICK_IMAGE) || name.eq_ignore_ascii_case(HELPER_IMAGE)
 }
 
 fn normalized(path: &str) -> String {
@@ -242,6 +247,8 @@ fn max_age(name: &str) -> Option<Duration> {
 /// What one reclamation pass did, for the debug line.
 #[derive(Default)]
 struct Tally {
+    /// Covered processes opened and judged. This process is skipped before
+    /// it is opened, so it counts under `skipped`'s `Own` and not here.
     candidates: usize,
     terminated: usize,
     /// Judged stranded, but `TerminateProcess` failed.
@@ -251,9 +258,10 @@ struct Tally {
     skipped: BTreeMap<Reason, usize>,
 }
 
-/// Opens every process a rule's image name covers, judges it on that one
-/// handle, terminates the stranded ones through the same handle, then waits
-/// for them once. Toolhelp's name filters first, so nothing else is opened.
+/// Opens every other process a rule's image name covers, judges it on that
+/// one handle, terminates the stranded ones through the same handle, then
+/// waits for them once. Toolhelp's name filters first, so nothing else is
+/// opened, and this process never is: `judge` would skip it anyway.
 fn reclaim() -> Tally {
     let snapshot = platform::process_snapshot();
     let cx = Context {
@@ -267,9 +275,11 @@ fn reclaim() -> Tally {
     let mut tally = Tally::default();
     let mut terminated = Vec::new();
     for (&pid, entry) in &snapshot.entries {
-        let covered = entry.name.eq_ignore_ascii_case(TICK_IMAGE)
-            || entry.name.eq_ignore_ascii_case(HELPER_IMAGE);
-        if !covered {
+        if !covers(&entry.name) {
+            continue;
+        }
+        if pid == cx.own_pid {
+            *tally.skipped.entry(Reason::Own).or_default() += 1;
             continue;
         }
         let Some(candidate) = platform::open_candidate(&snapshot, pid) else {

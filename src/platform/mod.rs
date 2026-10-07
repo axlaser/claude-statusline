@@ -688,16 +688,8 @@ mod imp {
     /// The creation time from a limited-information handle, which a standard
     /// user can open on every process of their own.
     pub fn process_start(pid: u64) -> Option<u64> {
-        let pid = u32::try_from(pid).ok()?;
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle.is_null() {
-                return None;
-            }
-            let start = times(handle).map(|(created, _)| created);
-            CloseHandle(handle);
-            start
-        }
+        let handle = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        times(handle.0).map(|(created, _)| created)
     }
 
     /// One Toolhelp snapshot, keyed by pid.
@@ -745,6 +737,19 @@ mod imp {
         }
     }
 
+    /// `pid` opened with `access`; `None` when it does not fit a `DWORD` or
+    /// the open fails.
+    fn open(pid: u64, access: u32) -> Option<ProcessHandle> {
+        let pid = u32::try_from(pid).ok()?;
+        let raw = unsafe { OpenProcess(access, 0, pid) };
+        // Never `then_some`: a null handle built eagerly would be closed on drop.
+        if raw.is_null() {
+            None
+        } else {
+            Some(ProcessHandle(raw))
+        }
+    }
+
     impl ProcessHandle {
         pub fn terminate(&self) -> bool {
             unsafe { TerminateProcess(self.0, 1) != 0 }
@@ -753,8 +758,7 @@ mod imp {
         /// Whether the process exited within `within`. Never waits forever:
         /// `INFINITE` is a value of the same parameter.
         pub fn wait(&self, within: std::time::Duration) -> bool {
-            let ms =
-                u32::try_from(within.as_millis()).map_or(INFINITE - 1, |ms| ms.min(INFINITE - 1));
+            let ms = within.as_millis().min(u128::from(INFINITE - 1)) as u32;
             unsafe { WaitForSingleObject(self.0, ms) == WAIT_OBJECT_0 }
         }
     }
@@ -774,16 +778,13 @@ mod imp {
             parent: super::ParentStart::Unreadable,
         };
         let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE;
-        let raw = u32::try_from(pid)
-            .map(|p| unsafe { OpenProcess(access, 0, p) })
-            .unwrap_or(std::ptr::null_mut());
-        if raw.is_null() {
+        let Some(handle) = open(pid, access) else {
             return Some(super::Candidate {
                 facts,
                 handle: None,
             });
-        }
-        let handle = ProcessHandle(raw);
+        };
+        let raw = handle.0;
         facts.image = image_path(raw);
         if let Some((created, cpu)) = times(raw) {
             facts.created = Some(created);
