@@ -209,6 +209,8 @@ observed fresh/stale outcome, not only the rendered bytes — see
   reads as never-notified, so a session already over threshold re-fires its context or rate
   alert once. Accepted rather than migrated: a sweep would add a delete path over
   predictable names in a shared directory, which is the surface the guards exist for.
+  *(2026-10-07: still true of the flat files this entry is about. `housekeep` now sweeps,
+  but only inside the verified private directory — see the 2026-10-07 sweep entry below.)*
 - *2026-09-21:* a user who upgrades mid-session abandons that session's token record and
   its per-agent records, because both formats gained fields — the token record is `v5` and
   the per-agent record is nine fields — and the parsers reject any record whose count or
@@ -277,6 +279,18 @@ observed fresh/stale outcome, not only the rendered bytes — see
   other way, and a wrong join degrades to the same quiet row as "nothing to report"), and
   `a_hostile_changelog_target_is_refused_not_followed` for the guard, which every other
   guarded read in the crate already has.
+- *2026-10-07:* `housekeep` deletes state files untouched for 7 days and staging files
+  (`.<family>….<pid>.tmp`) older than 10 minutes. A session resumed after a week finds its
+  records gone and pays the one-tick effects an abandoned record already has, the first
+  three as the 2026-08-02 entry lists them: one large `(+N)` token delta, a threshold
+  alert that may repeat once, the fallback tier re-reading each agent transcript once, and
+  one full read of the session's own transcript. This
+  narrows the 2026-08-02 refusal rather than reversing it: that entry rejected a delete
+  path over predictable names in the *shared* temp root, and the sweep never runs there.
+  It runs only when the root is the guarded directory and verifies private at that moment,
+  acts on regular files only, and never follows a link. The evidence is new: ticks killed
+  between write and rename had left 24 staging files in one user's directory, and no
+  per-session state file was ever deleted.
 
 ### Accepted divergence: `Bash` no longer invalidates the git cache — 2026-09-21
 
@@ -846,7 +860,8 @@ in `src/state.rs`, which are unchanged and must stay unconditional inside it.
 
 **There is no migration, and the cited clutter does not go away.** The motivating
 number — 82 of 437 entries in the maintainer's `%TEMP%` — is not reduced by
-shipping this. Existing flat files are never migrated, swept, or read; they
+shipping this. Existing flat files are never migrated, swept, or read (the
+`housekeep` sweep added on 2026-10-07 acts inside the private directory only); they
 persist until an uninstall or an OS temp cleaner removes them, which is why both
 uninstallers keep their legacy flat globs permanently. The change bounds future
 accumulation.
@@ -1553,3 +1568,83 @@ binary's directory: a measurement must not terminate those without the user's sa
 live pass adds one `TerminateProcess` per match and one shared wait, at most 1 s, for the
 images to unmap. The case table never runs one: every test that launches `housekeep`
 sets `STATUSLINE_SKIP_PROCESS_RECLAIM`.
+
+### `housekeep` runs on prompt submit and on idle, never per tick — 2026-10-07
+
+Recorded because the pass takes a system-wide process snapshot, the kind of work §2 keeps
+off the tick, and because each obvious placement is wrong for a reason worth keeping.
+
+**Where it runs.** Two async hooks, written whenever the status line is: `UserPromptSubmit`,
+and `Notification` with matcher `idle_prompt`, which Claude Code sends once a finished turn
+has waited `messageIdleNotifThresholdMs` (60 s by default) for input, and not while
+background agents still run (`notification_type: "idle_prompt"` in the 2.1.292 bundle). A
+turn's strays are reclaimed about a minute after it ends rather than at the next prompt,
+which after the last prompt of the day is the next morning. `install.ps1` runs a pass after
+the self-check and `uninstall.ps1` before `settings remove`, so an upgrade can remove the
+`.old` image the stranded ticks kept mapped. The cost is the entry above: about 15 ms, the
+snapshot, twice per turn.
+
+- **Not per tick.** It would put a snapshot on the path §2 forbids new work on, and a
+  stranded process is only reclaimable after the 60 s age floor anyway.
+- **Not on `Stop`.** `notify stop` holds that event. A second `Stop` entry would make
+  `settings has notify` answer yes, and the installers would switch notifications on for
+  users who declined them, including from older pinned binaries that cannot be fixed. The
+  hook writer's de-duplication would also make the two entries erase each other.
+- **Tied to the status line, not a flag.** No new `apply` option means no `settings
+  supports` probe in the installers, and the cleanup exists because of status-line ticks.
+- **No rate-limiting stamp file.** Two passes per turn at about 15 ms do not earn one.
+  Reopen if a pass measures above ~50 ms.
+
+**What waits for the next prompt.** A process stranded in a turn's last seconds is still
+under the 60 s floor when the idle pass runs. It is reclaimed at the next prompt's pass, as
+is everything when `idle_prompt` does not fire (background agents still running, or a
+raised idle threshold).
+
+**The floor is pinned, not chosen by feel.** A detached `notify` child legitimately runs
+with a dead parent, so the age floor is what keeps the rules off it.
+`the_age_floor_outlasts_every_bounded_wait` holds `STRANDED_AGE_FLOOR` above the longest
+bounded wait such a process makes, `SPAWN_DEADLINE` (20 s) plus a 30 s allowance for a
+synchronous sound, so a future longer wait fails a test instead of being killed.
+
+### The refresh stays at 1 s — slowing it rejected, 2026-10-07
+
+Raising the default `refreshInterval` from `1` to `10`, with a one-time migration of
+installs still at `1`, was considered and not adopted: per-second redraw is kept.
+The case for it was that on Windows a tick took 0.5–1.3 s to reach this binary through Git
+Bash (maintainer machine, Windows 11 26200, Claude Code 2.1.292, Git for Windows 2.55), so
+most ticks were still starting when the next came due and Claude Code's cancellation
+stranded processes: 14 of 119 ticks (12%) in an 11-minute sample
+(`docs/solutions/integration-issues/claude-code-taskkill-strands-msys2-children.md`).
+Cancelled ticks still leak at that rate. The `housekeep` hooks, on prompt submit and on
+idle, are what reclaim them.
+
+### Hooks launch the binary directly — 2026-10-07
+
+`settings apply` writes each hook in **exec form** when `claude --version` reports 2.1.139
+or newer: `"command"` is the bare absolute path and the subcommand goes in `"args"`, and
+Claude Code spawns the binary with no shell. Otherwise, or when the version cannot be read,
+it writes the quoted command string every earlier install wrote. `--hook-form exec|shell`
+overrides the probe. `statusLine` and `subagentStatusLine` stay strings in both forms,
+because Claude Code's schema drops `args` for them.
+
+**It prevents none of the measured leaks.** Every leak in the sample came from a
+status-line tick, and no hook run leaked. What it saves is a Git Bash launch on every hook
+run on Windows: about four short-lived processes and one bash start each. Kept in this
+release for that saving, at the price of a version probe and a second hook shape.
+
+- **The probe runs once per `apply`, never on a hook or a tick.** It goes through the same
+  bounded spawn as the git child, at most 5 s, and only after `settings.json` has loaded,
+  so no other action and no refused file spawns `claude`. Its version is parsed with
+  `update.rs`'s comparison, one parser instead of one in each installer, and the
+  installers pass no new flag, so an older pinned binary is never handed one.
+- **Unknown is the shell form.** Only the `claude` on `PATH` is asked. On Windows `Command`
+  resolves `claude.exe` only, so an npm install's `claude.cmd` shim reads as unknown, which
+  is today's behaviour rather than a failed install.
+- **What it cannot see.** A host that bundles its own, older Claude Code (an IDE extension,
+  the desktop app) would read exec hooks it cannot run; README tells those users to re-run
+  `apply` with `--hook-form shell`. Downgrading Claude Code below 2.1.139 needs a reinstall
+  for the same reason.
+- **Exec form needs an absolute path.** Without a shell nothing expands `~`. The installers
+  already pass absolute paths.
+- **Switching forms never leaves two entries.** Both shapes carry the path in `"command"`,
+  which is what `has`, `remove` and the hook writer's de-duplication match on.

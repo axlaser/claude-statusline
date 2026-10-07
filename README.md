@@ -207,7 +207,7 @@ They're only available on Claude Pro and Max plans, not API keys, and only after
 
 - Test it: `~/.claude/bin/claude-statusline notify stop` should play a sound. On Windows: `& "$env:USERPROFILE\.claude\bin\claude-statusline.exe" notify stop`.
 - Check the event isn't set to `"sound": false` in `~/.claude/notify-config.json`.
-- Check `settings.json` has `claude-statusline notify <event>` hooks under `PermissionRequest`, `Stop`, `PreCompact` and `PostCompact`.
+- Check `settings.json` has hooks under `PermissionRequest`, `Stop`, `PreCompact` and `PostCompact` that run `claude-statusline` with `notify <event>`. The event is either at the end of the `command` string or, on Claude Code 2.1.139 and later, in `args`.
 - Linux: `paplay` needs PulseAudio or PipeWire running. Without it, `ffplay` or `ogg123` play the sound if one is installed.
 - Restart Claude Code. Hooks load at startup.
 
@@ -237,6 +237,57 @@ Turn on the debug log, raise a notification, click it, and read the `focus:` lin
 - **Linux, nothing comes forward:** see the [platform notes](#click-to-focus). With several GNOME Terminal windows open, none is raised, because GNOME Terminal doesn't expose which window is which.
 - **`TMPDIR` differs between your terminal and your login session:** the click handler looks in the wrong place and just dismisses the notification.
 - **kitty:** needs `allow_remote_control yes` and a unix socket, such as `listen_on unix:/tmp/kitty`.
+
+</details>
+
+<details>
+<summary><strong>Hooks don't run in an IDE extension or the desktop app</strong></summary>
+
+The installer asks your `claude` command for its version. From Claude Code 2.1.139 on, it writes hooks that launch the binary directly, with its path in `command` and the subcommand in `args`, and no shell. A host that bundles its own, older Claude Code can't run those. If yours is older than 2.1.139, rewrite the hooks as command strings:
+
+```bash
+~/.claude/bin/claude-statusline settings apply --binary ~/.claude/bin/claude-statusline --statusline --subagent --git-refresh --notify --hook-form shell
+```
+
+```powershell
+$bin = "$env:USERPROFILE\.claude\bin\claude-statusline.exe"
+& $bin settings apply --binary $bin --statusline --subagent --git-refresh --notify --hook-form shell
+```
+
+Leave out `--notify` if you don't use notifications, and `--subagent` if you kept your own `subagentStatusLine`. After downgrading Claude Code itself below 2.1.139, running the installer again is enough. Restart Claude Code either way.
+
+</details>
+
+<details>
+<summary><strong>Windows: leftover <code>claude-statusline</code> and <code>cygwin-console-helper</code> processes</strong></summary>
+
+When a refresh is still starting as the next one comes due, Claude Code cancels it by killing its process tree, and that kill can race Git Bash. What it leaves behind never finishes: a `claude-statusline.exe` that never got to run, or a `cygwin-console-helper.exe` waiting for a bash that's gone, each helper keeping its own console host (`conhost.exe`) open. On one machine a week of this added up to 436 processes and about 2.4 GB of memory. The cause is in Claude Code and Git Bash ([anthropics/claude-code#98976](https://github.com/anthropics/claude-code/issues/98976)); this tool cleans up after it.
+
+- **Cleanup is automatic.** A `housekeep` hook runs each time you send a prompt, and again about a minute after a turn ends. It stops leftovers at least 60 seconds old whose parent has gone, and leaves anything that may still be in use, including helpers serving an open Git Bash window.- **Count them:**
+
+  ```powershell
+  Get-Process claude-statusline, cygwin-console-helper -ErrorAction SilentlyContinue | Group-Object Name -NoElement
+  ```
+
+- **Clean up now.** Run the same pass by hand. It prints nothing, so count before and after:
+
+  ```powershell
+  & "$env:USERPROFILE\.claude\bin\claude-statusline.exe" housekeep
+  ```
+
+  Each helper's console host exits with it. Anything under 60 seconds old waits for the next pass.
+- **Fewer of them:** a longer [refresh interval](#configuration) means fewer refreshes cancelled while starting, at the cost of the idle time and rate-limit countdowns updating less often.
+- **Still there?** With the [debug log](#configuration) on, each pass writes a `housekeep:` line counting what it found, stopped and skipped, and why. Restarting Windows clears them all.
+- **An upgrade said "Could not move the existing binary aside":** leftovers were holding the old binary. Run the install command again; it now moves a locked copy out of the way and cleans up once the new binary has passed its self-check.
+- **Every refresh is slow:** some antivirus products delay each start of Git's `usr\bin\bash.exe` specifically, while an identical copy under another name starts in about 60 ms. Slow starts mean more cancelled refreshes. Compare the two in Git's folder (adjust the path if Git is installed elsewhere):
+
+  ```powershell
+  $git = "$env:ProgramFiles\Git\usr\bin"
+  (Measure-Command { & "$git\bash.exe" -c true }).TotalMilliseconds
+  (Measure-Command { & "$git\sh.exe" -c true }).TotalMilliseconds
+  ```
+
+  If `bash.exe` is much slower, an on-access process exclusion for that path in your antivirus is worth asking about; it helped on the maintainer's machine.
 
 </details>
 
@@ -431,51 +482,70 @@ Every step can be read before you run it.
    <details>
    <summary>Or edit <code>settings.json</code> by hand</summary>
 
-   This is exactly what the command writes:
+   This is what the command writes with Claude Code 2.1.139 or later. `<absolute path>` is the binary's full path, as `echo ~/.claude/bin/claude-statusline` prints it: hooks in this form run without a shell, so nothing expands `~` or `$HOME`.
 
    ```json
    {
      "statusLine": {
        "type": "command",
-       "command": "~/.claude/bin/claude-statusline",
+       "command": "<absolute path>",
        "refreshInterval": 1
      },
      "subagentStatusLine": {
        "type": "command",
-       "command": "~/.claude/bin/claude-statusline subagent"
+       "command": "<absolute path> subagent"
      },
      "hooks": {
        "PostToolUse": [
          {
            "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline git-refresh", "async": true }]
+           "hooks": [{ "type": "command", "command": "<absolute path>", "args": ["git-refresh"], "async": true }]
          }
        ],
        "PermissionRequest": [
          {
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify permission", "async": true }]
+           "hooks": [{ "type": "command", "command": "<absolute path>", "args": ["notify", "permission"], "async": true }]
          }
        ],
        "Stop": [
          {
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify stop", "async": true }]
+           "hooks": [{ "type": "command", "command": "<absolute path>", "args": ["notify", "stop"], "async": true }]
          }
        ],
        "PreCompact": [
          {
            "matcher": "*",
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify compaction_start", "async": true }]
+           "hooks": [{ "type": "command", "command": "<absolute path>", "args": ["notify", "compaction_start"], "async": true }]
          }
        ],
        "PostCompact": [
          {
            "matcher": "*",
-           "hooks": [{ "type": "command", "command": "~/.claude/bin/claude-statusline notify compaction_done", "async": true }]
+           "hooks": [{ "type": "command", "command": "<absolute path>", "args": ["notify", "compaction_done"], "async": true }]
+         }
+       ],
+       "UserPromptSubmit": [
+         {
+           "hooks": [{ "type": "command", "command": "<absolute path>", "args": ["housekeep"], "async": true }]
+         }
+       ],
+       "Notification": [
+         {
+           "matcher": "idle_prompt",
+           "hooks": [{ "type": "command", "command": "<absolute path>", "args": ["housekeep"], "async": true }]
          }
        ]
      }
    }
    ```
+
+   On Claude Code older than 2.1.139, or when it can't read your version, the command writes each hook as one string that runs through a shell instead:
+
+   ```json
+   { "type": "command", "command": "<absolute path> notify stop", "async": true }
+   ```
+
+   `statusLine` and `subagentStatusLine` are strings in both forms.
 
    </details>
 
@@ -539,10 +609,16 @@ Every step can be read before you run it.
    & $bin settings protocol register --binary $bin
    ```
 
-   To edit `settings.json` by hand instead, use the [macOS and Linux JSON](#manual-install-macos-and-linux) with every command pointing at the full, quoted path. The quotes stop a space in your profile path from breaking the command:
+   To edit `settings.json` by hand instead, use the [macOS and Linux JSON](#manual-install-macos-and-linux) with every command pointing at the full path to `claude-statusline.exe`, backslashes doubled. A command that is one string (`statusLine`, `subagentStatusLine`, and hooks on Claude Code older than 2.1.139) needs the path in quotes, so a space in your profile path can't break it:
 
    ```json
-   "command": "\"C:/Users/YOUR_USERNAME/.claude/bin/claude-statusline.exe\" subagent"
+   "command": "\"C:\\Users\\YOUR_USERNAME\\.claude\\bin\\claude-statusline.exe\" subagent"
+   ```
+
+   A hook with `args` takes the bare path, without quotes:
+
+   ```json
+   { "type": "command", "command": "C:\\Users\\YOUR_USERNAME\\.claude\\bin\\claude-statusline.exe", "args": ["notify", "stop"], "async": true }
    ```
 
 6. **Upgrading from the old PowerShell-script version?** Delete the scripts. Keep `notify-config.json`.
@@ -565,9 +641,10 @@ On each refresh, Claude Code pipes a JSON description of the session to the bina
 | `subagent` | `subagentStatusLine` | Saves Claude Code's live subagent feed for the box to read. Prints nothing, so Claude Code's own agent panel is unchanged. |
 | `git-refresh` | `PostToolUse` hook | Clears the cached git status after a file edit |
 | `notify <event>` | `PermissionRequest`, `Stop`, `PreCompact`, `PostCompact` hooks | Plays sounds and shows desktop notifications |
+| `housekeep` | `UserPromptSubmit` hook, and `Notification` hook for `idle_prompt` | Deletes session files untouched for a week, and half-written ones a killed refresh left. On Windows, also stops processes that cancelled refreshes left behind |
 | `focus` | A notification's click action | Brings the session's terminal forward |
 
-On Windows, clicks go to `claude-statusline-focus.exe`, a second program built without a console so no window flashes.
+From Claude Code 2.1.139, hooks launch the binary directly, with no shell; on Windows that skips starting Git Bash for every hook. The installer checks your Claude Code version and writes command strings for older ones. On Windows, clicks go to `claude-statusline-focus.exe`, a second program built without a console so no window flashes.
 
 It stays fast in long sessions because it skips repeat work. Git status is cached for up to 5 seconds and cleared as soon as `.git/index` changes. The transcript is only read again when its size or modified time changes.
 
