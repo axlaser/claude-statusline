@@ -83,21 +83,17 @@ pub const POST_TOOL_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
 
 /// Claude Code's refresh cadence for the status line, in seconds. Written only
 /// when the entry does not already carry one, so a user who tuned it keeps
-/// their value across upgrades -- except an exact `1` on the upgrade that first
-/// writes the housekeep hooks, which moves here once (see `apply`).
+/// their value across upgrades.
 ///
 /// `2` while the scripts shipped, because PowerShell's ~124 ms startup made a
 /// 1-second cadence expensive on Windows and one value had to serve every
-/// platform. The interpreter went, so the default dropped to `1`, the minimum
+/// platform. The interpreter is gone, so the default drops to the minimum
 /// the scripts already used on macOS and Linux.
 ///
-/// `10` since 2026-10-07. On Windows a tick took 0.5-1.3 s just to reach this
-/// binary through Git Bash, so at `1` most ticks were still starting when the
-/// next was due, and Claude Code cancels the old one with a tree kill that
-/// races MSYS2's process creation and strands processes. One value still
-/// serves every platform: the cost is idle elapsed time and rate-limit
-/// countdowns redrawing every 10 s instead of every second.
-pub const REFRESH_INTERVAL: u64 = 10;
+/// Kept at `1` on 2026-10-07, when `10` was considered to cut the ticks
+/// Claude Code cancels on Windows: per-second redraw won, and the strays a
+/// cancelled tick leaves are reclaimed by `housekeep` instead.
+pub const REFRESH_INTERVAL: u64 = 1;
 
 /// The four scripts a pre-binary installation left in `~/.claude`, as
 /// basenames: what the script installers matched on when de-duplicating their
@@ -274,25 +270,8 @@ pub fn apply(root: &mut Value, binary: &str, spec: &ApplySpec) {
     // Captured before `remove_legacy` deletes those entries: a migrating user's
     // own keys live in that object and should survive the migration as they
     // survive an ordinary upgrade.
-    let mut prior_statusline = root.get(STATUS_LINE).cloned();
+    let prior_statusline = root.get(STATUS_LINE).cloned();
     let prior_subagent = root.get(SUBAGENT_STATUS_LINE).cloned();
-
-    // Settings written before the housekeep hooks existed carry `1` as the old
-    // default, not as a choice, so it moves to `REFRESH_INTERVAL` once. The
-    // hooks' absence is the marker, read before this run writes them; a `1`
-    // set by hand after that upgrade is kept. A user who deletes the hooks by
-    // hand is migrated again on their next install: accepted, as no other
-    // marker exists without new state.
-    let housekeep_installed = HOUSEKEEP_HOOKS
-        .iter()
-        .any(|(event, _)| hook_present(root, event, binary));
-    if !housekeep_installed {
-        if let Some(Value::Object(prior)) = prior_statusline.as_mut() {
-            if prior.get("refreshInterval").and_then(Value::as_u64) == Some(1) {
-                prior.insert("refreshInterval".into(), json!(REFRESH_INTERVAL));
-            }
-        }
-    }
 
     remove_legacy(root);
 
@@ -362,8 +341,7 @@ pub fn apply(root: &mut Value, binary: &str, spec: &ApplySpec) {
 
 /// Writes our entry at `key` over whatever was already there, keeping the
 /// user's own keys. `type` and `command` are always rewritten, since an upgrade
-/// has to repoint the command; `defaults` are written only when absent. The
-/// one-time `refreshInterval` migration is the caller's, applied to `prior`.
+/// has to repoint the command; `defaults` are written only when absent.
 ///
 /// Replacing the whole object, as this used to, silently deleted a customised
 /// `refreshInterval` and any `padding` on every upgrade, both of which README

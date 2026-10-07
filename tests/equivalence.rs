@@ -5313,7 +5313,7 @@ fn the_status_line_brings_the_housekeep_hooks() {
     }
     failures.check(
         "refreshInterval",
-        root["statusLine"]["refreshInterval"] == 10,
+        root["statusLine"]["refreshInterval"] == 1,
         || format!("got {}", root["statusLine"]["refreshInterval"]),
     );
     failures.check(
@@ -5324,11 +5324,12 @@ fn the_status_line_brings_the_housekeep_hooks() {
     failures.assert_empty("housekeep hooks");
 }
 
-/// KTD10: an install still at the old `1` moves to `10` on the upgrade that
-/// first writes the housekeep hooks, and never again. The hooks' absence is
-/// the only marker, so a `1` set by hand after that upgrade is the user's.
+/// The upgrade that first writes the housekeep hooks leaves the cadence alone.
+/// Moving `1` to `10` was considered on 2026-10-07 to cut the ticks Claude
+/// Code cancels, and rejected: per-second redraw stays, and `housekeep`
+/// reclaims what a cancelled tick strands.
 #[test]
-fn a_one_second_refresh_moves_to_ten_once_with_the_housekeep_hooks() {
+fn the_housekeep_upgrade_keeps_a_one_second_refresh() {
     let mut root = serde_json::json!({
         "statusLine": {
             "type": "command",
@@ -5339,20 +5340,10 @@ fn a_one_second_refresh_moves_to_ten_once_with_the_housekeep_hooks() {
     });
     settings::apply(&mut root, UNIX_BINARY, &all());
     assert_eq!(
-        root["statusLine"]["refreshInterval"], 10,
-        "an install still at 1 was not migrated"
-    );
-    assert_eq!(
-        root["statusLine"]["padding"], 2,
-        "the migration lost padding"
-    );
-
-    root["statusLine"]["refreshInterval"] = serde_json::json!(1);
-    settings::apply(&mut root, UNIX_BINARY, &all());
-    assert_eq!(
         root["statusLine"]["refreshInterval"], 1,
-        "a 1 the user chose after the migration was overwritten"
+        "the upgrade that adds the housekeep hooks changed the refresh"
     );
+    assert_eq!(root["statusLine"]["padding"], 2, "the upgrade lost padding");
 }
 
 /// Windows quoting, driven the way an installer drives it: with the
@@ -5568,13 +5559,12 @@ fn a_script_installation_is_rewritten_not_left_beside_ours() {
         });
     }
 
-    // A script install predates the housekeep hooks, so its `1` migrates.
     failures.check(
         "refreshInterval",
-        root["statusLine"]["refreshInterval"] == 10,
+        root["statusLine"]["refreshInterval"] == 1,
         || {
             format!(
-                "the script-era 1 was not migrated: {}",
+                "the script-era refresh was changed: {}",
                 root["statusLine"]["refreshInterval"]
             )
         },
@@ -5723,10 +5713,7 @@ fn existing_key_order_is_preserved() {
 /// with nothing said about it — and README documents both as things to tune,
 /// so the settings most likely to be present were the ones most likely to be
 /// lost. The default is only a default: it is written when the key is absent
-/// and never over a value the user chose. The one exception is an exact `1`
-/// on the upgrade that first writes the housekeep hooks, which was the old
-/// default rather than a choice and moves to `10` once
-/// (`a_one_second_refresh_moves_to_ten_once_with_the_housekeep_hooks`).
+/// and never over a value the user chose.
 #[test]
 fn an_upgrade_keeps_the_users_own_status_line_keys() {
     let mut root = serde_json::json!({
@@ -5768,7 +5755,8 @@ fn an_upgrade_keeps_the_users_own_status_line_keys() {
     let mut fresh = serde_json::json!({});
     settings::apply(&mut fresh, UNIX_BINARY, &all());
     assert_eq!(
-        fresh["statusLine"]["refreshInterval"], 10,
+        fresh["statusLine"]["refreshInterval"],
+        settings::REFRESH_INTERVAL,
         "a fresh install should carry the default cadence"
     );
 }
