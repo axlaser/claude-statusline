@@ -107,6 +107,8 @@ fn settings_cli(rest: &[&str]) -> i32 {
         quote: settings::quote_for_this_platform(),
         ..Default::default()
     };
+    // Absent means `apply` asks `claude --version`.
+    let mut hook_form: Option<settings::HookForm> = None;
     let mut positional: Vec<&str> = Vec::new();
     let mut args = rest.iter().copied();
 
@@ -135,9 +137,15 @@ fn settings_cli(rest: &[&str]) -> i32 {
                 spec.git_refresh = true;
                 spec.notify = true;
             }
-            // Testing hooks: the platform default is what installers use.
+            // Testing and manual overrides: installers pass neither, and get
+            // the platform default and the detected hook form.
             "--quote" => spec.quote = true,
             "--no-quote" => spec.quote = false,
+            "--hook-form" => match args.next() {
+                Some("exec") => hook_form = Some(settings::HookForm::Exec),
+                Some("shell") => hook_form = Some(settings::HookForm::Shell),
+                _ => return fail("--hook-form needs exec or shell"),
+            },
             // A mistyped flag must not reach `positional` and be dropped:
             // accepting `--subagnet` and reporting success is what the exit-0
             // exemption exists to prevent. The `has` forms take a name there.
@@ -185,6 +193,10 @@ fn settings_cli(rest: &[&str]) -> i32 {
 
     match action {
         "apply" => {
+            // Detected here, after the file loaded, so no other action and no
+            // refused file ever spawns `claude`. Detection cannot fail `apply`:
+            // unknown is the shell form.
+            spec.hook_form = hook_form.unwrap_or_else(settings::detect_hook_form);
             settings::apply(&mut root, &binary, &spec);
             match settings::save(&path, &root) {
                 Ok(()) => 0,

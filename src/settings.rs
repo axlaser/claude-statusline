@@ -83,13 +83,21 @@ pub const POST_TOOL_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit";
 
 /// Claude Code's refresh cadence for the status line, in seconds. Written only
 /// when the entry does not already carry one, so a user who tuned it keeps
-/// their value across upgrades.
+/// their value across upgrades -- except an exact `1` on the upgrade that first
+/// writes the housekeep hooks, which moves here once (see `apply`).
 ///
 /// `2` while the scripts shipped, because PowerShell's ~124 ms startup made a
 /// 1-second cadence expensive on Windows and one value had to serve every
-/// platform. The interpreter is gone, so the default drops to the minimum
+/// platform. The interpreter went, so the default dropped to `1`, the minimum
 /// the scripts already used on macOS and Linux.
-pub const REFRESH_INTERVAL: u64 = 1;
+///
+/// `10` since 2026-10-07. On Windows a tick took 0.5-1.3 s just to reach this
+/// binary through Git Bash, so at `1` most ticks were still starting when the
+/// next was due, and Claude Code cancels the old one with a tree kill that
+/// races MSYS2's process creation and strands processes. One value still
+/// serves every platform: the cost is idle elapsed time and rate-limit
+/// countdowns redrawing every 10 s instead of every second.
+pub const REFRESH_INTERVAL: u64 = 10;
 
 /// The four scripts a pre-binary installation left in `~/.claude`, as
 /// basenames: what the script installers matched on when de-duplicating their
@@ -143,7 +151,9 @@ pub struct ApplySpec {
     pub subagent: bool,
     pub git_refresh: bool,
     pub notify: bool,
-    /// Store the binary path wrapped in quotes.
+    /// Store the binary path wrapped in quotes, in every entry Claude Code runs
+    /// through a shell: the status-line pair always, hooks in shell form. An
+    /// exec-form hook's `command` is a path, never quoted.
     ///
     /// Decided here rather than by the caller because the caller is a shell,
     /// and shells eat quotes: PowerShell consumed the quotes of a pre-quoted
@@ -151,6 +161,68 @@ pub struct ApplySpec {
     /// and silently wrote an unquoted command that word-split on the first
     /// space in the profile directory.
     pub quote: bool,
+    /// How hooks launch the binary. The status-line pair is a string in
+    /// either form: Claude Code's schema drops `args` for them.
+    pub hook_form: HookForm,
+}
+
+/// How a hook entry launches the binary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum HookForm {
+    /// `command` is the bare path and the subcommand is in `args`: Claude Code
+    /// (>= `EXEC_HOOKS_SINCE`) spawns it with no shell, which on Windows skips
+    /// Git Bash and its process chain on every hook run.
+    Exec,
+    /// One command string run through the shell: what every earlier install
+    /// wrote, and what any Claude Code can run.
+    #[default]
+    Shell,
+}
+
+/// The first Claude Code that runs a hook's `args` without a shell. The
+/// status-line pair has no `args` in its schema at any version.
+pub const EXEC_HOOKS_SINCE: &str = "2.1.139";
+
+/// How long `claude --version` may take before the answer is "unknown".
+pub const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The hook form for what `claude --version` printed: exec at or above
+/// `EXEC_HOOKS_SINCE`, shell for anything older or unreadable.
+pub fn hook_form_for(version_output: &str) -> HookForm {
+    let version = version_output.split_whitespace().next().unwrap_or("");
+    if crate::update::reads_as_version(version)
+        && !crate::update::is_newer(EXEC_HOOKS_SINCE, version)
+    {
+        HookForm::Exec
+    } else {
+        HookForm::Shell
+    }
+}
+
+/// Runs a version command bounded by `timeout`. Output only counts from a
+/// clean exit; a failure to start, a non-zero exit or the bound all read as
+/// unknown, which is the shell form.
+pub fn probe_hook_form(command: std::process::Command, timeout: std::time::Duration) -> HookForm {
+    let form = crate::git::run_bounded(command, timeout).map_or(HookForm::Shell, |out| {
+        hook_form_for(&String::from_utf8_lossy(&out))
+    });
+    crate::debug::log(move || format!("settings: hook form {form:?}"));
+    form
+}
+
+/// The hook form the installed Claude Code supports, from `claude --version`.
+///
+/// Only the `claude` on `PATH` is asked: a host that bundles its own, older
+/// copy is not seen. On Windows `Command` resolves `claude.exe` only, so an
+/// npm install's `claude.cmd` shim is not found and reads as unknown -- the
+/// shell form, today's behaviour, never a failed `apply`.
+pub fn detect_hook_form() -> HookForm {
+    let mut command = std::process::Command::new("claude");
+    command
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    probe_hook_form(command, VERSION_PROBE_TIMEOUT)
 }
 
 /// Whether this platform needs the stored command quoted. Windows does, or a
@@ -172,9 +244,20 @@ const NOTIFY_HOOKS: [(&str, Option<&str>, &str); 4] = [
     ("PostCompact", Some("*"), "compaction_done"),
 ];
 
+/// Where the cleanup pass is hooked: when a prompt is submitted, and when a
+/// turn has gone idle (`idle_prompt`, sent once Claude Code has waited
+/// `messageIdleNotifThresholdMs` for input). Neither event carries any of our
+/// other hooks, so `has notify` never mistakes this for an opt-in -- the
+/// reason it is not on `Stop`, which `notify stop` already holds.
+const HOUSEKEEP_HOOKS: [(&str, Option<&str>); 2] = [
+    ("UserPromptSubmit", None),
+    ("Notification", Some("idle_prompt")),
+];
+
 /// Applies the requested entries to `root`, replacing any this tool wrote
 /// before and leaving everything else untouched. `binary` is the bare command
-/// reference; `spec.quote` decides whether it is stored quoted.
+/// reference; `spec.quote` decides whether it is stored quoted, and
+/// `spec.hook_form` how the hooks launch it.
 pub fn apply(root: &mut Value, binary: &str, spec: &ApplySpec) {
     ensure_object(root);
 
@@ -191,15 +274,44 @@ pub fn apply(root: &mut Value, binary: &str, spec: &ApplySpec) {
     // Captured before `remove_legacy` deletes those entries: a migrating user's
     // own keys live in that object and should survive the migration as they
     // survive an ordinary upgrade.
-    let prior_statusline = root.get(STATUS_LINE).cloned();
+    let mut prior_statusline = root.get(STATUS_LINE).cloned();
     let prior_subagent = root.get(SUBAGENT_STATUS_LINE).cloned();
+
+    // Settings written before the housekeep hooks existed carry `1` as the old
+    // default, not as a choice, so it moves to `REFRESH_INTERVAL` once. The
+    // hooks' absence is the marker, read before this run writes them; a `1`
+    // set by hand after that upgrade is kept. A user who deletes the hooks by
+    // hand is migrated again on their next install: accepted, as no other
+    // marker exists without new state.
+    let housekeep_installed = HOUSEKEEP_HOOKS
+        .iter()
+        .any(|(event, _)| hook_present(root, event, binary));
+    if !housekeep_installed {
+        if let Some(Value::Object(prior)) = prior_statusline.as_mut() {
+            if prior.get("refreshInterval").and_then(Value::as_u64) == Some(1) {
+                prior.insert("refreshInterval".into(), json!(REFRESH_INTERVAL));
+            }
+        }
+    }
 
     remove_legacy(root);
 
-    let binary: &str = &if spec.quote && !binary.starts_with('"') {
+    // Quoted for the entries a shell runs; an exec-form hook's `command` is a
+    // path, and quotes in it would name a file that does not exist.
+    let bare = binary.trim_matches('"');
+    let quoted: &str = &if spec.quote && !binary.starts_with('"') {
         format!("\"{binary}\"")
     } else {
         binary.to_string()
+    };
+    let hook = |root: &mut Value, event: &str, matcher: Option<&str>, tokens: &[&str]| match spec
+        .hook_form
+    {
+        HookForm::Exec => set_hook(root, event, matcher, bare, bare, Some(tokens)),
+        HookForm::Shell => {
+            let command = format!("{quoted} {}", tokens.join(" "));
+            set_hook(root, event, matcher, bare, &command, None);
+        }
     };
 
     if spec.statusline {
@@ -207,7 +319,7 @@ pub fn apply(root: &mut Value, binary: &str, spec: &ApplySpec) {
             root,
             STATUS_LINE,
             prior_statusline,
-            binary,
+            quoted,
             &[("refreshInterval", json!(REFRESH_INTERVAL))],
         );
     }
@@ -217,40 +329,41 @@ pub fn apply(root: &mut Value, binary: &str, spec: &ApplySpec) {
             root,
             SUBAGENT_STATUS_LINE,
             prior_subagent,
-            &format!("{binary} subagent"),
+            &format!("{quoted} subagent"),
             &[],
         );
     }
 
     if spec.git_refresh {
-        // `async: true` is preserved deliberately: the entries have to match
-        // what the installer always wrote, and without it the hook runs
-        // synchronously inside every file-modifying tool call.
-        set_hook(
+        hook(
             root,
             "PostToolUse",
             Some(POST_TOOL_MATCHER),
-            binary,
-            &format!("{binary} git-refresh"),
+            &["git-refresh"],
         );
     }
 
     if spec.notify {
         for (event, matcher, arg) in NOTIFY_HOOKS {
-            set_hook(
-                root,
-                event,
-                matcher,
-                binary,
-                &format!("{binary} notify {arg}"),
-            );
+            hook(root, event, matcher, &["notify", arg]);
+        }
+    }
+
+    // Tied to the status line rather than to a flag of its own, so the
+    // installers need no new option and no capability probe: the cleanup
+    // exists because of status-line ticks. Written last, so a fresh install
+    // orders its events as an upgrade appends them.
+    if spec.statusline {
+        for (event, matcher) in HOUSEKEEP_HOOKS {
+            hook(root, event, matcher, &["housekeep"]);
         }
     }
 }
 
 /// Writes our entry at `key` over whatever was already there, keeping the
 /// user's own keys. `type` and `command` are always rewritten, since an upgrade
-/// has to repoint the command; `defaults` are written only when absent.
+/// has to repoint the command; `defaults` are written only when absent. The
+/// one-time `refreshInterval` migration is the caller's, applied to `prior`.
 ///
 /// Replacing the whole object, as this used to, silently deleted a customised
 /// `refreshInterval` and any `padding` on every upgrade, both of which README
@@ -470,7 +583,21 @@ fn hook_present(root: &Value, event: &str, binary: &str) -> bool {
 /// `$HOME` with a space yielded a truncated key, and since `references`
 /// matches on substring the retain below deleted every unrelated hook that
 /// merely mentioned the home directory.
-fn set_hook(root: &mut Value, event: &str, matcher: Option<&str>, binary: &str, command: &str) {
+///
+/// `args` is written only in exec form. Either form's `command` contains the
+/// path, so the retain recognises and replaces an entry of the other form:
+/// switching forms never leaves two.
+///
+/// `async: true` on every hook, as the installers always wrote it: without it
+/// the hook runs synchronously inside the tool call or prompt it follows.
+fn set_hook(
+    root: &mut Value,
+    event: &str,
+    matcher: Option<&str>,
+    binary: &str,
+    command: &str,
+    args: Option<&[&str]>,
+) {
     let hooks = root
         .as_object_mut()
         .expect("root is an object by this point")
@@ -497,10 +624,16 @@ fn set_hook(root: &mut Value, event: &str, matcher: Option<&str>, binary: &str, 
     if let Some(m) = matcher {
         entry.insert("matcher".into(), json!(m));
     }
-    entry.insert(
-        "hooks".into(),
-        json!([{ "type": "command", "command": command, "async": true }]),
-    );
+    // Inserted in this order, which `preserve_order` keeps: the shell form
+    // stays byte-identical to what earlier installs wrote.
+    let mut hook = Map::new();
+    hook.insert("type".into(), json!("command"));
+    hook.insert("command".into(), json!(command));
+    if let Some(args) = args {
+        hook.insert("args".into(), json!(args));
+    }
+    hook.insert("async".into(), json!(true));
+    entry.insert("hooks".into(), json!([hook]));
     list.push(Value::Object(entry));
 }
 

@@ -43,7 +43,7 @@ pub fn available(changelog: Option<&Path>, running: &str) -> Option<String> {
     // into a permanent false alarm — `v2.1.278` would advertise an update to
     // the version it is already running. The same shape guard `latest_in`
     // applies to the changelog side, and it subsumes the empty case.
-    if !running.starts_with(|c: char| c.is_ascii_digit()) {
+    if !reads_as_version(running) {
         return None;
     }
     let bytes = crate::state::read_trusted_prefix(changelog?, PREFIX)?;
@@ -70,10 +70,15 @@ pub fn latest_in(text: &str) -> Option<&str> {
         // escape sequence to print. Nothing downstream wants more than the
         // number anyway — `is_newer` cuts at the same place.
         let token = numeric_core(rest.split_whitespace().next()?);
-        token
-            .starts_with(|c: char| c.is_ascii_digit())
-            .then_some(token)
+        reads_as_version(token).then_some(token)
     })
+}
+
+/// Whether `is_newer` can read `v` as a number at all. Anything else
+/// normalises to zero there, which reads as "older than everything" rather
+/// than "unknown", so callers ask this first.
+pub fn reads_as_version(v: &str) -> bool {
+    v.starts_with(|c: char| c.is_ascii_digit())
 }
 
 /// Dotted numeric comparison, component by component.

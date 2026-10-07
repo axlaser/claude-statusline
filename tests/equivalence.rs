@@ -1335,11 +1335,49 @@ fn the_settings_subcommand_reports_through_its_exit_code() {
         run_bin(&full, "", &[])
     };
 
-    // Applying to an absent file creates it and reports success.
-    let applied = settings_run(&["apply", "--all", "--no-quote"]);
+    // With no `--hook-form`, `apply` asks `claude --version`. A `PATH` with no
+    // `claude` on it is the unresolvable case: apply still succeeds, in the
+    // shell form every earlier install wrote.
+    let no_claude = dir.join("empty-path");
+    std::fs::create_dir_all(&no_claude).expect("failed to stage an empty PATH");
+    let detected = run_bin(
+        &[
+            "settings",
+            "apply",
+            "--all",
+            "--no-quote",
+            "--binary",
+            binary,
+            "--settings",
+            settings,
+        ],
+        "",
+        &[(
+            "PATH",
+            no_claude.to_str().expect("the scratch path is UTF-8"),
+        )],
+    );
+    assert_eq!(detected.code, Some(0), "stdout: {}", detected.stdout);
+    let body = std::fs::read_to_string(&path).expect("apply wrote no settings.json");
+    assert!(
+        body.contains(&format!("{binary} housekeep")) && !body.contains("\"args\""),
+        "an unresolvable claude must leave the shell form:\n{body}"
+    );
+
+    // Applying creates the file and reports success; `--hook-form` reaches
+    // the merge.
+    std::fs::remove_file(&path).expect("failed to reset settings.json");
+    let applied = settings_run(&["apply", "--all", "--no-quote", "--hook-form", "exec"]);
     assert_eq!(applied.code, Some(0), "apply --all should succeed");
     let body = std::fs::read_to_string(&path).expect("apply wrote no settings.json");
-    for key in ["statusLine", "subagentStatusLine", "git-refresh", "notify"] {
+    for key in [
+        "statusLine",
+        "subagentStatusLine",
+        "git-refresh",
+        "notify",
+        "housekeep",
+        "\"args\"",
+    ] {
         assert!(body.contains(key), "apply --all omitted {key}:\n{body}");
     }
 
@@ -1383,6 +1421,11 @@ fn the_settings_subcommand_reports_through_its_exit_code() {
         settings_run(&["apply", "--subagnet"]).code,
         Some(1),
         "a mistyped flag must not be dropped into positionals and reported as success"
+    );
+    assert_eq!(
+        settings_run(&["apply", "--all", "--hook-form", "sometimes"]).code,
+        Some(1),
+        "a hook form other than exec or shell is a failure"
     );
     assert_eq!(
         settings_run(&["frobnicate"]).code,
@@ -4803,8 +4846,10 @@ fn a_script_installation_is_removed_but_its_config_is_kept() {
 const WIN_BINARY: &str = "\"C:\\Users\\a b\\.claude\\bin\\claude-statusline.exe\"";
 const UNIX_BINARY: &str = "/home/u/.claude/bin/claude-statusline";
 
-/// A settings file with content the installer must not disturb, including a
-/// hook the user registered on the same event the installer writes to.
+/// A settings file with content the installer must not disturb, including
+/// hooks the user registered on events the installer also writes to: the
+/// housekeep pass shares `UserPromptSubmit` and `Notification` with whatever
+/// the user hangs there.
 fn user_settings() -> serde_json::Value {
     serde_json::json!({
         "theme": "dark",
@@ -4812,6 +4857,13 @@ fn user_settings() -> serde_json::Value {
         "hooks": {
             "PostToolUse": [
                 { "matcher": "Bash", "hooks": [{ "type": "command", "command": "~/my-own-hook.sh" }] }
+            ],
+            "Notification": [
+                { "matcher": "permission_prompt", "hooks": [{ "type": "command", "command": "~/ping-me.sh" }] },
+                { "matcher": "idle_prompt", "hooks": [{ "type": "command", "command": "~/idle.sh" }] }
+            ],
+            "UserPromptSubmit": [
+                { "hooks": [{ "type": "command", "command": "~/log-prompt.sh" }] }
             ]
         }
     })
@@ -4824,7 +4876,213 @@ fn all() -> settings::ApplySpec {
         git_refresh: true,
         notify: true,
         quote: false,
+        hook_form: settings::HookForm::Shell,
     }
+}
+
+/// Every hook `--all` writes, as (event, matcher, subcommand tokens).
+const ALL_HOOKS: [(&str, Option<&str>, &[&str]); 7] = [
+    (
+        "PostToolUse",
+        Some(settings::POST_TOOL_MATCHER),
+        &["git-refresh"],
+    ),
+    ("PermissionRequest", None, &["notify", "permission"]),
+    ("Stop", None, &["notify", "stop"]),
+    ("PreCompact", Some("*"), &["notify", "compaction_start"]),
+    ("PostCompact", Some("*"), &["notify", "compaction_done"]),
+    ("UserPromptSubmit", None, &["housekeep"]),
+    ("Notification", Some("idle_prompt"), &["housekeep"]),
+];
+
+/// The one entry we expect at `event`, serialised: text rather than `Value`
+/// equality, because key order is part of "today's form byte for byte".
+fn expected_hook(
+    matcher: Option<&str>,
+    form: settings::HookForm,
+    bare: &str,
+    quoted: &str,
+    tokens: &[&str],
+) -> String {
+    let hook = match form {
+        settings::HookForm::Exec => serde_json::json!({
+            "type": "command", "command": bare, "args": tokens, "async": true
+        }),
+        settings::HookForm::Shell => serde_json::json!({
+            "type": "command",
+            "command": format!("{quoted} {}", tokens.join(" ")),
+            "async": true
+        }),
+    };
+    let entry = match matcher {
+        Some(m) => serde_json::json!([{ "matcher": m, "hooks": [hook] }]),
+        None => serde_json::json!([{ "hooks": [hook] }]),
+    };
+    serde_json::to_string(&entry).unwrap()
+}
+
+/// Exec form puts the bare path in `command` and the subcommand in `args`, so
+/// Claude Code spawns the binary with no shell; shell form is what every
+/// earlier install wrote, byte for byte. The status-line entries have no
+/// `args` in Claude Code's schema and keep the quoted string either way.
+#[test]
+fn hooks_are_written_in_the_hook_form_asked_for() {
+    let bare = WIN_BINARY.trim_matches('"');
+    let mut failures = Failures::default();
+    for form in [settings::HookForm::Exec, settings::HookForm::Shell] {
+        let mut root = serde_json::json!({});
+        let spec = settings::ApplySpec {
+            hook_form: form,
+            ..all_quoted()
+        };
+        settings::apply(&mut root, bare, &spec);
+
+        for (event, matcher, tokens) in ALL_HOOKS {
+            let expected = expected_hook(matcher, form, bare, WIN_BINARY, tokens);
+            let actual = serde_json::to_string(&root["hooks"][event]).unwrap();
+            failures.check(&format!("{form:?} {event}"), actual == expected, || {
+                format!("expected {expected}\n      got {actual}")
+            });
+        }
+        for (key, expected) in [
+            ("statusLine", WIN_BINARY.to_string()),
+            ("subagentStatusLine", format!("{WIN_BINARY} subagent")),
+        ] {
+            let actual = root[key]["command"].as_str().unwrap_or_default();
+            failures.check(&format!("{form:?} {key}"), actual == expected, || {
+                format!("expected `{expected}`, got `{actual}`")
+            });
+        }
+    }
+    failures.assert_empty("hook form");
+}
+
+/// Recognition is a substring match on `command`, so switching forms replaces
+/// our entry rather than adding a second: an upgrade to exec form, and an
+/// older binary's string-form `apply` over exec-form entries, both leave one
+/// entry per event, in the form that `apply` asked for.
+#[test]
+fn switching_hook_form_leaves_one_entry_per_event() {
+    let bare = WIN_BINARY.trim_matches('"');
+    let mut root = serde_json::json!({});
+    let mut failures = Failures::default();
+    for form in [
+        settings::HookForm::Shell,
+        settings::HookForm::Exec,
+        settings::HookForm::Shell,
+    ] {
+        let spec = settings::ApplySpec {
+            hook_form: form,
+            ..all_quoted()
+        };
+        settings::apply(&mut root, bare, &spec);
+        for (event, matcher, tokens) in ALL_HOOKS {
+            let expected = expected_hook(matcher, form, bare, WIN_BINARY, tokens);
+            let actual = serde_json::to_string(&root["hooks"][event]).unwrap();
+            failures.check(&format!("to {form:?} {event}"), actual == expected, || {
+                format!("expected {expected}\n      got {actual}")
+            });
+        }
+    }
+    failures.assert_empty("hook form switch");
+}
+
+/// Exec form is chosen only for a Claude Code that reports 2.1.139 or newer;
+/// anything else, unreadable output included, keeps the shell form.
+#[test]
+fn the_hook_form_follows_the_claude_code_version() {
+    use settings::HookForm::{Exec, Shell};
+    let mut failures = Failures::default();
+    for (output, expected) in [
+        ("2.1.139 (Claude Code)\n", Exec),
+        ("2.1.292 (Claude Code)", Exec),
+        ("2.2 (Claude Code)", Exec),
+        ("3.0.0", Exec),
+        ("2.1.138 (Claude Code)", Shell),
+        ("2.0.999 (Claude Code)", Shell),
+        ("", Shell),
+        ("garbage", Shell),
+        ("(Claude Code) 2.1.139", Shell),
+        ("v2.1.139", Shell),
+    ] {
+        let got = settings::hook_form_for(output);
+        failures.check(output, got == expected, || {
+            format!("expected {expected:?}, got {got:?}")
+        });
+    }
+    failures.assert_empty("version parse");
+}
+
+/// The probe runs `claude --version` bounded: a version only counts from a
+/// clean exit, and a `claude` that never answers is killed at the bound and
+/// reads as unknown, after which `apply` completes in shell form.
+#[test]
+fn the_hook_form_probe_is_bounded_and_needs_a_clean_exit() {
+    #[cfg(unix)]
+    let shell = |script: &str| {
+        let mut c = std::process::Command::new("sh");
+        c.args(["-c", script]);
+        c
+    };
+    #[cfg(windows)]
+    let shell = |script: &str| {
+        let mut c = std::process::Command::new("cmd");
+        c.arg("/c").args(script.split(' '));
+        c
+    };
+    let bound = std::time::Duration::from_secs(2);
+
+    #[cfg(unix)]
+    let (prints, fails) = ("echo 2.1.139", "echo 2.1.139; exit 1");
+    #[cfg(windows)]
+    let (prints, fails) = ("echo 2.1.139", "echo 2.1.139& exit 1");
+    assert_eq!(
+        settings::probe_hook_form(shell(prints), bound),
+        settings::HookForm::Exec,
+        "a clean `2.1.139` did not read as exec form, so the probe proves nothing"
+    );
+    assert_eq!(
+        settings::probe_hook_form(shell(fails), bound),
+        settings::HookForm::Shell,
+        "a version printed by a failing run was trusted"
+    );
+
+    // ~5 s, spawned directly as in `a_child_past_its_deadline_is_killed_not_awaited`.
+    #[cfg(unix)]
+    let hangs = {
+        let mut c = std::process::Command::new("sleep");
+        c.arg("5");
+        c
+    };
+    #[cfg(windows)]
+    let hangs = {
+        let mut c = std::process::Command::new("ping");
+        c.args(["-n", "6", "127.0.0.1"]);
+        c
+    };
+    let started = std::time::Instant::now();
+    let form = settings::probe_hook_form(hangs, std::time::Duration::from_millis(200));
+    let elapsed = started.elapsed();
+    assert_eq!(form, settings::HookForm::Shell);
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the probe took {elapsed:?} against a 200ms bound — the hung child was awaited"
+    );
+
+    let mut root = serde_json::json!({});
+    settings::apply(
+        &mut root,
+        UNIX_BINARY,
+        &settings::ApplySpec {
+            hook_form: form,
+            ..all()
+        },
+    );
+    assert_eq!(
+        root["hooks"]["Stop"][0]["hooks"][0]["command"],
+        format!("{UNIX_BINARY} notify stop"),
+        "apply after a timed-out probe did not complete in shell form"
+    );
 }
 
 fn all_quoted() -> settings::ApplySpec {
@@ -4845,12 +5103,19 @@ fn applying_twice_leaves_one_entry_each() {
 
     assert_eq!(once, twice, "a second apply changed the file");
 
-    let post = twice["hooks"]["PostToolUse"].as_array().unwrap();
-    assert_eq!(
-        post.len(),
-        2,
-        "expected the user's hook plus exactly one of ours, got {post:#?}"
-    );
+    // The user's hooks plus exactly one of ours on each event.
+    for (event, expected) in [
+        ("PostToolUse", 2),
+        ("UserPromptSubmit", 2),
+        ("Notification", 3),
+    ] {
+        let entries = twice["hooks"][event].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            expected,
+            "{event}: expected the user's hooks plus exactly one of ours, got {entries:#?}"
+        );
+    }
 }
 
 /// The installer writes into a file it does not own. A user's own hook on the
@@ -4875,6 +5140,19 @@ fn unrelated_content_and_foreign_hooks_survive() {
     failures.check("foreign-hook", kept, || {
         "the user's own PostToolUse hook was dropped".to_string()
     });
+    // `~/idle.sh` shares our `idle_prompt` matcher: recognition is by command.
+    for (event, command) in [
+        ("Notification", "~/ping-me.sh"),
+        ("Notification", "~/idle.sh"),
+        ("UserPromptSubmit", "~/log-prompt.sh"),
+    ] {
+        let kept = root["hooks"][event]
+            .as_array()
+            .is_some_and(|list| list.iter().any(|e| e["hooks"][0]["command"] == command));
+        failures.check(command, kept, || {
+            format!("the user's own {event} hook was dropped beside the housekeep hook")
+        });
+    }
     failures.assert_empty("settings merge");
 }
 
@@ -4917,7 +5195,11 @@ fn a_space_in_the_unix_path_leaves_foreign_hooks_alone() {
 
 /// Uninstall has to leave no trace it can avoid leaving, which means pruning
 /// the containers our entries were the only occupants of — but not the ones
-/// still holding someone else's hook.
+/// still holding someone else's hook, the user's own `Notification` and
+/// `UserPromptSubmit` hooks beside the housekeep pair among them.
+///
+/// Compared as text, not as values: `Value` equality ignores key order, and
+/// the round trip has to give the user back the file they had.
 #[test]
 fn remove_restores_the_pre_install_file() {
     let before = user_settings();
@@ -4927,11 +5209,88 @@ fn remove_restores_the_pre_install_file() {
         root, before,
         "apply did nothing, so the test proves nothing"
     );
+    assert!(settings::has(&root, UNIX_BINARY, "statusline"));
 
     settings::remove(&mut root, UNIX_BINARY);
     assert_eq!(
-        root, before,
+        serde_json::to_string_pretty(&root).unwrap(),
+        serde_json::to_string_pretty(&before).unwrap(),
         "uninstall did not restore the file to its pre-install state"
+    );
+}
+
+/// The cleanup pass rides with the status line: whoever installs one gets
+/// both housekeep hooks, async, on events none of our other hooks use. A user
+/// who declined notifications must still read as declined, or the installers
+/// would switch them on (KTD1's reason for not reusing `Stop`).
+#[test]
+fn the_status_line_brings_the_housekeep_hooks() {
+    let mut root = serde_json::json!({});
+    let declined = settings::ApplySpec {
+        notify: false,
+        ..all()
+    };
+    settings::apply(&mut root, UNIX_BINARY, &declined);
+
+    let hook = serde_json::json!([{
+        "type": "command",
+        "command": format!("{UNIX_BINARY} housekeep"),
+        "async": true
+    }]);
+    let mut failures = Failures::default();
+    for (event, expected) in [
+        ("UserPromptSubmit", serde_json::json!([{ "hooks": hook }])),
+        (
+            "Notification",
+            serde_json::json!([{ "matcher": "idle_prompt", "hooks": hook }]),
+        ),
+    ] {
+        let actual = &root["hooks"][event];
+        failures.check(event, *actual == expected, || {
+            format!("expected {expected:#}, got {actual:#}")
+        });
+    }
+    failures.check(
+        "refreshInterval",
+        root["statusLine"]["refreshInterval"] == 10,
+        || format!("got {}", root["statusLine"]["refreshInterval"]),
+    );
+    failures.check(
+        "declined",
+        !settings::has(&root, UNIX_BINARY, "notify"),
+        || "the housekeep hooks made a declined user read as opted in".to_string(),
+    );
+    failures.assert_empty("housekeep hooks");
+}
+
+/// KTD10: an install still at the old `1` moves to `10` on the upgrade that
+/// first writes the housekeep hooks, and never again. The hooks' absence is
+/// the only marker, so a `1` set by hand after that upgrade is the user's.
+#[test]
+fn a_one_second_refresh_moves_to_ten_once_with_the_housekeep_hooks() {
+    let mut root = serde_json::json!({
+        "statusLine": {
+            "type": "command",
+            "command": "~/.claude/bin/claude-statusline",
+            "refreshInterval": 1,
+            "padding": 2
+        }
+    });
+    settings::apply(&mut root, UNIX_BINARY, &all());
+    assert_eq!(
+        root["statusLine"]["refreshInterval"], 10,
+        "an install still at 1 was not migrated"
+    );
+    assert_eq!(
+        root["statusLine"]["padding"], 2,
+        "the migration lost padding"
+    );
+
+    root["statusLine"]["refreshInterval"] = serde_json::json!(1);
+    settings::apply(&mut root, UNIX_BINARY, &all());
+    assert_eq!(
+        root["statusLine"]["refreshInterval"], 1,
+        "a 1 the user chose after the migration was overwritten"
     );
 }
 
@@ -4988,36 +5347,45 @@ fn quoting_is_applied_on_this_side_of_the_shell_boundary() {
 
 /// Whatever form the command was stored in, every query and the removal path
 /// have to recognise it — the uninstaller holds a bare path where the installer
-/// wrote a quoted one.
+/// wrote a quoted one, and exec-form hooks hold the bare path themselves.
 #[test]
 fn quoted_windows_paths_round_trip() {
-    let mut root = serde_json::json!({});
-    settings::apply(&mut root, WIN_BINARY, &all());
-
     let mut failures = Failures::default();
-    let command = root["statusLine"]["command"].as_str().unwrap_or_default();
-    failures.check(
-        "quoted",
-        command.starts_with('"') && command.ends_with('"'),
-        || format!("statusLine command is not quoted: {command}"),
-    );
+    for form in [settings::HookForm::Shell, settings::HookForm::Exec] {
+        let mut root = serde_json::json!({});
+        let spec = settings::ApplySpec {
+            hook_form: form,
+            ..all()
+        };
+        settings::apply(&mut root, WIN_BINARY, &spec);
 
-    for feature in ["statusline", "subagent", "git-refresh", "notify"] {
-        failures.check(feature, settings::has(&root, WIN_BINARY, feature), || {
-            "written but not detected by has()".to_string()
-        });
-        // The uninstaller may hold the bare path where the installer wrote a
-        // quoted one; both have to match the same entry.
-        let bare = WIN_BINARY.trim_matches('"');
-        failures.check(feature, settings::has(&root, bare, feature), || {
-            "not detected when queried with the unquoted path".to_string()
-        });
+        let command = root["statusLine"]["command"].as_str().unwrap_or_default();
+        failures.check(
+            &format!("{form:?} quoted"),
+            command.starts_with('"') && command.ends_with('"'),
+            || format!("statusLine command is not quoted: {command}"),
+        );
+
+        for feature in ["statusline", "subagent", "git-refresh", "notify"] {
+            let case = format!("{form:?} {feature}");
+            failures.check(&case, settings::has(&root, WIN_BINARY, feature), || {
+                "written but not detected by has()".to_string()
+            });
+            // The uninstaller may hold the bare path where the installer wrote
+            // a quoted one; both have to match the same entry.
+            let bare = WIN_BINARY.trim_matches('"');
+            failures.check(&case, settings::has(&root, bare, feature), || {
+                "not detected when queried with the unquoted path".to_string()
+            });
+        }
+
+        settings::remove(&mut root, WIN_BINARY.trim_matches('"'));
+        failures.check(
+            &format!("{form:?} removed"),
+            root.get("statusLine").is_none() && root.get("hooks").is_none(),
+            || format!("removal by unquoted path left entries behind: {root:#}"),
+        );
     }
-
-    settings::remove(&mut root, WIN_BINARY.trim_matches('"'));
-    failures.check("removed", root.get("statusLine").is_none(), || {
-        "removal by unquoted path left the entry behind".to_string()
-    });
     failures.assert_empty("windows quoting");
 }
 
@@ -5139,6 +5507,18 @@ fn a_script_installation_is_rewritten_not_left_beside_ours() {
         });
     }
 
+    // A script install predates the housekeep hooks, so its `1` migrates.
+    failures.check(
+        "refreshInterval",
+        root["statusLine"]["refreshInterval"] == 10,
+        || {
+            format!(
+                "the script-era 1 was not migrated: {}",
+                root["statusLine"]["refreshInterval"]
+            )
+        },
+    );
+
     // One of ours per event, not one of ours beside one of theirs.
     for (event, expected) in [
         ("PostToolUse", 2),
@@ -5146,6 +5526,8 @@ fn a_script_installation_is_rewritten_not_left_beside_ours() {
         ("Stop", 2),
         ("PreCompact", 1),
         ("PostCompact", 1),
+        ("UserPromptSubmit", 1),
+        ("Notification", 1),
     ] {
         let count = root["hooks"][event].as_array().map_or(0, Vec::len);
         failures.check(event, count == expected, || {
@@ -5280,7 +5662,10 @@ fn existing_key_order_is_preserved() {
 /// with nothing said about it — and README documents both as things to tune,
 /// so the settings most likely to be present were the ones most likely to be
 /// lost. The default is only a default: it is written when the key is absent
-/// and never over a value the user chose.
+/// and never over a value the user chose. The one exception is an exact `1`
+/// on the upgrade that first writes the housekeep hooks, which was the old
+/// default rather than a choice and moves to `10` once
+/// (`a_one_second_refresh_moves_to_ten_once_with_the_housekeep_hooks`).
 #[test]
 fn an_upgrade_keeps_the_users_own_status_line_keys() {
     let mut root = serde_json::json!({
@@ -5322,8 +5707,7 @@ fn an_upgrade_keeps_the_users_own_status_line_keys() {
     let mut fresh = serde_json::json!({});
     settings::apply(&mut fresh, UNIX_BINARY, &all());
     assert_eq!(
-        fresh["statusLine"]["refreshInterval"],
-        settings::REFRESH_INTERVAL,
+        fresh["statusLine"]["refreshInterval"], 10,
         "a fresh install should carry the default cadence"
     );
 }
