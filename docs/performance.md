@@ -1525,3 +1525,31 @@ Absolute medians sat at 36–41 ms for both shapes in this sitting, about twice 
 which is the host floor drifting (§3), not the binary. The malformed floor is not a
 `measure-pair` mode — its proof of work asserts a rendered box — so it was taken by the
 same method with a throwaway driver.
+
+### The `housekeep` pass costs one process snapshot — 2026-10-07
+
+`housekeep` runs when a prompt is submitted and when a turn goes idle, never on a tick, so
+§6 is unchanged. What one pass costs, release builds with LTO, rustc 1.99.0, maintainer
+machine (Windows 11 26200), one fresh process per probe, 21 interleaved pairs per row in
+alternating order, isolated `USERPROFILE`/`HOME`/`TEMP`/`TMP`, `SystemRoot` an empty
+directory, an identical-binary control for each row in the same sitting:
+
+| Shape | Paired delta | Control |
+|---|---|---|
+| Sweep: `housekeep` with reclamation off, against `git-refresh` on empty stdin (same entry and state-directory resolution, no work). 118 young state files, the size of the maintainer's real directory, plus one stale staging file per probe, asserted removed | +0.03 ms | +0.45 ms |
+| Reclamation: a read-only probe that takes the snapshot and opens and judges every process a rule covers, against the same probe exiting at once. It never terminates | +15.07 ms | +0.93 ms |
+
+The sweep is inside noise: one directory verdict, one listing, and the entry's own
+metadata, which on Windows comes from the listing at no extra call per file. Reclamation is
+the Toolhelp snapshot: 11.0 ms in-process with 342 processes on the machine, against 2.9 ms
+to open and judge the 66 covered ones (medians of 9, isolated, so they do not sum).
+That is about twice the ~6 ms focus capture measured for its snapshot. It is still well
+under the ~50 ms at which a timestamp file rate-limiting the pass would earn its keep, so
+none was built.
+
+A live pass was not timed. The snapshot is system-wide, and on the measuring machine the
+rules matched 48 orphaned two-argument helpers and 17 stranded ticks from the installed
+binary's directory: a measurement must not terminate those without the user's say-so. A
+live pass adds one `TerminateProcess` per match and one shared wait, at most 1 s, for the
+images to unmap. The case table never runs one: every test that launches `housekeep`
+sets `STATUSLINE_SKIP_PROCESS_RECLAIM`.

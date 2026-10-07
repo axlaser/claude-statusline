@@ -7,7 +7,7 @@
 use std::io::Write;
 
 use claude_statusline::{
-    clock, cmd, config, debug, entry, focus, platform, self_check, session, settings,
+    clock, cmd, config, debug, entry, focus, housekeep, platform, self_check, session, settings,
 };
 
 /// Reads all of stdin. An unreadable or non-UTF-8 stream degrades to "no
@@ -351,6 +351,13 @@ fn dispatch(sub: &str, rest: &[&str], os_rest: &[std::ffi::OsString]) {
         "subagent" => {
             let payload = read_stdin();
             cmd::subagent::run(&payload, &session::state_dir());
+        }
+        // The cleanup hook. Its payload carries nothing the pass needs, but is
+        // drained so Claude Code's write never meets a closed pipe. Prints
+        // nothing: a hook's stdout can reach the transcript.
+        "housekeep" => {
+            let _ = read_hook_stdin();
+            housekeep::run(&session::state_dir());
         }
         // Exercises the catch; in release builds so the test drives what ships.
         "__panic-probe" => panic!("deliberate panic probe"),

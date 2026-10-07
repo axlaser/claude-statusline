@@ -9,6 +9,7 @@ pub mod debug;
 pub mod entry;
 pub mod focus;
 pub mod git;
+pub mod housekeep;
 pub mod notify_state;
 pub mod payload;
 pub mod platform;

@@ -163,7 +163,9 @@ fn write_inner(path: &Path, bytes: &[u8], create_parent_privately: bool) -> Writ
         // per-file check; what bounds them is the name,
         // `statusline-<sanitized session id>`, which an attacker cannot
         // choose. Routing them through a guarded remove is a behaviour change
-        // that needs its own case.
+        // that needs its own case. The third, `housekeep`'s sweep, picks its
+        // names by listing the directory, so it re-verifies the directory
+        // first and removes only regular files of the state families.
         match crate::platform::create_private_dir(parent) {
             crate::platform::DirVerdict::Private => {}
             // Hostile and Failed are different answers: `cmd::subagent` maps

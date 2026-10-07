@@ -16,6 +16,7 @@ use claude_statusline::cmd::statusline as cmd_statusline;
 use claude_statusline::debug;
 use claude_statusline::focus::{self, Anchor, CaptureOutcome, Identity, Key, Observation, Record};
 use claude_statusline::git::{self, GitStatus, Porcelain};
+use claude_statusline::housekeep::{self, Context, Reason, Verdict};
 use claude_statusline::notify_state::{self, decide, Latch, LatchState};
 use claude_statusline::payload::{sanitize_display, Payload};
 use claude_statusline::platform;
@@ -192,6 +193,18 @@ fn entry_contract_always_exits_zero_and_silent() {
         },
         EntryCase {
             bin: BIN,
+            name: "housekeep-empty",
+            args: &["housekeep"],
+            stdin: "",
+        },
+        EntryCase {
+            bin: BIN,
+            name: "housekeep-malformed",
+            args: &["housekeep"],
+            stdin: "{not json",
+        },
+        EntryCase {
+            bin: BIN,
             name: "focus-no-key",
             args: &["focus"],
             stdin: "",
@@ -223,9 +236,18 @@ fn entry_contract_always_exits_zero_and_silent() {
         },
     ];
 
+    // `housekeep` must never reclaim a real process or sweep the real state
+    // directory from a test; the other rows are indifferent to both.
+    let tmp = scratch_dir("entry-contract");
+    let tmp = tmp.to_str().expect("scratch path is not UTF-8");
+    let env = [
+        (housekeep::SKIP_RECLAIM_ENV, "1"),
+        ("TEMP", tmp),
+        ("TMPDIR", tmp),
+    ];
     let mut failures = Failures::default();
     for c in cases {
-        let run = run_exe(c.bin, c.args, c.stdin, &[]);
+        let run = run_exe(c.bin, c.args, c.stdin, &env);
         failures.check(c.name, run.code == Some(0), || {
             format!("expected exit 0, got {:?}", run.code)
         });
@@ -585,6 +607,431 @@ fn an_unopenable_process_reads_unknown_never_zero_or_dead() {
             && f.parent == platform::ParentStart::Unreadable,
         "{f:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Housekeeping: the stranded-process policy and the state-file sweep
+// ---------------------------------------------------------------------------
+
+/// One second in `FILETIME` units.
+const FT_SEC: u64 = 10_000_000;
+/// When the pass's snapshot was taken. Any instant works.
+const TAKEN: u64 = 134_000_000_000_000_000;
+const ME: u64 = 0x5eed;
+
+/// The pass as `housekeep` builds it, with `current_exe` spelled the way it
+/// reports: no `\\?\` prefix, and casing that differs from the image path's.
+fn pass_context() -> Context {
+    Context {
+        taken: TAKEN,
+        own_pid: 1_000,
+        own_exe: Some(r"C:\Users\Me\.claude\claude-statusline.exe".to_string()),
+        owner: Some(ME),
+    }
+}
+
+/// A tick MSYS2 created suspended and whose bash died before resuming it.
+fn stranded_tick() -> platform::ProcessFacts {
+    platform::ProcessFacts {
+        pid: 4_242,
+        ppid: 4_000,
+        name: "claude-statusline.exe".to_string(),
+        threads: 1,
+        image: Some(PathBuf::from(
+            r"\\?\C:\Users\me\.claude\claude-statusline.exe",
+        )),
+        created: Some(TAKEN - 61 * FT_SEC),
+        cpu: Some(0),
+        owner: Some(ME),
+        args: Some(0),
+        parent: platform::ParentStart::Gone,
+    }
+}
+
+/// A console helper whose bash died before signalling "goodbye". Most measured
+/// orphans had run, so it carries CPU time and more than one thread.
+fn orphaned_helper() -> platform::ProcessFacts {
+    platform::ProcessFacts {
+        pid: 5_151,
+        ppid: 5_000,
+        name: "cygwin-console-helper.exe".to_string(),
+        threads: 3,
+        image: Some(PathBuf::from(
+            r"C:\Program Files\Git\usr\bin\cygwin-console-helper.exe",
+        )),
+        created: Some(TAKEN - 61 * FT_SEC),
+        cpu: Some(156_250),
+        owner: Some(ME),
+        args: Some(2),
+        parent: platform::ParentStart::Gone,
+    }
+}
+
+fn edited(
+    mut facts: platform::ProcessFacts,
+    edit: impl FnOnce(&mut platform::ProcessFacts),
+) -> platform::ProcessFacts {
+    edit(&mut facts);
+    facts
+}
+
+/// Each rule's conditions one at a time. A row that skips names the reason,
+/// so a row cannot pass by tripping a different rule than the one it varies.
+#[test]
+fn the_stranded_process_policy_terminates_only_what_cannot_be_in_use() {
+    use platform::ParentStart;
+    let tick = stranded_tick;
+    let helper = orphaned_helper;
+    let skip = Verdict::Skip;
+    let cases = [
+        ("stranded-tick", tick(), Verdict::Terminate),
+        (
+            "tick-59s-old",
+            edited(tick(), |f| f.created = Some(TAKEN - 59 * FT_SEC)),
+            skip(Reason::Young),
+        ),
+        (
+            "tick-live-parent",
+            edited(tick(), |f| {
+                f.parent = ParentStart::At(TAKEN - 3_600 * FT_SEC)
+            }),
+            skip(Reason::ParentAlive),
+        ),
+        (
+            "tick-with-cpu-time",
+            edited(tick(), |f| f.cpu = Some(1)),
+            skip(Reason::Running),
+        ),
+        (
+            "tick-in-another-directory",
+            edited(tick(), |f| {
+                f.image = Some(PathBuf::from(r"C:\Tools\claude-statusline.exe"))
+            }),
+            skip(Reason::Elsewhere),
+        ),
+        // The installer's rename to `.old` changes the file, not the directory.
+        (
+            "tick-renamed-to-old",
+            edited(tick(), |f| {
+                f.image = Some(PathBuf::from(
+                    r"\\?\C:\Users\me\.claude\claude-statusline.exe.old",
+                ))
+            }),
+            Verdict::Terminate,
+        ),
+        (
+            "parent-pid-reused-by-a-newer-process",
+            edited(tick(), |f| f.parent = ParentStart::At(TAKEN - 30 * FT_SEC)),
+            Verdict::Terminate,
+        ),
+        (
+            "created-at-the-snapshot",
+            edited(tick(), |f| f.created = Some(TAKEN)),
+            skip(Reason::Reused),
+        ),
+        (
+            "created-after-the-snapshot",
+            edited(tick(), |f| f.created = Some(TAKEN + FT_SEC)),
+            skip(Reason::Reused),
+        ),
+        (
+            "parent-start-unreadable",
+            edited(tick(), |f| f.parent = ParentStart::Unreadable),
+            skip(Reason::Unreadable),
+        ),
+        (
+            "owner-unreadable",
+            edited(tick(), |f| f.owner = None),
+            skip(Reason::Unreadable),
+        ),
+        (
+            "another-users-process",
+            edited(tick(), |f| f.owner = Some(ME + 1)),
+            skip(Reason::Foreign),
+        ),
+        (
+            "this-process",
+            edited(tick(), |f| f.pid = pass_context().own_pid),
+            skip(Reason::Own),
+        ),
+        ("orphaned-helper", helper(), Verdict::Terminate),
+        (
+            "helper-with-three-arguments",
+            edited(helper(), |f| f.args = Some(3)),
+            skip(Reason::Arguments),
+        ),
+        (
+            "helper-command-line-unreadable",
+            edited(helper(), |f| f.args = None),
+            skip(Reason::Unreadable),
+        ),
+        (
+            "helper-outside-usr-bin",
+            edited(helper(), |f| {
+                f.image = Some(PathBuf::from(r"C:\Tools\cygwin-console-helper.exe"))
+            }),
+            skip(Reason::Elsewhere),
+        ),
+    ];
+
+    let cx = pass_context();
+    let mut failures = Failures::default();
+    for (name, facts, want) in cases {
+        let got = housekeep::judge(&facts, &cx);
+        failures.check(name, got == want, || format!("{got:?}, want {want:?}"));
+    }
+    failures.assert_empty("stranded-process policy");
+}
+
+/// A detached `notify` child legitimately runs on with a dead parent for as
+/// long as its waits allow; the age floor keeps every rule away from it. The
+/// longest today is the toast's deadline followed by a synchronous stock
+/// sound, a few seconds at most. A longer bounded wait must fail here rather
+/// than get its process killed.
+#[test]
+fn the_age_floor_outlasts_every_bounded_wait() {
+    use claude_statusline::platform::notify::SPAWN_DEADLINE;
+    let sound = std::time::Duration::from_secs(30);
+    assert!(
+        housekeep::STRANDED_AGE_FLOOR > SPAWN_DEADLINE + sound,
+        "the floor ({:?}) no longer outlasts the toast deadline plus a sound",
+        housekeep::STRANDED_AGE_FLOOR
+    );
+}
+
+/// Writes `name` under `dir` and backdates (or postdates) it to `mtime`.
+fn file_at(dir: &Path, name: &str, mtime: std::time::SystemTime) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, b"x").expect("stage the file");
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(mtime))
+        .expect("set the mtime");
+    path
+}
+
+/// Both age boundaries from each side, one of every family, a future mtime,
+/// and names the sweep must not claim.
+#[test]
+fn the_sweep_removes_stale_staging_and_week_old_state_only() {
+    use std::time::Duration;
+    let (_dir, root) = guarded_root("housekeep-sweep");
+    // The directory comes into being the way a tick creates it.
+    let live = root.join("statusline-git-live.txt");
+    assert_eq!(
+        state::write_guarded_under(&root, &live, b"x"),
+        WriteOutcome::Written
+    );
+
+    let now = std::time::SystemTime::now();
+    let min = Duration::from_secs(60);
+    let day = Duration::from_secs(86_400);
+    let ago = |d: Duration| now - d;
+    let cases = [
+        (".statusline-git-a.txt.4242.tmp", ago(9 * min), true),
+        (".statusline-git-b.txt.4242.tmp", ago(11 * min), false),
+        (
+            "statusline-tokens-c.txt",
+            ago(6 * day + 23 * 60 * min),
+            true,
+        ),
+        ("statusline-tokens-d.txt", ago(7 * day + 60 * min), false),
+        ("statusline-notify-e.json", now + day, true),
+        ("statusline-git-s.txt", ago(8 * day), false),
+        ("statusline-tasks-s.json", ago(8 * day), false),
+        ("statusline-notify-s.json", ago(8 * day), false),
+        ("statusline-focus-s.json", ago(8 * day), false),
+        ("statusline-sa-s-task-t.txt", ago(8 * day), false),
+        ("statusline-sa-s-explorer.txt", ago(8 * day), false),
+        ("other-tool.txt", ago(30 * day), true),
+        (".other-tool.txt.4242.tmp", ago(30 * day), true),
+        (".statusline-git-f.txt.x1.tmp", ago(30 * day), true),
+    ];
+    for (name, mtime, _) in &cases {
+        file_at(&root, name, *mtime);
+    }
+
+    let removed = housekeep::sweep(&root, now);
+    let mut failures = Failures::default();
+    for (name, _, kept) in &cases {
+        let exists = root.join(name).exists();
+        failures.check(name, exists == *kept, || {
+            format!("exists={exists}, want kept={kept}")
+        });
+    }
+    let want = cases.iter().filter(|c| !c.2).count();
+    failures.check("count", removed == want, || {
+        format!("removed {removed}, want {want}")
+    });
+    failures.check("fresh-state", live.exists(), || "removed".to_string());
+    failures.assert_empty("sweep");
+}
+
+/// The sweep acts only in the directory this binary verified as its own: never
+/// in the flat fallback, which is the shared temp root, and it never creates
+/// the directory to sweep it.
+#[test]
+fn the_sweep_leaves_the_flat_fallback_and_an_absent_directory_alone() {
+    let week_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86_400);
+    let flat = scratch_dir("housekeep-flat");
+    let stale = file_at(&flat, "statusline-git-s.txt", week_ago);
+    let staging = file_at(&flat, ".statusline-git-s.txt.4242.tmp", week_ago);
+    let removed = housekeep::sweep(&inherited(&flat), std::time::SystemTime::now());
+    assert_eq!(removed, 0);
+    assert!(
+        stale.exists() && staging.exists(),
+        "the flat root was swept"
+    );
+
+    let (_dir, absent) = guarded_root("housekeep-absent");
+    assert_eq!(housekeep::sweep(&absent, std::time::SystemTime::now()), 0);
+    assert!(!absent.exists(), "the sweep created the state directory");
+}
+
+/// A link named like a week-old state file, itself backdated, pointing at a
+/// week-old file named like one too: only the regular-file rule spares it,
+/// and the sweep must neither remove the link nor reach through it.
+#[test]
+fn the_sweep_never_follows_or_removes_a_link() {
+    let (dir, root) = guarded_root("housekeep-link");
+    assert_eq!(
+        platform::create_private_dir(&root),
+        platform::DirVerdict::Private
+    );
+    let week_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86_400);
+    let outside = dir.join("outside");
+    std::fs::create_dir_all(&outside).expect("outside");
+    let victim = file_at(&outside, "statusline-git-victim.txt", week_ago);
+    let link = root.join("statusline-git-link.txt");
+    if !plant_aged_link(&victim, &link, week_ago) {
+        skipped_for_want_of_symlinks();
+        return;
+    }
+
+    let removed = housekeep::sweep(&root, std::time::SystemTime::now());
+    assert_eq!(removed, 0);
+    assert!(
+        std::fs::symlink_metadata(&link).is_ok(),
+        "the link was removed"
+    );
+    assert!(victim.exists(), "the sweep reached through the link");
+}
+
+/// A symlink to `victim`, with the link's own mtime set: std's `set_modified`
+/// would follow it, so `utimensat` is asked not to.
+#[cfg(unix)]
+fn plant_aged_link(victim: &Path, link: &Path, mtime: std::time::SystemTime) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if !make_symlink(victim, link) {
+        return false;
+    }
+    let secs = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    // Zeroed, then set: some targets' `timespec` carries padding fields a
+    // struct literal could not name.
+    let mut at: libc::timespec = unsafe { std::mem::zeroed() };
+    at.tv_sec = secs as libc::time_t;
+    let path = std::ffi::CString::new(link.as_os_str().as_bytes()).expect("no NUL");
+    unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            [at, at].as_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) == 0
+    }
+}
+
+/// A junction to the victim's directory: the reparse point any user can plant
+/// without Developer Mode. Its own mtime is set through a handle opened on the
+/// reparse point rather than its target.
+#[cfg(windows)]
+fn plant_aged_link(victim: &Path, link: &Path, mtime: std::time::SystemTime) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    let target = victim.parent().expect("the victim's directory");
+    let made = Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    made && std::fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(link)
+        .and_then(|f| f.set_modified(mtime))
+        .is_ok()
+}
+
+/// The hook fires on every prompt and every idle turn, across sessions, so two
+/// passes overlap routinely: both must exit 0 silently, each logging its one
+/// line, with nothing on stdin at all. Run as the binary, so the dispatch arm
+/// and the state directory it resolves are the shipped ones.
+#[test]
+fn concurrent_housekeep_passes_both_exit_zero_silently() {
+    let (dir, root) = guarded_root("housekeep-concurrent");
+    let live = root.join("statusline-git-live.txt");
+    assert_eq!(
+        state::write_guarded_under(&root, &live, b"x"),
+        WriteOutcome::Written
+    );
+    let week_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86_400);
+    let stale: Vec<PathBuf> = (0..20)
+        .map(|n| file_at(&root, &format!("statusline-tokens-{n}.txt"), week_ago))
+        .collect();
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let tmp = dir.join("tmp");
+
+    let spawn = || {
+        Command::new(BIN)
+            .arg("housekeep")
+            .env(housekeep::SKIP_RECLAIM_ENV, "1")
+            .env("TEMP", &tmp)
+            .env("TMPDIR", &tmp)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env("STATUSLINE_DEBUG", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn housekeep")
+    };
+    let passes = [spawn(), spawn()];
+    let mut failures = Failures::default();
+    for (n, pass) in passes.into_iter().enumerate() {
+        let out = pass.wait_with_output().expect("wait for housekeep");
+        let name = format!("pass-{n}");
+        failures.check(&name, out.status.code() == Some(0), || {
+            format!("exit {:?}", out.status.code())
+        });
+        failures.check(
+            &name,
+            out.stdout.is_empty() && out.stderr.is_empty(),
+            || format!("stdout {:?}, stderr {:?}", out.stdout, out.stderr),
+        );
+    }
+    failures.check("stale-removed", stale.iter().all(|p| !p.exists()), || {
+        "a week-old state file survived".to_string()
+    });
+    failures.check("fresh-kept", live.exists(), || "removed".to_string());
+    let log = std::fs::read_to_string(home.join(".claude").join("statusline-debug.log"))
+        .unwrap_or_default();
+    let lines = log
+        .lines()
+        .filter(|l| l.starts_with("housekeep: reclaim=off "))
+        .count();
+    failures.check("one-line-per-pass", lines == 2, || format!("log: {log:?}"));
+    failures.assert_empty("concurrent housekeep");
 }
 
 // ---------------------------------------------------------------------------
