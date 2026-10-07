@@ -546,15 +546,14 @@ fn a_suspended_copy_reads_as_a_stranded_tick_does() {
     // The rules on facts the platform read rather than hand-built ones: once
     // its creator is gone and a minute has passed, the copy is a stranded tick.
     // An image path spelled differently from `current_exe` would read
-    // Elsewhere, which disables reclamation without killing anything.
-    // Canonicalized, because a runner's temp path may be an 8.3 short name
-    // where a hook's binary path, built from the profile, never is.
+    // Elsewhere, which disables reclamation without killing anything. Both
+    // report the path the process was launched by, 8.3 short names included,
+    // and in use both come from the one path `settings.json` holds: so the
+    // pass's own path here is the one the copy was launched by.
     let pass = Context {
         taken: snapshot.taken + 61 * FT_SEC,
         own_pid: u64::from(std::process::id()),
-        own_exe: std::fs::canonicalize(&exe)
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned()),
+        own_exe: Some(exe.to_string_lossy().into_owned()),
         owner: platform::current_owner(),
     };
     let orphaned = platform::ProcessFacts {

@@ -55,7 +55,10 @@ where
         .append(true)
         .open(path)
     {
-        let _ = writeln!(f, "{line}");
+        // One write, newline included: `writeln!` on an unbuffered file is
+        // two, and concurrent processes appending to this log interleave
+        // between them.
+        let _ = f.write_all(format!("{line}\n").as_bytes());
     }
 }
 

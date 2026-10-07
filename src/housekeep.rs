@@ -219,7 +219,14 @@ pub fn sweep(root: &StateRoot, now: SystemTime) -> usize {
         }
         match std::fs::remove_file(entry.path()) {
             Ok(()) => removed += 1,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // A concurrent pass got there first. Windows reports a file that
+            // pass is still deleting as access denied rather than absent; one
+            // that stays locked is retried by the next pass.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) => {}
             Err(e) => {
                 let path = entry.path().display().to_string();
                 debug::log(move || format!("housekeep: cannot remove {path}: {e}"));
