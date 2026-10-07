@@ -698,9 +698,44 @@ fn the_stranded_process_policy_terminates_only_what_cannot_be_in_use() {
             skip(Reason::ParentAlive),
         ),
         (
+            "tick-exactly-60s-old",
+            edited(tick(), |f| f.created = Some(TAKEN - 60 * FT_SEC)),
+            Verdict::Terminate,
+        ),
+        (
+            "parent-started-with-the-child",
+            edited(tick(), |f| f.parent = ParentStart::At(TAKEN - 61 * FT_SEC)),
+            skip(Reason::ParentAlive),
+        ),
+        (
             "tick-with-cpu-time",
             edited(tick(), |f| f.cpu = Some(1)),
             skip(Reason::Running),
+        ),
+        (
+            "tick-with-a-second-thread",
+            edited(tick(), |f| f.threads = 2),
+            skip(Reason::Running),
+        ),
+        (
+            "cpu-time-unreadable",
+            edited(tick(), |f| f.cpu = None),
+            skip(Reason::Unreadable),
+        ),
+        (
+            "image-unreadable",
+            edited(tick(), |f| f.image = None),
+            skip(Reason::Unreadable),
+        ),
+        (
+            "creation-time-unreadable",
+            edited(tick(), |f| f.created = None),
+            skip(Reason::Unreadable),
+        ),
+        (
+            "an-image-no-rule-covers",
+            edited(tick(), |f| f.name = "bash.exe".to_string()),
+            skip(Reason::Name),
         ),
         (
             "tick-in-another-directory",
@@ -889,6 +924,62 @@ fn the_sweep_leaves_the_flat_fallback_and_an_absent_directory_alone() {
     assert!(!absent.exists(), "the sweep created the state directory");
 }
 
+/// A directory that resolved guarded and stopped verifying before the pass
+/// reached it: replaced by a link to somewhere else, or on Unix loosened to
+/// 0755. The sweep's own re-check is all that stands between that and deleting
+/// through it, since resolution already happened.
+#[test]
+fn the_sweep_refuses_a_state_directory_that_stopped_verifying() {
+    let week_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 86_400);
+    let (dir, root) = guarded_root("housekeep-swapped");
+    let elsewhere = dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).expect("elsewhere");
+    let stale = file_at(&elsewhere, "statusline-git-s.txt", week_ago);
+    let staging = file_at(&elsewhere, ".statusline-git-s.txt.4242.tmp", week_ago);
+    if !plant_dir_link(&elsewhere, &root) {
+        skipped_for_want_of_symlinks();
+        return;
+    }
+    assert_eq!(housekeep::sweep(&root, std::time::SystemTime::now()), 0);
+    assert!(
+        stale.exists() && staging.exists(),
+        "the sweep deleted through a link"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let (_dir, root) = guarded_root("housekeep-loosened");
+        assert_eq!(
+            platform::create_private_dir(&root),
+            platform::DirVerdict::Private
+        );
+        let stale = file_at(&root, "statusline-git-s.txt", week_ago);
+        std::fs::set_permissions(&*root, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(housekeep::sweep(&root, std::time::SystemTime::now()), 0);
+        assert!(stale.exists(), "the sweep acted in a loosened directory");
+    }
+}
+
+/// A link to the directory `target` that any user can plant: a junction on
+/// Windows, which needs no Developer Mode, and a symlink elsewhere.
+#[cfg(unix)]
+fn plant_dir_link(target: &Path, link: &Path) -> bool {
+    make_dir_symlink(target, link)
+}
+
+#[cfg(windows)]
+fn plant_dir_link(target: &Path, link: &Path) -> bool {
+    Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// A link named like a week-old state file, itself backdated, pointing at a
 /// week-old file named like one too: only the regular-file rule spares it,
 /// and the sweep must neither remove the link nor reach through it.
@@ -955,20 +1046,13 @@ fn plant_aged_link(victim: &Path, link: &Path, mtime: std::time::SystemTime) -> 
     const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     let target = victim.parent().expect("the victim's directory");
-    let made = Command::new("cmd")
-        .args(["/C", "mklink", "/J"])
-        .arg(link)
-        .arg(target)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    made && std::fs::OpenOptions::new()
-        .access_mode(FILE_WRITE_ATTRIBUTES)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(link)
-        .and_then(|f| f.set_modified(mtime))
-        .is_ok()
+    plant_dir_link(target, link)
+        && std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(link)
+            .and_then(|f| f.set_modified(mtime))
+            .is_ok()
 }
 
 /// The hook fires on every prompt and every idle turn, across sessions, so two
@@ -4109,6 +4193,7 @@ fn powershell_installers_never_read_a_stale_exit_code() {
     for rel in INSTALL_PS1 {
         let body = read_repo_file(rel);
         let mut defines_helper = false;
+        let mut helper_calls = 0;
 
         for (n, line) in code_lines(&body, '#') {
             if line.contains("function Invoke-Binary") {
@@ -4136,7 +4221,18 @@ fn powershell_installers_never_read_a_stale_exit_code() {
                     format!("invokes a native command outside Invoke-Binary: {line}")
                 });
             }
+            if is_helper_call {
+                helper_calls += 1;
+                failures.check(&format!("{rel}:{n}"), line.contains("@() | & $Exe"), || {
+                    format!("the helper's call no longer pipes in an empty input: {line}")
+                });
+            }
         }
+        failures.check(
+            &format!("{rel}: Invoke-Binary calls the binary"),
+            helper_calls > 0,
+            || "no `& $Exe @BinArgs` line, so the empty-input check above saw nothing".to_string(),
+        );
 
         // Guards against the assertions above passing vacuously on a file that
         // simply stopped calling anything.

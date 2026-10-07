@@ -263,7 +263,9 @@ Leave out `--notify` if you don't use notifications, and `--subagent` if you kep
 
 When a refresh is still starting as the next one comes due, Claude Code cancels it by killing its process tree, and that kill can race Git Bash. What it leaves behind never finishes: a `claude-statusline.exe` that never got to run, or a `cygwin-console-helper.exe` waiting for a bash that's gone, each helper keeping its own console host (`conhost.exe`) open. On one machine a week of this added up to 436 processes and about 2.4 GB of memory. The cause is in Claude Code and Git Bash ([anthropics/claude-code#98976](https://github.com/anthropics/claude-code/issues/98976)); this tool cleans up after it.
 
-- **Cleanup is automatic.** A `housekeep` hook runs each time you send a prompt, and again about a minute after a turn ends. It stops leftovers at least 60 seconds old whose parent has gone, and leaves anything that may still be in use, including helpers serving an open Git Bash window.- **Count them:**
+- **Cleanup is automatic.** A `housekeep` hook runs each time you send a prompt, and again about a minute after a turn ends. It stops leftovers at least 60 seconds old whose parent has gone, and leaves anything that may still be in use, including helpers serving an open Git Bash window.
+
+- **Count them:**
 
   ```powershell
   Get-Process claude-statusline, cygwin-console-helper -ErrorAction SilentlyContinue | Group-Object Name -NoElement
