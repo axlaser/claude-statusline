@@ -543,6 +543,29 @@ fn a_suspended_copy_reads_as_a_stranded_tick_does() {
         show,
     );
 
+    // The rules on facts the platform read rather than hand-built ones: once
+    // its creator is gone and a minute has passed, the copy is a stranded tick.
+    // An image path spelled differently from `current_exe` would read
+    // Elsewhere, which disables reclamation without killing anything.
+    // Canonicalized, because a runner's temp path may be an 8.3 short name
+    // where a hook's binary path, built from the profile, never is.
+    let pass = Context {
+        taken: snapshot.taken + 61 * FT_SEC,
+        own_pid: u64::from(std::process::id()),
+        own_exe: std::fs::canonicalize(&exe)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
+        owner: platform::current_owner(),
+    };
+    let orphaned = platform::ProcessFacts {
+        parent: platform::ParentStart::Gone,
+        ..facts.clone()
+    };
+    let verdict = housekeep::judge(&orphaned, &pass);
+    failures.check("judged-stranded", verdict == Verdict::Terminate, || {
+        format!("{verdict:?} for {orphaned:?}")
+    });
+
     let me = platform::open_candidate(&snapshot, u64::from(std::process::id()))
         .expect("the snapshot holds this process");
     failures.check(
