@@ -50,9 +50,14 @@ windows-sys = { version = "0.59", features = [
     # spawning a player would be a second process on every notification.
     "Win32_Media_Audio",
     # Click-to-focus: `ProcessPrng` for the token, the standard library's own
-    # source; Toolhelp for walking the parent chain to the anchor.
+    # source; Toolhelp for walking the parent chain to the anchor, and for
+    # finding stranded processes to reclaim.
     "Win32_Security_Cryptography",
     "Win32_System_Diagnostics_ToolHelp",
+    # Reclaiming stranded processes: `NtQueryInformationProcess` reads a
+    # helper's command line on a limited-information handle. It is an ntdll
+    # export, mapped into every process, so it adds no DLL load.
+    "Wdk_System_Threading",
     # Click-to-focus: finding the terminal window and marking it with a
     # window property at capture, verified at click.
     "Win32_UI_WindowsAndMessaging",

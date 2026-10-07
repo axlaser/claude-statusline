@@ -141,7 +141,7 @@ There is one implementation. Platform-conditional code is confined to four areas
 
 1. **notification delivery** -- the per-OS sound and toast mechanisms, and the click side of them: capturing which terminal window a session runs in, the click transport, and the Windows URI registration,
 2. **file-ownership checks** -- the uid and ACL guards,
-3. **process and stream handling** -- redirecting fd 2 at entry, and creation flags on spawned children,
+3. **process and stream handling** -- redirecting fd 2 at entry, creation flags on spawned children, and reclaiming stranded processes: the process snapshot focus capture shares, the facts read through one handle per candidate, and termination on that handle,
 4. **environment spelling** -- `%USERPROFILE%` against `$HOME`, `%TEMP%` against `$TMPDIR`, and whether a stored command needs quoting.
 
 Anything else that reaches for `cfg!(windows)` is a design error -- most often a sign that a behaviour should be resolved to one recorded answer instead of branched. Path formatting is the worked example: the port compares the home prefix case-sensitively on every platform rather than matching Windows' case-insensitive comparison, because keeping both would need a branch here (see `docs/performance.md` §4).

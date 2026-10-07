@@ -402,6 +402,192 @@ fn std_handles_inheritable() -> [bool; 3] {
 }
 
 // ---------------------------------------------------------------------------
+// Process facts
+// ---------------------------------------------------------------------------
+
+/// The stranded-helper rule terminates a two-argument helper and spares a
+/// three-argument one, which serves a pseudo console; the count is what tells
+/// them apart. The first two rows are the measured helper shapes.
+#[test]
+fn argument_count_splits_the_way_windows_does() {
+    let cases: [(&str, &str, usize); 9] = [
+        (
+            "orphaned-helper",
+            r#""\\?\C:\Program Files\Git\usr\bin\cygwin-console-helper.exe" 0x260 0x2B0"#,
+            2,
+        ),
+        (
+            "pseudo-console-helper",
+            r#""\\?\C:\Program Files\Git\usr\bin\cygwin-console-helper.exe" 0x260 0x2B0 0x2B4"#,
+            3,
+        ),
+        ("stranded-tick", r"C:\Tools\claude-statusline.exe", 0),
+        ("bare-program-with-args", "helper.exe 0x1 0x2", 2),
+        ("quoted-argument-with-a-space", r#"prog "a b" c"#, 2),
+        ("escaped-quote-stays-literal", r#"prog a\"b c"#, 2),
+        ("escaped-backslash-then-quote", r#"prog "a\\" b"#, 2),
+        ("blank-runs", "prog \t a   b \t", 2),
+        ("empty", "", 0),
+    ];
+    let mut failures = Failures::default();
+    for (name, line, want) in cases {
+        let got = platform::argument_count(line);
+        failures.check(name, got == want, || {
+            format!("{line:?}: {got}, want {want}")
+        });
+    }
+    failures.assert_empty("argument_count");
+}
+
+/// A process this test created, terminated through the handle `Child` holds
+/// however the test ends, so a failed assertion cannot strand a copy.
+#[cfg(windows)]
+struct OwnChild(std::process::Child);
+
+#[cfg(windows)]
+impl Drop for OwnChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A stranded tick is a process created suspended whose creator died before
+/// resuming it. A copy of the binary, created suspended by this test, must
+/// read the way the stranded-tick rule expects one thread and zero CPU time to
+/// read, and keep its directory through the installer's rename to `.old`; and
+/// after terminate-and-wait the file must be deletable, which is what lets an
+/// upgrade remove `.old`. The test process itself is the running contrast.
+#[cfg(windows)]
+#[test]
+fn a_suspended_copy_reads_as_a_stranded_tick_does() {
+    use std::os::windows::process::CommandExt;
+    use std::time::Duration;
+    const CREATE_SUSPENDED: u32 = 0x0000_0004;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let dir = scratch_dir("stranded-facts");
+    let exe = dir.join("claude-statusline.exe");
+    std::fs::copy(BIN, &exe).expect("copy the binary");
+    let child = OwnChild(
+        Command::new(&exe)
+            .args(["0x1", "0x2"])
+            .creation_flags(CREATE_SUSPENDED | CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("create the suspended copy"),
+    );
+    let pid = u64::from(child.0.id());
+    let dir_real = std::fs::canonicalize(&dir).expect("canonical scratch dir");
+    let dir_of = |image: &Option<PathBuf>| {
+        image
+            .as_deref()
+            .and_then(Path::parent)
+            .and_then(|p| std::fs::canonicalize(p).ok())
+    };
+
+    let snapshot = platform::process_snapshot();
+    let candidate = platform::open_candidate(&snapshot, pid).expect("the snapshot holds the copy");
+    let facts = candidate.facts.clone();
+    let mut failures = Failures::default();
+    let show = || format!("{facts:?}");
+    failures.check("one-thread", facts.threads == 1, show);
+    failures.check("zero-cpu", facts.cpu == Some(0), show);
+    failures.check(
+        "image-dir",
+        dir_of(&facts.image).as_ref() == Some(&dir_real),
+        show,
+    );
+    failures.check(
+        "owner-is-this-user",
+        facts.owner.is_some() && facts.owner == platform::current_owner(),
+        show,
+    );
+    failures.check("argument-count", facts.args == Some(2), show);
+    failures.check(
+        "created-before-the-snapshot",
+        facts.created.is_some_and(|c| c < snapshot.taken),
+        show,
+    );
+    // The test process created it and is alive: its PID is held by a process
+    // no younger than the copy.
+    failures.check(
+        "live-parent",
+        facts.ppid == u64::from(std::process::id())
+            && matches!(facts.parent, platform::ParentStart::At(start)
+                if facts.created.is_some_and(|c| start <= c)),
+        show,
+    );
+
+    let me = platform::open_candidate(&snapshot, u64::from(std::process::id()))
+        .expect("the snapshot holds this process");
+    failures.check(
+        "running-process-has-cpu",
+        me.facts.cpu.is_some_and(|t| t > 0),
+        || format!("{:?}", me.facts),
+    );
+    drop(me);
+
+    let old = dir.join("claude-statusline.exe.old");
+    let renamed = std::fs::rename(&exe, &old);
+    failures.check("rename-while-suspended", renamed.is_ok(), || {
+        format!("{renamed:?}")
+    });
+    let after = platform::process_snapshot();
+    let reopened = platform::open_candidate(&after, pid).expect("the copy outlives the rename");
+    failures.check(
+        "name-survives-rename",
+        reopened.facts.name == "claude-statusline.exe",
+        || format!("{:?}", reopened.facts),
+    );
+    failures.check(
+        "image-dir-survives-rename",
+        dir_of(&reopened.facts.image).as_ref() == Some(&dir_real),
+        || format!("{:?}", reopened.facts),
+    );
+    drop(reopened);
+
+    let terminated = candidate.terminate();
+    let alive = platform::wait_for_exit(std::slice::from_ref(&candidate), Duration::from_secs(1));
+    failures.check(
+        "terminated-and-exited",
+        terminated && alive.is_empty(),
+        || format!("terminated={terminated} still alive={alive:?}"),
+    );
+    let deleted = std::fs::remove_file(&old);
+    failures.check("deletable-after-the-wait", deleted.is_ok(), || {
+        format!("{deleted:?}")
+    });
+    drop(child);
+    failures.assert_empty("suspended-copy facts");
+}
+
+/// A process this user cannot open must read "unknown" for every handle fact:
+/// a zero CPU time, a dead parent or a missing owner read from a failed open
+/// is exactly what the rules terminate on. System (PID 4) refuses the
+/// terminate right to everyone. Nothing here terminates it.
+#[cfg(windows)]
+#[test]
+fn an_unopenable_process_reads_unknown_never_zero_or_dead() {
+    const SYSTEM: u64 = 4;
+    let snapshot = platform::process_snapshot();
+    let candidate = platform::open_candidate(&snapshot, SYSTEM)
+        .expect("the System process is in every snapshot");
+    let f = &candidate.facts;
+    assert!(
+        f.image.is_none()
+            && f.created.is_none()
+            && f.cpu.is_none()
+            && f.owner.is_none()
+            && f.args.is_none()
+            && f.parent == platform::ParentStart::Unreadable,
+        "{f:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Clock
 // ---------------------------------------------------------------------------
 
@@ -3275,7 +3461,7 @@ fn code_lines(body: &str, comment: char) -> impl Iterator<Item = (usize, &str)> 
 const PLATFORM_CONDITIONAL: [(&str, &str); 9] = [
     (
         "src/platform/mod.rs",
-        "file-ownership checks and process-entry stream handling",
+        "file-ownership checks, process-entry stream handling and reclaiming stranded processes",
     ),
     ("src/platform/notify.rs", "notification delivery"),
     (

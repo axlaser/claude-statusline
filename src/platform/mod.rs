@@ -1,11 +1,15 @@
 //! Two of the areas platform-conditional code is confined to: file-ownership
-//! checks and process-entry stream handling. Notification delivery is the third
-//! and lives in `notify`, with its click side in `focus`.
+//! checks, and process handling — process-entry stream handling, plus the
+//! process snapshot, facts and termination that reclaim stranded processes.
+//! Notification delivery is a third and lives in `notify`, with its click side
+//! in `focus`, which shares the snapshot walker here.
 //!
 //! Keep new `#[cfg]` code here rather than scattering it —
 //! `platform_conditional_code_stays_in_its_areas` asserts the file list.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 pub mod focus;
 pub mod notify;
@@ -79,10 +83,183 @@ pub fn create_private_dir(path: &Path) -> DirVerdict {
     imp::verify_through_handle(path)
 }
 
+/// One process as a Toolhelp snapshot saw it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessEntry {
+    pub ppid: u64,
+    /// A process created suspended and never resumed has exactly one.
+    pub threads: u32,
+    /// The image's file name as recorded at creation, so a later rename of the
+    /// file (the installer's move to `.old`) does not change it.
+    pub name: String,
+}
+
+/// Every process at one instant. Empty on Unix, where only stale files are
+/// cleaned up and focus capture reads `/proc` or `libproc` instead.
+#[derive(Debug, Default)]
+pub struct ProcessSnapshot {
+    /// When the walk began, in `FILETIME` units (100 ns since 1601). Read
+    /// before the walk, so a process whose handle reports a creation time at
+    /// or after this is one the snapshot never saw: its PID was reused, and
+    /// the entry under that PID describes a different process.
+    pub taken: u64,
+    pub entries: HashMap<u64, ProcessEntry>,
+}
+
+/// One snapshot of every process; empty when it cannot be taken.
+pub fn process_snapshot() -> ProcessSnapshot {
+    imp::process_snapshot()
+}
+
+/// What the process holding a candidate's parent PID says about the parent.
+/// Raw facts: the liveness rule, `ancestor_chain`'s, belongs to the
+/// caller's pure policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentStart {
+    /// No process in the snapshot holds the parent PID.
+    Gone,
+    /// The creation time of the process holding it. Later than the
+    /// candidate's own means the PID was reused and the real parent is gone.
+    At(u64),
+    /// That creation time could not be read, which must count as alive.
+    Unreadable,
+}
+
+/// Everything a stranded-process rule asks of one process. The snapshot
+/// fields are always known; every fact read through the handle is `None` when
+/// it could not be read — never a zero, an empty path or a dead parent standing
+/// in for "unknown", because each of those answers is a reason to kill
+/// (`docs/solutions/logic-errors/get-acl-unavailable-inverts-trust-check.md`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessFacts {
+    pub pid: u64,
+    pub ppid: u64,
+    pub name: String,
+    pub threads: u32,
+    /// `QueryFullProcessImageNameW`'s path, as reported: after a rename it
+    /// names the new file, in the same directory.
+    pub image: Option<PathBuf>,
+    /// Creation time, in `FILETIME` units.
+    pub created: Option<u64>,
+    /// Kernel plus user time, in 100 ns units.
+    pub cpu: Option<u64>,
+    /// Comparable with `current_owner()`.
+    pub owner: Option<u64>,
+    /// Arguments after the program, by `argument_count`.
+    pub args: Option<usize>,
+    pub parent: ParentStart,
+}
+
+/// A process opened once, with what was read through that one handle. The
+/// handle is the only way to act on it, and holding it pins the process
+/// object, so a termination always lands on the process the facts describe,
+/// never on a successor that reused its PID.
+pub struct Candidate {
+    pub facts: ProcessFacts,
+    handle: Option<imp::ProcessHandle>,
+}
+
+impl Candidate {
+    /// Terminates the process through the handle its facts were read from.
+    /// `false` when it was never opened or the call failed.
+    pub fn terminate(&self) -> bool {
+        self.handle
+            .as_ref()
+            .is_some_and(imp::ProcessHandle::terminate)
+    }
+}
+
+/// Opens `pid` with `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE |
+/// SYNCHRONIZE` and reads its facts. `None` when the snapshot does not hold it;
+/// a process that cannot be opened comes back with every handle fact `None`.
+pub fn open_candidate(snapshot: &ProcessSnapshot, pid: u64) -> Option<Candidate> {
+    imp::open_candidate(snapshot, pid)
+}
+
+/// Waits for terminated candidates to exit, on the handles they were judged
+/// and terminated through, against one shared deadline: an installer removes
+/// the old binary right after, which fails while any image is still mapped.
+/// One handle at a time rather than `WaitForMultipleObjects`, which stops at
+/// 64 and a week of leaks measured 116 ticks. Returns the PIDs that had not
+/// exited, for the caller to log; they are left as they are.
+pub fn wait_for_exit(terminated: &[Candidate], within: Duration) -> Vec<u64> {
+    let deadline = Instant::now() + within;
+    terminated
+        .iter()
+        .filter(|c| {
+            let left = deadline.saturating_duration_since(Instant::now());
+            !c.handle.as_ref().is_some_and(|h| h.wait(left))
+        })
+        .map(|c| c.facts.pid)
+        .collect()
+}
+
+/// How many arguments follow the program on a Windows command line, split the
+/// way `CommandLineToArgvW` splits it: a program that opens with a quote runs
+/// to the next quote, otherwise to the first space or tab; after it, spaces and
+/// tabs outside quotes separate arguments, and a quote behind an odd run of
+/// backslashes is literal. Counted here because `CommandLineToArgvW` lives in
+/// `shell32`, a DLL this binary does not otherwise load.
+pub fn argument_count(command_line: &str) -> usize {
+    let blank = |c: &char| matches!(c, ' ' | '\t');
+    let mut chars = command_line.chars().peekable();
+    if chars.next_if_eq(&'"').is_some() {
+        let _ = chars.by_ref().find(|c| *c == '"');
+    } else {
+        while chars.next_if(|c| !blank(c)).is_some() {}
+    }
+    let mut count = 0;
+    loop {
+        while chars.next_if(blank).is_some() {}
+        if chars.peek().is_none() {
+            return count;
+        }
+        count += 1;
+        let (mut quoted, mut backslashes) = (false, 0usize);
+        while let Some(c) = chars.next_if(move |c| quoted || !blank(c)) {
+            match c {
+                '\\' => {
+                    backslashes += 1;
+                    continue;
+                }
+                '"' if backslashes % 2 == 0 => quoted = !quoted,
+                _ => {}
+            }
+            backslashes = 0;
+        }
+    }
+}
+
 #[cfg(unix)]
 mod imp {
     use std::os::unix::fs::MetadataExt;
     use std::path::Path;
+
+    /// Stranded processes are a Windows problem: MSYS2's suspended spawn and
+    /// its console helper. The snapshot is empty, so no process is ever opened
+    /// and this handle type has no values.
+    pub enum ProcessHandle {}
+
+    impl ProcessHandle {
+        pub fn terminate(&self) -> bool {
+            match *self {}
+        }
+
+        pub fn wait(&self, _within: std::time::Duration) -> bool {
+            match *self {}
+        }
+    }
+
+    pub fn process_snapshot() -> super::ProcessSnapshot {
+        super::ProcessSnapshot::default()
+    }
+
+    pub fn open_candidate(
+        _snapshot: &super::ProcessSnapshot,
+        _pid: u64,
+    ) -> Option<super::Candidate> {
+        None
+    }
 
     /// Nothing to clear: `exec` replaces fds 0-2 with whatever the child was
     /// given, and std opens every other descriptor close-on-exec.
@@ -177,12 +354,17 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::Path;
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Path, PathBuf};
 
+    use windows_sys::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessCommandLineInformation,
+    };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, LocalFree, SetHandleInformation, ERROR_SUCCESS, HANDLE, HANDLE_FLAG_INHERIT,
-        INVALID_HANDLE_VALUE,
+        CloseHandle, LocalFree, SetHandleInformation, ERROR_SUCCESS, FILETIME, HANDLE,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, UNICODE_STRING, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
         GetNamedSecurityInfoW, GetSecurityInfo, SE_FILE_OBJECT, SE_KERNEL_OBJECT,
@@ -201,7 +383,16 @@ mod imp {
     use windows_sys::Win32::System::Console::{
         GetStdHandle, SetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetProcessTimes, OpenProcess, OpenProcessToken,
+        QueryFullProcessImageNameW, TerminateProcess, WaitForSingleObject, INFINITE,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+        PROCESS_TERMINATE,
+    };
 
     fn wide(s: &Path) -> Vec<u16> {
         s.as_os_str()
@@ -270,9 +461,16 @@ mod imp {
     }
 
     pub fn current_owner() -> Option<u64> {
+        token_owner(unsafe { GetCurrentProcess() })
+    }
+
+    /// The user a process runs as. `OpenProcessToken` needs only the limited
+    /// query right, so the same code answers for this process and for a
+    /// candidate opened with nothing more.
+    fn token_owner(process: HANDLE) -> Option<u64> {
         unsafe {
             let mut token: HANDLE = std::ptr::null_mut();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
                 return None;
             }
             let mut needed: u32 = 0;
@@ -455,6 +653,207 @@ mod imp {
                 LocalFree(sd as *mut _);
             }
             id
+        }
+    }
+
+    fn filetime_u64(t: FILETIME) -> u64 {
+        (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)
+    }
+
+    /// Now in `FILETIME` units. std's clock on Windows is the system time, so
+    /// this needs no binding of its own.
+    fn filetime_now() -> u64 {
+        const UNIX_EPOCH_AS_FILETIME: u64 = 116_444_736_000_000_000;
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        UNIX_EPOCH_AS_FILETIME + (since.as_nanos() / 100) as u64
+    }
+
+    /// Creation time, then kernel plus user time.
+    fn times(handle: HANDLE) -> Option<(u64, u64)> {
+        unsafe {
+            let mut creation: FILETIME = std::mem::zeroed();
+            let mut exit: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+            (ok != 0).then(|| {
+                let cpu = filetime_u64(kernel).saturating_add(filetime_u64(user));
+                (filetime_u64(creation), cpu)
+            })
+        }
+    }
+
+    /// The creation time from a limited-information handle, which a standard
+    /// user can open on every process of their own.
+    pub fn process_start(pid: u64) -> Option<u64> {
+        let pid = u32::try_from(pid).ok()?;
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return None;
+            }
+            let start = times(handle).map(|(created, _)| created);
+            CloseHandle(handle);
+            start
+        }
+    }
+
+    /// One Toolhelp snapshot, keyed by pid.
+    pub fn process_snapshot() -> super::ProcessSnapshot {
+        let taken = filetime_now();
+        let mut entries = HashMap::new();
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snap.is_null() || snap == INVALID_HANDLE_VALUE {
+                return super::ProcessSnapshot { taken, entries };
+            }
+            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            if Process32FirstW(snap, &mut entry) != 0 {
+                loop {
+                    let len = entry
+                        .szExeFile
+                        .iter()
+                        .position(|c| *c == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    entries.insert(
+                        u64::from(entry.th32ProcessID),
+                        super::ProcessEntry {
+                            ppid: u64::from(entry.th32ParentProcessID),
+                            threads: entry.cntThreads,
+                            name: String::from_utf16_lossy(&entry.szExeFile[..len]),
+                        },
+                    );
+                    if Process32NextW(snap, &mut entry) == 0 {
+                        break;
+                    }
+                }
+            }
+            CloseHandle(snap);
+        }
+        super::ProcessSnapshot { taken, entries }
+    }
+
+    /// An open process handle, closed on drop.
+    pub struct ProcessHandle(HANDLE);
+
+    impl Drop for ProcessHandle {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    impl ProcessHandle {
+        pub fn terminate(&self) -> bool {
+            unsafe { TerminateProcess(self.0, 1) != 0 }
+        }
+
+        /// Whether the process exited within `within`. Never waits forever:
+        /// `INFINITE` is a value of the same parameter.
+        pub fn wait(&self, within: std::time::Duration) -> bool {
+            let ms =
+                u32::try_from(within.as_millis()).map_or(INFINITE - 1, |ms| ms.min(INFINITE - 1));
+            unsafe { WaitForSingleObject(self.0, ms) == WAIT_OBJECT_0 }
+        }
+    }
+
+    pub fn open_candidate(snapshot: &super::ProcessSnapshot, pid: u64) -> Option<super::Candidate> {
+        let entry = snapshot.entries.get(&pid)?;
+        let mut facts = super::ProcessFacts {
+            pid,
+            ppid: entry.ppid,
+            name: entry.name.clone(),
+            threads: entry.threads,
+            image: None,
+            created: None,
+            cpu: None,
+            owner: None,
+            args: None,
+            parent: super::ParentStart::Unreadable,
+        };
+        let access = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE | PROCESS_SYNCHRONIZE;
+        let raw = u32::try_from(pid)
+            .map(|p| unsafe { OpenProcess(access, 0, p) })
+            .unwrap_or(std::ptr::null_mut());
+        if raw.is_null() {
+            return Some(super::Candidate {
+                facts,
+                handle: None,
+            });
+        }
+        let handle = ProcessHandle(raw);
+        facts.image = image_path(raw);
+        if let Some((created, cpu)) = times(raw) {
+            facts.created = Some(created);
+            facts.cpu = Some(cpu);
+        }
+        facts.owner = token_owner(raw);
+        facts.args = command_line(raw).map(|line| super::argument_count(&line));
+        // The parent is not opened with the candidate's rights: only its
+        // creation time is needed, and asking for more would turn a parent
+        // this user may query but not terminate into an unreadable one.
+        facts.parent = if snapshot.entries.contains_key(&entry.ppid) {
+            process_start(entry.ppid).map_or(super::ParentStart::Unreadable, super::ParentStart::At)
+        } else {
+            super::ParentStart::Gone
+        };
+        Some(super::Candidate {
+            facts,
+            handle: Some(handle),
+        })
+    }
+
+    fn image_path(handle: HANDLE) -> Option<PathBuf> {
+        let mut buf = vec![0u16; 32_768];
+        let mut len = buf.len() as u32;
+        let ok = unsafe {
+            QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len)
+        };
+        (ok != 0).then(|| PathBuf::from(OsString::from_wide(&buf[..len as usize])))
+    }
+
+    /// The command line through `NtQueryInformationProcess`, which reads it on
+    /// a limited-information handle without touching the target's memory.
+    /// ntdll is mapped into every process, so this loads nothing.
+    fn command_line(handle: HANDLE) -> Option<String> {
+        unsafe {
+            let mut needed = 0u32;
+            NtQueryInformationProcess(
+                handle,
+                ProcessCommandLineInformation,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            let size = needed as usize;
+            if size < std::mem::size_of::<UNICODE_STRING>() {
+                return None;
+            }
+            // Whole `u64`s, so the `UNICODE_STRING` heading the buffer is aligned.
+            let mut buf = vec![0u64; size.div_ceil(8)];
+            let status = NtQueryInformationProcess(
+                handle,
+                ProcessCommandLineInformation,
+                buf.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            );
+            if status < 0 {
+                return None;
+            }
+            let header = &*(buf.as_ptr() as *const UNICODE_STRING);
+            // The kernel points `Buffer` just past the header, inside `buf`;
+            // anything else is not read.
+            let start = buf.as_ptr() as usize;
+            let text = header.Buffer as usize;
+            let bytes = usize::from(header.Length);
+            if header.Buffer.is_null() || text < start || text + bytes > start + buf.len() * 8 {
+                return None;
+            }
+            let units = std::slice::from_raw_parts(header.Buffer, bytes / 2);
+            Some(String::from_utf16_lossy(units))
         }
     }
 }

@@ -296,22 +296,14 @@ mod imp {
     use crate::focus::{WindowCandidate, WindowIdentity, PSEUDO_CONSOLE_CLASS, WINDOW_CLASSES};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, BOOL, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, FILETIME, HANDLE, HWND, LPARAM,
-        LRESULT, WPARAM,
+        BOOL, ERROR_FILE_NOT_FOUND, ERROR_SUCCESS, HANDLE, HWND, LPARAM, LRESULT, WPARAM,
     };
     use windows_sys::Win32::Security::Cryptography::ProcessPrng;
     use windows_sys::Win32::System::Diagnostics::Debug::IsDebuggerPresent;
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegGetValueW, RegSetValueExW, HKEY,
         HKEY_CURRENT_USER, KEY_WRITE, REG_OPTION_NON_VOLATILE, REG_SZ, RRF_RT_REG_SZ,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         RegisterHotKey, SendInput, UnregisterHotKey, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
@@ -333,72 +325,22 @@ mod imp {
         (ok != 0).then_some(buf)
     }
 
-    fn filetime_u64(t: FILETIME) -> u64 {
-        (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)
-    }
-
-    /// The creation time from a limited-information handle, which a standard
-    /// user can open on every process of their own.
-    pub fn process_start(pid: u64) -> Option<u64> {
-        let pid = u32::try_from(pid).ok()?;
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
-            if handle.is_null() {
-                return None;
-            }
-            let mut creation: FILETIME = std::mem::zeroed();
-            let mut exit: FILETIME = std::mem::zeroed();
-            let mut kernel: FILETIME = std::mem::zeroed();
-            let mut user: FILETIME = std::mem::zeroed();
-            let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
-            CloseHandle(handle);
-            (ok != 0).then(|| filetime_u64(creation))
-        }
-    }
-
-    /// One Toolhelp snapshot, read into a pid → (ppid, image) map.
-    fn snapshot() -> std::collections::HashMap<u64, (u64, String)> {
-        let mut out = std::collections::HashMap::new();
-        unsafe {
-            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if snap.is_null() || snap as isize == -1 {
-                return out;
-            }
-            let mut entry: PROCESSENTRY32W = std::mem::zeroed();
-            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-            if Process32FirstW(snap, &mut entry) != 0 {
-                loop {
-                    let len = entry
-                        .szExeFile
-                        .iter()
-                        .position(|c| *c == 0)
-                        .unwrap_or(entry.szExeFile.len());
-                    let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-                    out.insert(
-                        u64::from(entry.th32ProcessID),
-                        (u64::from(entry.th32ParentProcessID), name),
-                    );
-                    if Process32NextW(snap, &mut entry) == 0 {
-                        break;
-                    }
-                }
-            }
-            CloseHandle(snap);
-        }
-        out
-    }
+    // The Toolhelp walker and the creation-time read live with process
+    // handling in `platform`, which reclaiming stranded processes shares.
+    pub use crate::platform::imp::process_start;
+    use crate::platform::{process_snapshot, ProcessEntry};
 
     /// The chain from the snapshot with each entry's creation time. A parent
     /// pid recycled before the snapshot would point at an unrelated process;
     /// the creation-time comparison catches a "parent" younger than its child.
     pub fn ancestor_chain() -> Vec<ProcessInfo> {
-        let procs = snapshot();
+        let procs = process_snapshot().entries;
         let chain = walk(u64::from(std::process::id()), |pid| {
-            let (ppid, name) = procs.get(&pid)?;
+            let entry = procs.get(&pid)?;
             Some(ProcessInfo {
                 pid,
-                ppid: *ppid,
-                name: name.clone(),
+                ppid: entry.ppid,
+                name: entry.name.clone(),
                 start: process_start(pid).unwrap_or(0),
             })
         });
@@ -492,7 +434,7 @@ mod imp {
     /// children hands those children fresh consoles of their own.
     fn chain_console_window(
         chain: &[ProcessInfo],
-        procs: &std::collections::HashMap<u64, (u64, String)>,
+        procs: &std::collections::HashMap<u64, ProcessEntry>,
         all: &[HWND],
     ) -> Option<HWND> {
         let terminal_root = |h: HWND| -> Option<HWND> {
@@ -512,7 +454,7 @@ mod imp {
                 } else if class == "ConsoleWindowClass" {
                     // The window is conhost's; conhost's parent is the
                     // console application it serves.
-                    let conhost_parent = procs.get(&pid_of(*h)).map(|(ppid, _)| *ppid);
+                    let conhost_parent = procs.get(&pid_of(*h)).map(|e| e.ppid);
                     if conhost_parent == Some(ancestor.pid) {
                         return Some(*h);
                     }
@@ -550,15 +492,12 @@ mod imp {
         basename: &str,
     ) -> Option<WindowIdentity> {
         let _ = anchor_pid;
-        let procs = snapshot();
+        let procs = process_snapshot().entries;
         let all = top_level_windows();
         let (hwnd, owner_image) = match chain_console_window(chain, &procs, &all) {
             Some(h) => {
                 let pid = pid_of(h);
-                let image = procs
-                    .get(&pid)
-                    .map(|(_, name)| name.clone())
-                    .unwrap_or_default();
+                let image = procs.get(&pid).map(|e| e.name.clone()).unwrap_or_default();
                 (h, image)
             }
             None => ancestor_window(chain, &all, basename)?,
